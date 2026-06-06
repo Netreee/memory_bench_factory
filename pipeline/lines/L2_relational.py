@@ -7,7 +7,7 @@ pipeline.lines.L2_relational —— L2 关系多跳产线(单能力线:L2_multih
 """
 from __future__ import annotations
 
-from pipeline.lines.base import ProductionLine, Order
+from pipeline.lines.base import ProductionLine, Order, field_kind, interrogative
 from pipeline.world_state import (
     WorldState, Timeline, Op, _date_of, week_label, _norm,
     SET, UPDATE, INVALID, INSUFFICIENT, gt_multihop,
@@ -110,12 +110,17 @@ class RelationalLine(ProductionLine):
         if len(pf) < 2:
             return None
         fk_field, next_field = pf[0], pf[1]            # 负责人(dept→person FK) / 汇报对象(person→上级人员)
-        persons = set()
+        from pipeline.world_state import _strip_disambig
+        persons, seen_base = [], {_strip_disambig(e) for e in ws.entities}   # ★Fix3:人名也防表面塌缩(主干已被实体/已收人名占用 → 跳)
         for ent, flds in list(ws.entities.items()):
             tl = flds.get(fk_field)
-            if tl:
-                persons.update(str(v) for (_s, _d, v) in tl.set_values() if v and str(v) not in ws.entities)
-        persons = sorted(persons)
+            if not tl:
+                continue
+            for (_s, _d, v) in tl.set_values():
+                v = str(v)
+                if v and v not in ws.entities and _strip_disambig(v) not in seen_base:
+                    persons.append(v); seen_base.add(_strip_disambig(v))
+        persons = sorted(set(persons))
         if len(persons) < 2:                          # 造不出"人→上级人"的链(需 ≥2 个不同人名)
             return None
         # ★下一跳值 = 另一个【真实人员名】,不再写死 CTO/CEO 职级(审计 ★2,根因修复):
@@ -134,10 +139,14 @@ class RelationalLine(ProductionLine):
 
     def enumerate(self, ws, target: int = 200, wp=None) -> list[dict]:
         paths = discover_fk_paths(ws, hops=2)
+        profile = (wp or {}).get("domain_profile", {})
         out = []
         for o in enumerate_l2_orders(ws, paths)[:target]:
+            aux = dict(o.aux)
+            last = (aux.get("path") or [None])[-1]          # ★Fix2:末跳字段的 kind 决定疑问词(样本值=gt 答案)
+            aux.setdefault("ans_kind", field_kind(last, o.gt, profile))
             out.append({"line": self.id, "capability": "L2_multihop", "entity": o.entity,
-                        "field": o.field, "gt": o.gt, "evidence_sessions": o.evidence_sessions, "aux": o.aux})
+                        "field": o.field, "gt": o.gt, "evidence_sessions": o.evidence_sessions, "aux": aux})
         return out
 
     def gt(self, ws, o: dict):
@@ -151,9 +160,10 @@ class RelationalLine(ProductionLine):
         aw = aux.get("at_week")
         # ★§V-A 良定义:时变关系链,题面必须带【周锚】——否则"向谁汇报"逐周多值、gold 不唯一(run0604 实证)。
         #   并明确"那个人本人"(消"部门汇报 vs 负责人汇报"二义)。
+        q = interrogative(aux.get("ans_kind"))     # ★Fix2:末跳疑问词由 path[-1] 的 kind 派生(治"管理跨度是谁")
         wk = f"截至第{week_label(aw)}周(以那一周的状态为准)," if aw is not None else ""
         s = (f"{wk}沿一条两步关系链提问:从【{ent}】出发,先找它的「{p[0]}」**所指的那个人**,"
-             f"再问【那个人本人】的「{p[1]}」是谁。"
+             f"再问【那个人本人】的「{p[1]}」{q}。"
              f"★必须点明'第{week_label(aw)}周'这个时点(时变关系,不带周次答案不唯一);"
              f"只给起点【{ent}】和「{p[0]}→{p[1]}」关系;【绝不点名中间那个人】;答案也不能出现。")
         hide = [str(gt)]
@@ -250,6 +260,12 @@ if __name__ == "__main__":
     # ★§V-A 良定义:时变多跳题,题面必须带周锚(否则 gold 不唯一)
     ck("§V-A:L2 题面带周锚(单一真源 week_label=s+1)",
        all(f"第{week_label(o['aux'].get('at_week'))}周" in line.intent(o)[0] for o in orders if o["aux"].get("at_week") is not None))
+    # ★Fix2:末跳疑问词由 path[-1] 的 kind 派生(治"管理跨度是谁")
+    def _l2q(kind):
+        return line.intent({"line": "L2_relational", "capability": "L2_multihop", "entity": "X", "field": "f",
+                            "gt": "v", "aux": {"path": ["负责人", "末跳"], "at_week": 0, "ans_kind": kind}})[0]
+    ck("Fix2:L2 末跳 number → '是多少'且非'是谁'", "是多少" in _l2q("number") and "是谁" not in _l2q("number"))
+    ck("Fix2:L2 末跳 person → '是谁'", "是谁" in _l2q("person"))
 
     # prepare:office 型 profile(2 person 字段)应增强出人员实体
     base_table = {"entities": [

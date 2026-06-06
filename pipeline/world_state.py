@@ -347,6 +347,28 @@ def week_label(session: int) -> int:
     return session + 1
 
 
+def _strip_disambig(name) -> str:
+    """剥【常见消歧后缀】取专名主干 —— ★启发式(审计★2:诚实命名,非完备"近似名"判定)。
+    覆盖:括号注「张三(数据)」/ 下划线·横线·空格尾注「张三_数据」「张三 数据」/ CJK 后的尾随数字·拉丁「张三2」「张三A」。
+    刻意【不剥 CJK 尾字】→「张三丰」不会误塌缩成「张三」(真不同名);跨语言/罕见消歧仍漏 —— 判定与兜底共用它,
+    故宁可多覆盖常见款。漏网由 name_collisions 出口日志暴露。"""
+    import re
+    s = re.sub(r"[（(][^)）]*[)）]", "", str(name))                 # 括号注:张三(数据)→张三
+    s = re.split(r"[_\-—\s]", s, 1)[0]                             # 下划线/横线/空格尾注:张三_数据·张三 数据→张三
+    s = re.sub(r"(?<=[一-鿿])[0-9A-Za-z]+$", "", s)        # CJK 专名后的尾随数字/拉丁:张三2·张三A→张三
+    return s.strip() or str(name).strip()                         # 别剥成空串(纯拉丁/纯数字名 → 留原样)
+
+
+def name_collisions(ws: "WorldState") -> list:
+    """★Fix3:表面塌缩组——剥消歧后缀后主干相同的 ≥2 个实体(张三/张三(数据)/张三_数据)。
+    表面塌缩 → 渲染期裸专名指代不唯一 → 题面/语料歧义(命门1 表面层缺口)。返回 [[同主干实体…], …]。"""
+    from collections import defaultdict
+    g = defaultdict(list)
+    for e in ws.entities:
+        g[_strip_disambig(e)].append(e)
+    return [sorted(v) for v in g.values() if len(v) >= 2]
+
+
 def _as_int(x, default=0):
     """LLM 偶发把 session 写成字符串("3")/浮点;稳健强转 int,坏值回退 default(防 max()/排序炸)。"""
     try:
@@ -585,6 +607,17 @@ def _self_test() -> bool:
     ck("validate 抓单调(单调部.指标)", ("单调部", "monotonic") in vt, True)
     ck("validate 抓伪演化(伪演化部.负责人)", ("伪演化部", "fake_evolving") in vt, True)
     ck("validate 放过健康非单调字段(健康部.指标)", ("健康部", "monotonic") in vt, False)
+
+    # ★Fix3:表面塌缩近重名检测
+    ck("_strip_disambig 剥括号/下划线/空格/数字/字母尾缀",
+       all(_strip_disambig(n) == "张三" for n in ["张三(数据)", "张三_数据", "张三 数据", "张三2", "张三A"]), True)
+    ck("_strip_disambig 不误剥 CJK 尾字(张三丰≠张三,真不同名)", _strip_disambig("张三丰") == "张三丰", True)
+    nc_ws = WorldState({"张三": {"f": Timeline([Op(0, _date_of(0), SET, "x", None)])},
+                        "张三(数据)": {"f": Timeline([Op(0, _date_of(0), SET, "y", None)])},
+                        "李四": {"f": Timeline([Op(0, _date_of(0), SET, "z", None)])}}, n_sessions=1)
+    nc = name_collisions(nc_ws)
+    ck("name_collisions 抓张三系表面塌缩", any(set(g) == {"张三", "张三(数据)"} for g in nc), True)
+    ck("name_collisions 放过真不同名(李四不入塌缩组)", any("李四" in g for g in nc), False)
 
     npass = sum(1 for c in checks if c[0])
     for ok, name, got, want in checks:

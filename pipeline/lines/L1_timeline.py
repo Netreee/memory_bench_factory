@@ -8,7 +8,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 import random
 
-from pipeline.lines.base import ProductionLine, Order
+from pipeline.lines.base import ProductionLine, Order, field_kind, interrogative, sample_field_value
 from pipeline.world_state import (
     WorldState, _norm, _to_num, _date_of, week_label,
     SET, UPDATE, DELETE, EXPIRE, INVALID, INSUFFICIENT,
@@ -64,7 +64,7 @@ def _candidates(ws: WorldState, cap: str) -> list[Order]:
                     prior = [s for s in sessions if s < o.session]
                     if prior:
                         out.append(Order("TR", ent, fld,
-                                         gt={"session": o.session, "date": o.date,
+                                         gt={"session": o.session, "date": o.date, "week": week_label(o.session),
                                              "from": o.prev, "to": o.value, "ordinal": "首次"},
                                          evidence_sessions=sorted(set(prior + [o.session])),
                                          aux={"to_value": o.value, "from_value": o.prev, "ordinal": "首次"}))
@@ -154,8 +154,14 @@ class TimelineLine(ProductionLine):
                     picked.append(cands[c][taken[c]]); taken[c] += 1; progressed = True
             if not progressed:
                 break                                          # 全耗尽 = 世界供给上限
-        return [{"line": self.id, "capability": o.capability, "entity": o.entity, "field": o.field,
-                 "gt": o.gt, "evidence_sessions": o.evidence_sessions, "aux": o.aux} for o in picked[:target]]
+        profile = (wp or {}).get("domain_profile", {})         # ★Fix2:stamp 答案类型(疑问词单一真源)
+        out = []
+        for o in picked[:target]:
+            aux = dict(o.aux)
+            aux.setdefault("ans_kind", field_kind(o.field, sample_field_value(ws, o.entity, o.field), profile))
+            out.append({"line": self.id, "capability": o.capability, "entity": o.entity, "field": o.field,
+                        "gt": o.gt, "evidence_sessions": o.evidence_sessions, "aux": aux})
+        return out
 
     def gt(self, ws, o: dict):
         """护城河:按 capability 派发,用代码重算答案(与 enumerate 烘焙逐字段相等,见自检的校验闸)。"""
@@ -172,7 +178,8 @@ class TimelineLine(ProductionLine):
             chs = [op for op in tl.change_ops() if op.op in (SET, UPDATE) and op.prev is not None] if tl else []
             if chs:
                 op = chs[0]
-                return {"session": op.session, "date": op.date, "from": op.prev, "to": op.value, "ordinal": "首次"}
+                return {"session": op.session, "date": op.date, "week": week_label(op.session),
+                        "from": op.prev, "to": op.value, "ordinal": "首次"}
             return INSUFFICIENT
         if cap == "FORGET":
             qd = o.get("question_date")          # 题面 dict 不保留 question_date;缺则回放烘焙值(不强行重算)
@@ -188,19 +195,20 @@ class TimelineLine(ProductionLine):
         cap, ent, fld, aux, gt = (o.get("capability"), o.get("entity", ""), o.get("field", ""),
                                   o.get("aux", {}) or {}, o.get("gt"))
         hide = [str(gt)]
+        q = interrogative(aux.get("ans_kind"))     # ★Fix2:疑问词由字段 kind 派生(person→是谁/number→是多少/其它→是什么)
         if cap == "IE":
-            s = (f"复盘第 {week_label(aux.get('at_week'))} 周那次——问【当时】{ent} 的「{fld}」是多少"
+            s = (f"复盘第 {week_label(aux.get('at_week'))} 周那次——问【当时】{ent} 的「{fld}」{q}"
                  f"(制造'当时 vs 现在'对照;答案不进题面)。")
         elif cap == "KU":
-            s = f"问截至最新一期,{ent} 的「{fld}」是多少(不要暗示是第几周)。"
+            s = f"问截至最新一期,{ent} 的「{fld}」{q}(不要暗示是第几周)。"
         elif cap == "TR":
             s = f"问 {ent} 的「{fld}」是在哪一周【首次】发生变化的(只问哪一周,不写变化前后的值)。"
         elif cap == "MR":
             s = f"问在全部记录周里,{ent} 的「{fld}」{'最高/最大' if aux.get('agg') == 'max' else '最低/最小'}是多少。"
         elif cap == "PREEXPIRE":
-            s = f"问那个【已停止统计】的「{fld}」,{ent} 在停掉【前】最后一次是多少(题面不写该值)。"
+            s = f"问那个【已停止统计】的「{fld}」,{ent} 在停掉【前】最后一次{q}(题面不写该值)。"
         elif cap == "FORGET":
-            s = f"问截至最新,{ent} 的「{fld}」是多少(它可能已停止统计)。"
+            s = f"问截至最新,{ent} 的「{fld}」{q}(它可能已停止统计)。"
         elif cap == "ABS":
             s = f"问 {ent} 的「{fld}」是多少(此字段本场景根本不存在,考拒答)。"
         else:
@@ -409,6 +417,9 @@ if __name__ == "__main__":
     ck("MR min Oncall=9次@s4", _norm(mr[("Oncall数", "min")]["value"]) == _norm("9次") and mr[("Oncall数", "min")]["session"] == 4)
     tr = {o.aux["to_value"]: o for o in by_cap["TR"] if o.field == "负责人"}
     ck("TR 负责人→李四 @s2", "李四" in tr and tr["李四"].gt["session"] == 2)
+    # ★Fix1 时间单一真源:TR 答案是"哪一周",gt.week 必须是 week_label(session)(1-based,与语料同源),不是裸 session
+    ck("TR gt.week = week_label(session)(1-based,杜绝 off-by-one)",
+       all(o.gt.get("week") == week_label(o.gt["session"]) and o.gt["week"] == o.gt["session"] + 1 for o in by_cap["TR"]))
     forget = {o.field: o for o in by_cap["FORGET"]}
     ck("FORGET P0 已遗忘", "P0缺陷率" in forget and forget["P0缺陷率"].gt.get("forgotten") is True)
 
@@ -417,6 +428,15 @@ if __name__ == "__main__":
     orders = line.enumerate(ws)
     ck("校验闸:gt() 重算 == 烘焙(7 能力)",
        all(line.gt(ws, o) == o["gt"] for o in orders if o["capability"] in RECOMP))
+
+    # ★Fix2:疑问词由 ans_kind 派生(person→是谁/number→是多少/其它→是什么),不写死
+    def _q_of(cap, kind):
+        return line.intent({"capability": cap, "entity": "X", "field": "某字段", "gt": "v",
+                            "aux": {"ans_kind": kind, "at_week": 1}})[0]
+    ck("Fix2:IE+person → 题面'是谁'", "是谁" in _q_of("IE", "person"))
+    ck("Fix2:IE+number → '是多少'且非'是谁'", "是多少" in _q_of("IE", "number") and "是谁" not in _q_of("IE", "number"))
+    ck("Fix2:KU+status → 题面'是什么'", "是什么" in _q_of("KU", "status"))
+    ck("Fix2:enumerate 给每单 stamp ans_kind", all("ans_kind" in o["aux"] for o in orders))
 
     # ════════════════════════════════════════════════════════════════════════
     # ★边 A 闸 well_posed 自检(详设 §7;含撤下 W5 不再误杀 / 停-复活 drop / IE 越界不一致)

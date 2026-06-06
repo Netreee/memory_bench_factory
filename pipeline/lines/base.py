@@ -16,6 +16,39 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# ★疑问词单一真源(Fix2):答案【类型】决定疑问词,类型 = 字段 kind(命门1 扩展到表面)。
+#   kind 先查世界 field_schema(单一真源),查不到按【值】兜底;person 只能来自 schema(名字串猜不出"人")。
+#   各产线 intent 一律 interrogative(ans_kind) 派生,不许写死"是谁/是多少" → 治"管理跨度是谁"类类型错配整类。
+# ════════════════════════════════════════════════════════════════════════════
+_INTERROGATIVE = {"person": "是谁", "number": "是多少"}
+
+
+def field_kind(field_name: str, sample_value: Any = None, profile: dict | None = None) -> str:
+    """字段答案类型:person / number / 其它(text/status/category…)。先 schema 后值兜底。
+    ★审计★3(诚实降级,非 bug):值兜底【出不了 person】(名字串猜不出"人")——schema 没标 kind 时
+    人名字段降级判 text → 疑问词"是什么"(而非"是谁")。这是【安全降级】:绝不会错成"是多少"。
+    person 的正确性外包给白皮书 field_schema 的 kind 质量;要硬保证须在白皮书校验阶段强制 person 字段标 kind。"""
+    schema = {f.get("name"): f.get("kind") for f in (profile or {}).get("field_schema", [])}
+    k = schema.get(field_name)
+    if k:
+        return k
+    from pipeline.world_state import _to_num
+    return "number" if _to_num(sample_value) is not None else "text"
+
+
+def interrogative(kind: str | None) -> str:
+    """kind → 疑问词。person=是谁 / number=是多少 / 其它=是什么(status/category 等)。"""
+    return _INTERROGATIVE.get(kind or "", "是什么")
+
+
+def sample_field_value(ws, entity: str, field_name: str):
+    """从世界取该 (实体,字段) 的一个代表值(给 field_kind 的值兜底用)。"""
+    tl = getattr(ws, "entities", {}).get(entity, {}).get(field_name)
+    sv = tl.set_values() if tl else []
+    return sv[-1][2] if sv else None
+
+
 @dataclass
 class Order:
     """枚举期的内部脚手架;enumerate 最终包成 line-tagged dict 交给下游(gt 已烘焙)。"""

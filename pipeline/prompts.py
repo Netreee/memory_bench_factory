@@ -25,7 +25,7 @@ PROMPTS: dict[str, str] = {
 - person/status/category 字段:给 trajectory(随时间换),或 stable 给单一 value
 - ★至少 1 个字段末尾 null 结尾(= 该字段「$stopped」,考遗忘/停用前最后值)
 
-【硬约束】1.全新虚构值(防泄漏);2.session 用 0..N-1 整数,不写日期;3.evolving≥2 个不同值,每实体 4-6 字段;4.实体名互不相同。
+【硬约束】1.全新虚构值(防泄漏);2.session 用 0..N-1 整数,不写日期;3.evolving≥2 个不同值,每实体 4-6 字段;4.★所有专名(实体名 + 人名类字段值)**表面互不近似**:禁止"张三/张三(数据)/张三_数据"这类共享主干的近重名(下游机械校验表面塌缩,近重名整条作废)。
 
 【严格 JSON,name 是专名而非字段】{"entities":[{"name":"<一个真实$noun的专名>","type":"$noun","fields":{"<字段名>":{"type":"evolving","value_type":"...","trajectory":[{"session":0,"value":"..."}]},"<稳定字段>":{"type":"stable","value":"..."}}}]}""",
 
@@ -101,7 +101,7 @@ $defects
     "council.style": """从 few-shot 原文抽【风格 DNA】,供后续渲染【照着仿写】:语气、格式(连续段落?条目?表格?)、典型篇幅、术语/黑话密度、什么明说·什么默认。
 只输出 JSON:{"style_spec":{"tone":"..","format":"..","length":"..","jargon":"..","stated_vs_assumed":".."},"use_fewshot_as_exemplar":true}""",
 
-    "council.traps": """设计本场景【天然在哪坑记忆系统】,让 benchmark 有区分度:recency 偏置 / 近重名实体 / 长程依赖 / 多源矛盾 / 易混字段 …。每个陷阱说明它考验哪种记忆失败,并建议该【重激活哪条产线】来制造它。
+    "council.traps": """设计本场景【天然在哪坑记忆系统】,让 benchmark 有区分度:recency 偏置 / 长程依赖 / 多源矛盾 / 易混字段(语义近但不同名) …。★不要用"近重名实体"(同主干近重名如 张三/张三(数据))——它在渲染层会塌缩成歧义、制造无唯一解的坏题,已禁用。每个陷阱说明它考验哪种记忆失败,并建议该【重激活哪条产线】来制造它。
 只输出 JSON:{"traps":[{"trap":"..","stresses":"..","boost_line":"L?_.."}]}""",
 
     "council.critic": """你是中央办公室【批判员】。审一份白皮书,挑硬伤并直接产出【修订后的完整白皮书 JSON】(不是 diff,照原 schema):

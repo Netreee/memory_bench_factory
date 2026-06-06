@@ -5,7 +5,7 @@ build_world:并发批次让 LLM 填世界表 → assemble_world 成状态机 →
 from __future__ import annotations
 import json
 import config
-from pipeline.world_state import assemble_world, validate, WorldState
+from pipeline.world_state import assemble_world, validate, WorldState, _strip_disambig, name_collisions
 from pipeline.prompts import render
 
 
@@ -26,11 +26,13 @@ def build_world(wp, tracer, log=print) -> WorldState:
     sysp = _world_system(profile)
     # ★W.3:让 build_world 真正消费白皮书的 change_density / traps(此前全程无视)
     cd = (spec.get("timeline", {}) or {}).get("change_density", "")
+    # 近重名陷阱已在源头【议会菜单 council.traps】删除(不靠代码子串猜,审计★1);
+    # 万一漏网,seen_base 在收集期按主干去重(出口拦截)= 真兜底,故此处不再用关键词黑名单过滤。
     traps = [t.get("trap") for t in (wp.get("traps") or []) if t.get("trap")][:3]
     extra = (f"★变更密度:evolving 字段尽量按「{cd}」铺满全程。" if cd else "")
-    extra += (f"★陷阱布局:本场景需自然埋入这些坑——{traps}(如近重名实体、可矛盾的多源字段)。" if traps else "")
+    extra += (f"★陷阱布局:本场景需自然埋入这些坑——{traps}(如可矛盾的多源字段、易混字段)。" if traps else "")
     merged = {"entities": [], "cascades": [], "absent_fields": []}
-    seen = set()
+    seen, seen_base = set(), set()                    # ★Fix3:seen_base 防【表面塌缩】近重名(主干相同)
     batch = 8
 
     def _world_batch(_i):                             # 一个批次:求 batch 个实体
@@ -47,7 +49,10 @@ def build_world(wp, tracer, log=print) -> WorldState:
             for e in (out.get("entities", []) if isinstance(out, dict) else []):
                 nm = e.get("name")
                 if nm and nm not in seen and e.get("fields"):
-                    seen.add(nm); merged["entities"].append(e)
+                    base = _strip_disambig(nm)
+                    if base in seen_base:             # ★Fix3:主干已存在 → 表面塌缩近重名,丢弃(裸专名渲染会指代不唯一)
+                        continue
+                    seen.add(nm); seen_base.add(base); merged["entities"].append(e)
         log(f"  世界 round{rnd+1}: 累计 {len(merged['entities'])}/{n_entities} {noun}(并发 {n_calls} 批)")
     ws, _ = assemble_world(merged)
     # ★W.3 CRITIC 修复轮:assemble 算出的缺陷不再"只 log 就扔"——定向重生成坏字段(复用并行骨架:发散批次→收敛修复)
@@ -80,6 +85,8 @@ def build_world(wp, tracer, log=print) -> WorldState:
         ws, _ = assemble_world(merged)
     ws.n_sessions = max(ws.n_sessions or 0, n_sessions)
     rem = validate(ws, merged)
-    log(f"  ✓ 基础世界:{len(ws.entities)} 实体 / {ws.n_sessions} 周 / 修复后残留缺陷 {len(rem)}")  # 产线基质由 stage_world 的 line.prepare() 叠加
+    coll = name_collisions(ws)                        # ★Fix3:表面塌缩兜底检测(收集期已按主干去重,这里抓漏网)
+    log(f"  ✓ 基础世界:{len(ws.entities)} 实体 / {ws.n_sessions} 周 / 修复后残留缺陷 {len(rem)}"
+        + (f" / ⚠表面塌缩近重名 {coll}" if coll else ""))  # 产线基质由 stage_world 的 line.prepare() 叠加
     return ws
 
