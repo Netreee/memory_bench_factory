@@ -264,7 +264,7 @@ if __name__ == "__main__":
     def _l2q(kind):
         return line.intent({"line": "L2_relational", "capability": "L2_multihop", "entity": "X", "field": "f",
                             "gt": "v", "aux": {"path": ["负责人", "末跳"], "at_week": 0, "ans_kind": kind}})[0]
-    ck("Fix2:L2 末跳 number → '是多少'且非'是谁'", "是多少" in _l2q("number") and "是谁" not in _l2q("number"))
+    ck("Fix2:L2 末跳 numeric(真实schema词表)→ '是多少'且非'是谁'", "是多少" in _l2q("numeric") and "是谁" not in _l2q("numeric"))
     ck("Fix2:L2 末跳 person → '是谁'", "是谁" in _l2q("person"))
 
     # prepare:office 型 profile(2 person 字段)应增强出人员实体

@@ -17,7 +17,7 @@ from __future__ import annotations
 import random
 
 from pipeline.lines.base import ProductionLine, Order
-from pipeline.world_state import WorldState, INVALID, INSUFFICIENT, _to_num, _norm
+from pipeline.world_state import WorldState, INVALID, INSUFFICIENT, _to_num, _norm, week_label
 
 AUTHORITATIVE_SRC = "官方通报"
 RUMOR_SRCS = ["内部群聊转述", "未经核实的外部传闻", "走廊里的口耳相传"]
@@ -217,8 +217,12 @@ class ConflictLine(ProductionLine):
 
     def intent(self, o: dict) -> tuple[str, list]:
         ent, fld, aux = o.get("entity", ""), o.get("field", ""), (o.get("aux") or {})
-        s = (f"关于【{ent}】的「{fld}」,记忆里有两份说法对不上:一份出自【{aux.get('authoritative_source', '正式记录')}】,"
-             f"另一份出自【{aux.get('rumor_source', '小道消息')}】。问到底应认定为哪一个——"
+        # ★FixD:锁周——官方值会跨周漂移,题面必须锚到【矛盾发生那一周】,否则"官方值"= 哪周不唯一,
+        #   合理系统答"最新官方值"会被误判(D 首点:Q117/136 等)。gold = 该周官方值,与此锚一致。
+        sess = aux.get("session")
+        wk = f"截至第{week_label(sess)}周(以那一周的官方记录为准)," if sess is not None else ""
+        s = (f"{wk}关于【{ent}】的「{fld}」,记忆里有两份说法对不上:一份出自【{aux.get('authoritative_source', '正式记录')}】,"
+             f"另一份出自【{aux.get('rumor_source', '小道消息')}】。问那一周到底应认定为哪一个——"
              f"★按【来源可靠度】裁决(正式记录 > 小道消息),只回最终认定的那个值。")
         hide = [str(aux.get("authoritative_value")), str(aux.get("rumor_value"))]   # 两值都在语料,题面不剧透
         return s, hide
@@ -298,6 +302,10 @@ if __name__ == "__main__":
     ck("intent 隐藏权威值+小道值", c0["authoritative_value"] in hide and c0["rumor_value"] in hide)
     ck("题面不含两值", c0["authoritative_value"] not in intent and c0["rumor_value"] not in intent)
     ck("题面点明按来源可靠度裁决", "可靠度" in intent and "正式记录" in intent)
+    # ★FixD:题面必须锚到矛盾那一周(防"未锁周 + 官方值漂移"→合理系统答最新官方被误判)
+    from pipeline.world_state import week_label as _wl
+    ck("FixD:L5 题面带周锚(截至第N周)",
+       all(f"第{_wl(o['aux'].get('session'))}周" in line.intent(o)[0] for o in orders if o['aux'].get('session') is not None))
 
     # ════════════════════════════════════════════════════════════════════════
     # ★边 A 闸 well_posed(I0–I7)离线自检(设计见 docs/anchors/edge_a/L5_well_posed.md §8)

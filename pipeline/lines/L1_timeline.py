@@ -64,7 +64,9 @@ def _candidates(ws: WorldState, cap: str) -> list[Order]:
                     prior = [s for s in sessions if s < o.session]
                     if prior:
                         out.append(Order("TR", ent, fld,
-                                         gt={"session": o.session, "date": o.date, "week": week_label(o.session),
+                                         # ★FixA:gold 不 ship 裸 0-based session(下游会拿它格式化"第N周"→off-by-one);
+                                         #   只留 week(1-based,人类口径)+ date。内部锚 session 由 evidence_sessions / week-1 派生。
+                                         gt={"week": week_label(o.session), "date": o.date,
                                              "from": o.prev, "to": o.value, "ordinal": "首次"},
                                          evidence_sessions=sorted(set(prior + [o.session])),
                                          aux={"to_value": o.value, "from_value": o.prev, "ordinal": "首次"}))
@@ -178,8 +180,8 @@ class TimelineLine(ProductionLine):
             chs = [op for op in tl.change_ops() if op.op in (SET, UPDATE) and op.prev is not None] if tl else []
             if chs:
                 op = chs[0]
-                return {"session": op.session, "date": op.date, "week": week_label(op.session),
-                        "from": op.prev, "to": op.value, "ordinal": "首次"}
+                return {"week": week_label(op.session), "date": op.date,
+                        "from": op.prev, "to": op.value, "ordinal": "首次"}    # ★FixA:无裸 session,week=1-based 唯一周表示
             return INSUFFICIENT
         if cap == "FORGET":
             qd = o.get("question_date")          # 题面 dict 不保留 question_date;缺则回放烘焙值(不强行重算)
@@ -236,7 +238,9 @@ class TimelineLine(ProductionLine):
             return ("drop", f"FORGET:无停用标记就近「{ent}」")
         if cap in ("MR", "TR"):                          # 锚到 gt 标注的那一 session
             gt = order.get("gt")
-            sess = gt.get("session") if isinstance(gt, dict) else None
+            sess = gt.get("session") if isinstance(gt, dict) else None       # MR 仍带 session
+            if sess is None and isinstance(gt, dict) and gt.get("week") is not None:
+                sess = gt["week"] - 1                    # ★FixA:TR 已去裸 session,由 week(1-based)-1 派生内部锚
             if sess is not None:
                 docs = [d["content"] for d in evidence_docs if d["session"] == sess] or docs
         s = gold_scalar(order)
@@ -328,9 +332,9 @@ class TimelineLine(ProductionLine):
             if not chs:                                                    # W6:无变更
                 return ("drop", f"well_posed:TR 首次变更不成立:{ent}.{fld} 无 SET/UPDATE 变更")
             op = chs[0]
-            if not isinstance(gt, dict) or "session" not in gt or "to" not in gt:  # W3
-                return ("drop", f"well_posed:TR 类型错配:gt 应为 {{session,to,...}},得 {gt}")
-            if not (op.session == gt["session"] and _eq(op.value, gt["to"]) and _eq(op.prev, gt.get("from"))):  # W1
+            if not isinstance(gt, dict) or "week" not in gt or "to" not in gt:  # W3(FixA:周字段是 week,1-based)
+                return ("drop", f"well_posed:TR 类型错配:gt 应为 {{week,to,...}},得 {gt}")
+            if not (op.session == gt["week"] - 1 and _eq(op.value, gt["to"]) and _eq(op.prev, gt.get("from"))):  # W1(week-1=内部session)
                 return ("drop", f"well_posed:TR gt 与世界不符:首变={op} 烘焙={gt}")
             prior = [s for (s, _, _) in tl.set_values() if s < op.session]
             if not prior:                                                  # W6:无"变化前"周 → "首次变化"无参照
@@ -416,10 +420,11 @@ if __name__ == "__main__":
     ck("MR max Oncall=15次@s2", _norm(mr[("Oncall数", "max")]["value"]) == _norm("15次") and mr[("Oncall数", "max")]["session"] == 2)
     ck("MR min Oncall=9次@s4", _norm(mr[("Oncall数", "min")]["value"]) == _norm("9次") and mr[("Oncall数", "min")]["session"] == 4)
     tr = {o.aux["to_value"]: o for o in by_cap["TR"] if o.field == "负责人"}
-    ck("TR 负责人→李四 @s2", "李四" in tr and tr["李四"].gt["session"] == 2)
+    ck("TR 负责人→李四 @第3周(session2→week_label=3)", "李四" in tr and tr["李四"].gt["week"] == 3)
     # ★Fix1 时间单一真源:TR 答案是"哪一周",gt.week 必须是 week_label(session)(1-based,与语料同源),不是裸 session
-    ck("TR gt.week = week_label(session)(1-based,杜绝 off-by-one)",
-       all(o.gt.get("week") == week_label(o.gt["session"]) and o.gt["week"] == o.gt["session"] + 1 for o in by_cap["TR"]))
+    # ★FixA:TR gold 只 ship 1-based week + date,【绝不 ship 裸 0-based session】(下游会拿它格式化"第N周"→off-by-one)
+    ck("TR gold 无裸 session 键(杜绝下游误读为周)", all("session" not in o.gt for o in by_cap["TR"]))
+    ck("TR gold.week 为 1-based 整数", all(isinstance(o.gt.get("week"), int) and o.gt["week"] >= 1 for o in by_cap["TR"]))
     forget = {o.field: o for o in by_cap["FORGET"]}
     ck("FORGET P0 已遗忘", "P0缺陷率" in forget and forget["P0缺陷率"].gt.get("forgotten") is True)
 
@@ -434,7 +439,7 @@ if __name__ == "__main__":
         return line.intent({"capability": cap, "entity": "X", "field": "某字段", "gt": "v",
                             "aux": {"ans_kind": kind, "at_week": 1}})[0]
     ck("Fix2:IE+person → 题面'是谁'", "是谁" in _q_of("IE", "person"))
-    ck("Fix2:IE+number → '是多少'且非'是谁'", "是多少" in _q_of("IE", "number") and "是谁" not in _q_of("IE", "number"))
+    ck("Fix2:IE+numeric(真实schema词表)→ '是多少'且非'是谁'", "是多少" in _q_of("IE", "numeric") and "是谁" not in _q_of("IE", "numeric"))
     ck("Fix2:KU+status → 题面'是什么'", "是什么" in _q_of("KU", "status"))
     ck("Fix2:enumerate 给每单 stamp ans_kind", all("ans_kind" in o["aux"] for o in orders))
 

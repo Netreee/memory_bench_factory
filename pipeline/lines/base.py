@@ -21,7 +21,7 @@ from typing import Any, Optional
 #   kind 先查世界 field_schema(单一真源),查不到按【值】兜底;person 只能来自 schema(名字串猜不出"人")。
 #   各产线 intent 一律 interrogative(ans_kind) 派生,不许写死"是谁/是多少" → 治"管理跨度是谁"类类型错配整类。
 # ════════════════════════════════════════════════════════════════════════════
-_INTERROGATIVE = {"person": "是谁", "number": "是多少"}
+_INTERROGATIVE = {"person": "是谁", "numeric": "是多少", "number": "是多少"}  # ★词表对齐 field_schema(kind="numeric");"number" 留作历史别名
 
 
 def field_kind(field_name: str, sample_value: Any = None, profile: dict | None = None) -> str:
@@ -34,7 +34,7 @@ def field_kind(field_name: str, sample_value: Any = None, profile: dict | None =
     if k:
         return k
     from pipeline.world_state import _to_num
-    return "number" if _to_num(sample_value) is not None else "text"
+    return "numeric" if _to_num(sample_value) is not None else "text"   # ★兜底用 'numeric'(与 schema 同词表),不再 'number'
 
 
 def interrogative(kind: str | None) -> str:
