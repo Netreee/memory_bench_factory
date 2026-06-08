@@ -29,15 +29,20 @@ obl = _orders_by_line(orders)
 ck("_orders_by_line 计数正确", obl == {"L1_timeline": 8, "L2_relational": 4, "L3_process": 5})
 ck("_orders_by_line 空输入 → {}", _orders_by_line([]) == {})
 
-# ── _order_deficit:可行线计差额、不可行线不计、达标线不计 ──────────────────────
+# ── _order_deficit:可行线【实质】短缺才记(容差吸收噪声)、不可行线不计、达标线不计 ──
 target = {"L1_timeline": 10, "L2_relational": 6, "L3_process": 5, "L5_conflict": 3}
-produced = {"L1_timeline": 8, "L2_relational": 6, "L3_process": 2}      # L1 缺2, L2 够, L3 缺3, L5 0
+# L1 缺2(=容差 max(1,round(10×.15))=2,噪声,不算);L3 缺3(>容差 max(1,round(5×.15))=1,实质);L2 够;L5 0
+produced = {"L1_timeline": 8, "L2_relational": 6, "L3_process": 2}
 feasible = {"L1_timeline", "L2_relational", "L3_process"}               # L5 不可行(无文本字段)
 defi = _order_deficit(produced, target, feasible)
-ck("_order_deficit:可行且不足的线进赤字(L1 缺2/L3 缺3)", defi == {"L1_timeline": 2, "L3_process": 3})
+ck("_order_deficit:噪声级短缺(L1 缺2=容差)不进赤字", "L1_timeline" not in defi)
+ck("_order_deficit:实质短缺(L3 缺3>容差)进赤字、记全额", defi.get("L3_process") == 3)
 ck("_order_deficit:配额已满足的线不进赤字(L2)", "L2_relational" not in defi)
 ck("_order_deficit:不可行线不进赤字(L5,扩世界也没用)", "L5_conflict" not in defi)
 ck("_order_deficit:全达标 → 空赤字", _order_deficit({"L1_timeline": 10}, {"L1_timeline": 10}, {"L1_timeline"}) == {})
+# 容差边界(配额10→容差2):缺=容差放过、缺=容差+1 触发(记全额)
+ck("_order_deficit:容差边界 缺=tol 放过", _order_deficit({"L1_timeline": 8}, {"L1_timeline": 10}, {"L1_timeline"}) == {})
+ck("_order_deficit:容差边界 缺=tol+1 触发记全额3", _order_deficit({"L1_timeline": 7}, {"L1_timeline": 10}, {"L1_timeline"}) == {"L1_timeline": 3})
 
 # ── _grow_for_supply:有赤字才长、夹 clamp、无赤字原样 ───────────────────────────
 p0 = WorldParams(n_entities=12, n_sessions=10, quota_L1=10, max_n_conflicts=3, target_orders=target)

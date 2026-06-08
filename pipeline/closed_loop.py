@@ -20,20 +20,28 @@ def _orders_by_line(orders) -> dict:
 
 
 def _order_deficit(produced: dict, target_orders: dict, feasible: set) -> dict:
-    """①环判据:可行线里 实产 < 配额 的差额 {line: 缺多少}。不可行线不计(供不出,扩世界也没用)。"""
-    return {lid: tgt - produced.get(lid, 0)
-            for lid, tgt in target_orders.items()
-            if lid in feasible and produced.get(lid, 0) < tgt}
+    """①环判据:可行线里【实质】短缺 {line: 全额缺多少}(短超容差才算)。不可行线不计(扩世界也没用)。
+    ★容差 = max(1, round(配额×0.15)):配额本就是 floor/survival×slack 的【过度供给】,slack 就是用来吸收
+    "12/13 这种噪声抖动"的——差 1 单 / <15% 不该触发重渲整个世界(实测:差 1 单曾引发 14→49 的 3.5× 重建)。
+    真不够(短超容差)才记赤字去长世界;小缺口交给 over-provision slack + ②实测纠偏环 + fail-open 兜。"""
+    out = {}
+    for lid, tgt in target_orders.items():
+        got = produced.get(lid, 0)
+        if lid in feasible and got < tgt - max(1, round(tgt * 0.15)):
+            out[lid] = tgt - got
+    return out
 
 
 def _grow_for_supply(params: WorldParams, deficit: dict) -> WorldParams:
-    """①环成长:订单供不上 → 世界基质不够 → 放大 n_entities/n_sessions 重建(配额是 over-provision 目标,不动;
-    长大的是供给侧)。夹 clamp 防爆。无赤字则原样返回。"""
+    """①环成长:【实质】供不上才长世界,**按缺口比例温和补**实体(不再 ×1.4 一刀切)。夹 clamp。无赤字原样返回。
+    粗率 ~0.4 单/实体(同 invert_rate 的 RATE_L3);缺口大才顺带加几周。"""
     from pipeline.targetspec import N_ENT_CLAMP, N_SESS_CLAMP
     if not deficit:
         return params
-    n_ent = min(N_ENT_CLAMP[1], math.ceil(params.n_entities * 1.4) + 2)
-    n_sess = min(N_SESS_CLAMP[1], params.n_sessions + 3)
+    short = sum(deficit.values())                                   # 实质短缺总单数
+    add_ent = max(3, math.ceil(short / 0.4))                        # 按缺口比例补实体(0.4 单/实体粗率)
+    n_ent = min(N_ENT_CLAMP[1], params.n_entities + add_ent)
+    n_sess = min(N_SESS_CLAMP[1], params.n_sessions + 2)            # 实质赤字才到这里 → 顺带 +2 周(助 L1/L3 跨周供给)
     return dataclasses.replace(params, n_entities=n_ent, n_sessions=n_sess)
 
 
