@@ -18,8 +18,8 @@
 | 线 | 状态 | 备注 |
 |---|---|---|
 | **L4_preference** | 🟢 已建+自检 13/13 | 但 e2e 未激活(office 无偏好轴=域条件正确);要 **medical 等带选择维度的场景**才 fire |
-| **L6_refusal**(拒答边界) | 🔴 未设计 | 只 taxonomy 占位 |
-| **L7_consolidation**(巩固摘要) | 🔴 未设计 | 只 taxonomy 占位 |
+| **L6_refusal**(拒答边界) | 🟡 设计稿待审 | `L6_refusal_design.md`(全谱系含诱饵:T1张冠李戴/T2窗外/T3假前提);★新机理=接地反向(诱饵在/真答案不在)+ 闸专杀假拒答 |
+| **L7_consolidation**(巩固摘要) | 🟡 设计稿待审 | `L7_consolidation_design.md`(S1趋势/S2对比/S3阶段);★命脉=趋势分类器+margin 实测定标(复用 L4 纪律) |
 
 ## D. 大件·已设计/已记,待排期(不阻塞别的)
 | 项 | 状态 | 关键 |
