@@ -17,7 +17,9 @@ def _world_system(profile: dict) -> str:
     return render("world.system", noun=noun, fdesc=fdesc, stopped=stopped)
 
 
-def build_world(wp, tracer, log=print) -> WorldState:
+def build_world(wp, tracer, log=print, existing=None) -> WorldState:
+    """existing=None:全量建。existing=WorldState:★增量 augment——只长【新实体】(名避开既有+主干)
+    并入既有世界,旧实体不动(给闭环 ②环增量续渲用,§10.1)。"""
     profile = wp.get("domain_profile", {})
     spec = wp.get("shared_world_spec", {})
     n_entities = int(spec.get("entities", {}).get("count", 10))
@@ -32,7 +34,10 @@ def build_world(wp, tracer, log=print) -> WorldState:
     extra = (f"★变更密度:evolving 字段尽量按「{cd}」铺满全程。" if cd else "")
     extra += (f"★陷阱布局:本场景需自然埋入这些坑——{traps}(如可矛盾的多源字段、易混字段)。" if traps else "")
     merged = {"entities": [], "cascades": [], "absent_fields": []}
-    seen, seen_base = set(), set()                    # ★Fix3:seen_base 防【表面塌缩】近重名(主干相同)
+    base_ents = existing.entities if existing is not None else {}    # ★增量:在既有世界上只长新实体
+    seen = set(base_ents)                             # 新实体名避开既有
+    seen_base = {_strip_disambig(e) for e in base_ents}  # ★Fix3:也避开既有主干(不近重名)
+    base_n = len(base_ents)
     batch = 8
 
     def _world_batch(_i):                             # 一个批次:求 batch 个实体
@@ -42,18 +47,19 @@ def build_world(wp, tracer, log=print) -> WorldState:
             temperature=0.7, max_tokens=8192)
 
     for rnd in range(4):                              # 最多 4 轮;每轮把"还差几个"凑成的批次【并发】发(全局信号量限在飞 API)
-        if len(merged["entities"]) >= n_entities:
+        if base_n + len(merged["entities"]) >= n_entities:
             break
-        n_calls = (n_entities - len(merged["entities"]) + batch - 1) // batch
+        n_calls = (n_entities - base_n - len(merged["entities"]) + batch - 1) // batch
         for out in config.pmap(_world_batch, range(n_calls), workers=n_calls):
             for e in (out.get("entities", []) if isinstance(out, dict) else []):
                 nm = e.get("name")
                 if nm and nm not in seen and e.get("fields"):
                     base = _strip_disambig(nm)
-                    if base in seen_base:             # ★Fix3:主干已存在 → 表面塌缩近重名,丢弃(裸专名渲染会指代不唯一)
+                    if base in seen_base:             # ★Fix3:主干已存在(含既有世界)→ 表面塌缩近重名,丢弃
                         continue
                     seen.add(nm); seen_base.add(base); merged["entities"].append(e)
-        log(f"  世界 round{rnd+1}: 累计 {len(merged['entities'])}/{n_entities} {noun}(并发 {n_calls} 批)")
+        log(f"  世界 round{rnd+1}: 累计 {base_n + len(merged['entities'])}/{n_entities} {noun}"
+            f"{'(增量)' if existing is not None else ''}(并发 {n_calls} 批)")
     ws, _ = assemble_world(merged)
     # ★W.3 CRITIC 修复轮:assemble 算出的缺陷不再"只 log 就扔"——定向重生成坏字段(复用并行骨架:发散批次→收敛修复)
     ent_idx = {e.get("name"): e for e in merged["entities"]}
@@ -83,7 +89,11 @@ def build_world(wp, tracer, log=print) -> WorldState:
             if e and newf:                                # 只覆盖被点名的坏字段,不新增/不动其它字段
                 e["fields"].update({k: v for k, v in newf.items() if k in e.get("fields", {})})
         ws, _ = assemble_world(merged)
-    ws.n_sessions = max(ws.n_sessions or 0, n_sessions)
+    ws.n_sessions = max(ws.n_sessions or 0, n_sessions, (existing.n_sessions if existing is not None else 0))
+    if existing is not None:                          # ★增量 augment:只把【新实体】并入既有世界,旧实体/旧 docs 全不动
+        existing.entities.update(ws.entities)
+        existing.n_sessions = max(existing.n_sessions or 0, ws.n_sessions)
+        ws = existing
     rem = validate(ws, merged)
     coll = name_collisions(ws)                        # ★Fix3:表面塌缩兜底检测(收集期已按主干去重,这里抓漏网)
     log(f"  ✓ 基础世界:{len(ws.entities)} 实体 / {ws.n_sessions} 周 / 修复后残留缺陷 {len(rem)}"

@@ -79,7 +79,10 @@ def _chunk(lst, n):
         yield lst[i:i + n]
 
 
-def render_corpus(wp, ws, target_tokens, tracer, corpus, done_weeks, save_cb, log=print):
+def render_corpus(wp, ws, target_tokens, tracer, corpus, done_weeks, save_cb, log=print, only_entities=None):
+    """only_entities=None:全量渲(每周全实体+filler)。
+    only_entities=set:★增量 delta(§10.1)——【只渲这些新实体的 signal】并【追加】到已有周 docs,
+    不重渲旧实体、不重灌 filler;遍历所有周(新实体跨全程)。给闭环 ②环增量续渲用。"""
     profile = wp.get("domain_profile", {})
     sys_sig, sys_fil = _corpus_system(profile), _filler_system(profile)
     blocked = _tracked_blocklist(ws, profile)
@@ -87,12 +90,16 @@ def render_corpus(wp, ws, target_tokens, tracer, corpus, done_weeks, save_cb, lo
     n_sessions = ws.n_sessions
     filler_per_week = max(8, round(target_tokens / max(1, n_sessions) / 800))   # 每篇≈800字
     by_id = {x["session_id"]: x for x in corpus["sessions"]}
-    weeks = [s for s in ws.sessions() if s not in done_weeks]
+    weeks = list(ws.sessions()) if only_entities else [s for s in ws.sessions() if s not in done_weeks]
     lock = threading.Lock()
 
     def _render_week(s):                                  # ★一周的全部渲染 = 一个并行单元
         date = _date_of(s)
         facts = _session_facts(ws, s)
+        if only_entities is not None:                     # ★delta:本周只渲新实体的事实
+            facts = [f for f in facts if f["entity"] in only_entities]
+            if not facts:
+                return s                                  # 新实体本周无事实 → 不加 doc
         bysku = {}
         for f in facts:
             bysku.setdefault(f["entity"], []).append(f)
@@ -136,23 +143,32 @@ def render_corpus(wp, ws, target_tokens, tracer, corpus, done_weeks, save_cb, lo
                     if d.get("content") and not any(b in d.get("content", "") for b in blocked)]
 
         sig_lists = config.pmap(_render_sig, sig_groups, workers=8)              # 周内并发(全局信号量才是真上限)
-        fil_lists = config.pmap(_render_fil, list(range(n_batches)), workers=8)
-        docs = []                                          # 周内顺序编号,避免 race(doc_id 含 s,跨周不撞)
-        for gl in sig_lists:
-            for d in gl:
-                d["doc_id"] = f"s{s}_sig_{len(docs)}"; docs.append(d)
-        for fl in fil_lists:
-            for d in fl:
-                d.update({"doc_id": f"s{s}_fil_{len(docs)}", "is_filler": True, "fact_refs": []}); docs.append(d)
-        for d in _render_conflict_docs(ws, s, date, tracer):      # ★L5:本周小道矛盾文档(非 L5 场景为空)
-            d.update({"doc_id": f"s{s}_conf_{len(docs)}", "is_conflict": True, "fact_refs": []}); docs.append(d)
         with lock:                                         # 周乱序完成 → 锁内更新+逐周存盘(断点续渲不丢)
-            by_id[s] = {"session_id": s, "date": date, "docs": docs}
-            done_weeks.add(s)
+            if only_entities is not None:                  # ★delta:追加新实体 signal 到【已有周 docs】,接着编号;不灌 filler/conflict
+                docs = list(by_id.get(s, {}).get("docs", []))
+                base = len(docs)
+                for gl in sig_lists:
+                    for d in gl:
+                        d["doc_id"] = f"s{s}_sig_{base}"; base += 1; docs.append(d)
+                by_id[s] = {"session_id": s, "date": date, "docs": docs}   # 旧 docs 原样保留,只增量
+            else:                                          # 全量:本周 signal + filler + 小道矛盾,整周写入
+                fil_lists = config.pmap(_render_fil, list(range(n_batches)), workers=8)
+                docs = []                                  # 周内顺序编号,避免 race(doc_id 含 s,跨周不撞)
+                for gl in sig_lists:
+                    for d in gl:
+                        d["doc_id"] = f"s{s}_sig_{len(docs)}"; docs.append(d)
+                for fl in fil_lists:
+                    for d in fl:
+                        d.update({"doc_id": f"s{s}_fil_{len(docs)}", "is_filler": True, "fact_refs": []}); docs.append(d)
+                for d in _render_conflict_docs(ws, s, date, tracer):      # ★L5:本周小道矛盾文档(非 L5 场景为空)
+                    d.update({"doc_id": f"s{s}_conf_{len(docs)}", "is_conflict": True, "fact_refs": []}); docs.append(d)
+                by_id[s] = {"session_id": s, "date": date, "docs": docs}
+                done_weeks.add(s)
             corpus["sessions"] = [by_id[k] for k in sorted(by_id)]
             save_cb()
             ch = sum(len(dd.get("content", "")) for x in corpus["sessions"] for dd in x["docs"])
-            log(f"  [周 {s} ✓ {len(done_weeks)}/{n_sessions}] 累计 {sum(len(x['docs']) for x in corpus['sessions'])} 篇 / {ch/1e6:.2f}M 字")
+            tag = "delta+" if only_entities is not None else ""
+            log(f"  [周 {s} ✓{tag} {len(done_weeks)}/{n_sessions}] 累计 {sum(len(x['docs']) for x in corpus['sessions'])} 篇 / {ch/1e6:.2f}M 字")
         return s
 
     config.pmap(_render_week, weeks, workers=max(1, len(weeks)))   # ★周并行;在飞 API 由全局 LLM_CONCURRENCY 兜住

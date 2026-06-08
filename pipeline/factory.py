@@ -91,7 +91,10 @@ def stage_whitepaper(run: Run):
 
 def stage_world(run: Run):
     wp = run.read(ART["whitepaper"])
-    ws = build_world(wp, run.tracer, run.log)
+    existing = None
+    if run.manifest["config"].get("augment") and run.has(ART["world"]):   # ★增量(§10.1):在既有世界上 augment 新实体,旧不动
+        existing = WorldState.from_dict(run.read(ART["world"]))
+    ws = build_world(wp, run.tracer, run.log, existing=existing)
     _prepare_lines(wp, ws, run.log)
     run.write(ART["world"], ws.to_dict())
     run.set_algo(entities=len(ws.entities), sessions=ws.n_sessions)
@@ -144,7 +147,9 @@ def stage_corpus(run: Run):
     def save():
         ckpt.write_text(json.dumps({"corpus": corpus, "done_weeks": sorted(done)}, ensure_ascii=False), encoding="utf-8")
 
-    render_corpus(wp, ws, target, run.tracer, corpus, done, save, run.log)
+    only = run.manifest["config"].get("render_only")        # ★增量(§10.1):只渲这些新实体、追加到已有周 docs
+    render_corpus(wp, ws, target, run.tracer, corpus, done, save, run.log,
+                  only_entities=set(only) if only else None)
     ch = sum(len(dd.get("content", "")) for x in corpus["sessions"] for dd in x["docs"])
     run.set_algo(docs=sum(len(x["docs"]) for x in corpus["sessions"]), chars=ch)
 
