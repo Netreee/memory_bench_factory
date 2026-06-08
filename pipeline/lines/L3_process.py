@@ -17,14 +17,27 @@ from pipeline.world_state import WorldState, gt_event_order, _norm, EXPIRE, DELE
 MIN_EVENTS = 3                                          # 一道排序题至少要 3 个事件才有料
 
 
+def _value_history_count(ws: WorldState, ent: str) -> Counter:
+    """(field, _norm(value)) → 该取值在实体【全值史·含初始 SET】出现几次 = 读者在语料里看得见它几次。
+    >1 ⇒ "「字段」变为该值"无唯一可定位周(指代歧义)。
+    ★这是 L3 "可定位"判据的【唯一真相源】:源头点菜(_locatable_events)与边A闸(well_posed I2)共用同一函数,
+      杜绝两处定义漂移 —— run160053 Q31 正是源头与闸【都】只数变更流、【都】漏初始 SET → 双双漏放
+      (值班 wk1 初设 3 / wk6 改回 3,读者两处看见 3,却没被判为复现)。计数域必须 = 读者真看得见的取值序列。"""
+    vc: Counter = Counter()
+    for fname, tl in ws.entities.get(ent, {}).items():
+        for (_s, _d, v) in tl.set_values():             # set_values = 该字段所有 SET+UPDATE 取值(含初始 SET)
+            if v:
+                vc[(fname, _norm(v))] += 1
+    return vc
+
+
 def _locatable_events(ws: WorldState, ent: str) -> list[dict]:
-    """该实体的变更事件,滤掉【复现值】——同 (字段,值) 在世界出现 >1 次 → "「字段」变为该值"在排序题里
-    指代不唯一(无唯一可定位周)→ ill-posed。源头执行 L3 良定义(well_posed I2),让 enumerate 不产坏题。
+    """该实体的变更事件,滤掉【复现值】(全值史里同(字段,值)出现 >1 次)→ 源头杜绝 ill-posed 排序。
     · 按 (field, value) 计数,不按 field:同字段不同值(报表数=25 / =15)各自唯一可定位,保留;
     · 停用事件(value 空)是终态、天然唯一,保留。"""
-    events = gt_event_order(ws, ent)                    # 已按 (date,session) 时序
-    vc = Counter((e["field"], str(e.get("value"))) for e in events if e.get("value"))
-    return [e for e in events if (not e.get("value")) or vc[(e["field"], str(e.get("value")))] == 1]
+    vc = _value_history_count(ws, ent)                  # 与 well_posed I2 同一口径
+    return [e for e in gt_event_order(ws, ent)          # 排序题只点 UPDATE/EXPIRE/DELETE
+            if (not e.get("value")) or vc[(e["field"], _norm(e.get("value")))] == 1]
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -106,7 +119,8 @@ class ProcessLine(ProductionLine):
     # ── ★边 A 闸:良定义(docs/anchors/edge_a/L3_well_posed.md,已 QA)──
     def well_posed(self, order: dict, ws) -> tuple:
         """gold 是这道排序题在【世界】里唯一、合法、可复算的解吗?纯代码、零 LLM、不碰 corpus。
-        只信 gt_event_order(ws,ent)(与 gt() 同源,非 aux 烘焙日期)。I0–I6 见设计 §2/§3。
+        序/存在性信 gt_event_order(ws,ent)(与 gt() 同源,非 aux 烘焙日期);I2 复现计数信全值史
+        _value_history_count(含初始 SET,与源头 _locatable_events 同一函数)。I0–I6 见设计 §2/§3。
         现线唯一真高发病 = I2(同(字段,值)复现 → 指代不唯一);源头 _locatable_events 已挡,
         I2 现为防回归。I1/I3/I4/I5 实测 0 触发(纯兜底)。I2 按 (field,value) 判、不按 field 去重
         (同字段不同唯一值各自可定位,必放行 —— 反误杀守则 WP3)。"""
@@ -131,6 +145,7 @@ class ProcessLine(ProductionLine):
             pos_in_W[(*k, w["session"])] = idx
 
         # ── 为 E 每个事件解析它对应的【唯一】真实 session(I1 存在性 + I2 唯一可定位)──
+        vhist = _value_history_count(ws, ent)              # ★I2 口径=全值史(与源头 _locatable_events 同一函数,含初始 SET)
         resolved = []                                      # [(e, true_session, true_idx)]
         for e in E:
             is_stop = e.get("op") in (EXPIRE, DELETE) or e.get("value") in (None, "")
@@ -141,11 +156,16 @@ class ProcessLine(ProductionLine):
             if not sessions:
                 return ("drop", f"事件「{e.get('field')}={e.get('value')}」(op={op})"
                                 f"世界无此变更(悬空值/物理不存在)")
-            # I2 唯一可定位值:同 (字段,值) 变了多次 → 题面「变为该值」无唯一指代(停用天然单次,统一判)
-            if len(set(sessions)) > 1:
+            # I2 唯一可定位值:非停用值按【全值史·含初始 SET】计数(= vhist,与源头同口径);停用事件天然单次,按变更流判。
+            #   run160053 Q31:旧实现只数变更流、漏初始 SET → "初值=X + 改回 X" 漏放。停用值=""走身份 (field,"",op)。
+            n_loc = len(set(sessions)) if is_stop else vhist[(e.get("field"), _norm(e.get("value")))]
+            if n_loc > 1:
                 from pipeline.world_state import week_label
+                tl = ws.entities.get(ent, {}).get(e.get("field"))
+                wk = (sorted(set(sessions)) if is_stop else
+                      sorted({_s for (_s, _d, v) in (tl.set_values() if tl else []) if _norm(v) == _norm(e.get("value"))}))
                 return ("drop", f"事件「{e.get('field')}={e.get('value')}」无唯一可定位周"
-                                f"(出现于周 {[week_label(s) for s in sorted(set(sessions))]},指代歧义)")
+                                f"(出现于周 {[week_label(s) for s in wk]},指代歧义)")
             s = sessions[0]
             resolved.append((e, s, pos_in_W[(*k, s)]))
 
@@ -340,6 +360,23 @@ if __name__ == "__main__":
     st, why = line.well_posed(ip5, ip5_ws)
     ck("IP5 复现值 drop(I2,证 I2 真工作非只堵字面5)", st == "drop")
     ck("IP5 reason 命中『无唯一可定位周』", "无唯一可定位周" in why)
+
+    # IP6 ✗【初值复现】(run160053 Q31:IP5 漏的那类):值班 wk0 初设=3 → s1 改 5 → s6 又改回 3。
+    #   "变为 3" 在初设(s0)与 s6 两处可落 → 指代不唯一。★IP5 用两个 UPDATE(都在变更流里),
+    #   IP6 故意让复现值【等于初始 SET】—— 旧实现只数变更流、漏初始 SET → 源头与闸【双双漏放】(这正是 Q31)。
+    ip6_ws = _W({"值班":   [(0, SET, "3", None), (1, UPDATE, "5", "3"), (6, UPDATE, "3", "5")],   # 3 = 初值,s6 改回
+                 "缺陷率": [(0, SET, "1", None), (4, UPDATE, "2", "1")],
+                 "负责人": [(0, SET, "张三", None), (5, UPDATE, "李四", "张三")]})
+    # ① 源头:enumerate 必须剔掉"值班=3"(初值复现),不进任何 gt
+    ip6_orders = line.enumerate(ip6_ws)
+    ip6_vals = [(e["field"], str(e.get("value"))) for o in ip6_orders for e in o["gt"]]
+    ck("IP6 源头:初值复现『值班=3』被 enumerate 剔除", ("值班", "3") not in ip6_vals)
+    ck("IP6 源头:唯一值『值班=5』保留", ("值班", "5") in ip6_vals)
+    # ② 闸:手塞含"值班→3@s6"的坏序,well_posed 必 drop(证闸与源头同口径、不再漏放)
+    ip6 = _ord([_ev("值班", "3", 6), _ev("缺陷率", "2", 4), _ev("负责人", "李四", 5)])
+    st, why = line.well_posed(ip6, ip6_ws)
+    ck("IP6 闸:初值复现 drop(I2 全值史口径,堵 Q31)", st == "drop")
+    ck("IP6 reason 命中『无唯一可定位周』且列出初设周", "无唯一可定位周" in why)
 
     # I0:长度过短 drop
     ip0 = _ord([_ev("P0", "1.8", 1), _ev("SLA", "98", 3)])

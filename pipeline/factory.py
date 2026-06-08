@@ -64,12 +64,16 @@ ART = {"input": "00_input.json", "whitepaper": "01_whitepaper.json", "world": "0
 # ★作答协议(B类①修复):benchmark 出厂【显式声明】None 的两类语义 + 期望作答,治"None 未定义→理性系统被误判"。
 #   契约层一处声明(非逐题补丁),所有 None 题共享;eval 侧据此把 gold 哨兵映射到人类作答。
 ANSWER_PROTOCOL = {
-    "version": 1,
+    "version": 2,
     "rules": [
         "普通问题:答该项在【题面所指时点】的具体值。",
+        "【截至最新一期】:锚点 = 该实体最后一次有效记录(不是全局最后一周),沿用其最近有效值(carry-forward)。"
+        "全程在场的实体折到全局最后一期,早退场的实体折到它最后出现那一期——这是【同一条沿用规则】碰上不同寿命,不是两套口径。",
         "【从未涉及/不存在】:所问项在本场景根本没有(gold 标记 INSUFFICIENT,产线 ABS)→ 期望答『无此项/查无此记录』。",
-        "【曾有但已停止统计】:所问项曾被跟踪、现已停更(gold forgotten=True,产线 FORGET)→ 期望答『已停止统计/不再跟踪』;若问停止【前】的值则照常答值。",
+        "【曾有但已显式停止统计】:所问项曾被跟踪、现已停更(gold forgotten=True,产线 FORGET)→ 期望答『已停止统计/不再跟踪』。",
+        "【停统前的最后值】:若问的是『停止统计前最后一次』(产线 PREEXPIRE)→ 这是另一类问法,照常答停掉那一刻的值(非 None)。",
     ],
+    "latest_means_carry_forward": True,     # ★"最新一期"=该实体末次有效记录沿用,统一口径(run160053 D 点的"双标"实为读者侧表面歧义,gold 本就单一真源 latest_valid)
     "two_none_types_distinguished": True,   # ★区分"从未存在"(ABS)vs"曾有已停"(FORGET)是考点
     "gold_sentinel_map": {"INSUFFICIENT": "无此项/查无此记录", "forgotten=true": "已停止统计/不再跟踪"},
 }
