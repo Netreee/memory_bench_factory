@@ -17,15 +17,15 @@ from pipeline.lines.L3_process import ProcessLine
 from pipeline.lines.L4_preference import PreferenceLine
 from pipeline.lines.L5_conflict import ConflictLine
 from pipeline.lines.L6_refusal import RefusalLine
+from pipeline.lines.L7_consolidation import ConsolidationLine
 
 # ── 已建成的产线(实例)──
-LINES: list[ProductionLine] = [TimelineLine(), RelationalLine(), ProcessLine(),
-                               PreferenceLine(), ConflictLine(), RefusalLine()]
+LINES: list[ProductionLine] = [TimelineLine(), RelationalLine(), ProcessLine(), PreferenceLine(),
+                               ConflictLine(), RefusalLine(), ConsolidationLine()]
 
 # ── 规划但未落地的坐标(只元数据,给议会看完整菜单;建成后从这里删、移进 LINES)──
-PLANNED: list[tuple[str, str, str]] = [
-    ("L7_consolidation", "巩固摘要", "长跨度要点/趋势回忆(非逐字)"),
-]
+# ★L1–L7 七条线全部落地。新规划线在此登记(只元数据),建成后移进 LINES。
+PLANNED: list[tuple[str, str, str]] = []
 
 INVARIANTS: list[str] = [
     "每条产线必须自带【代码可算的 ground truth】——没有代码 gt 的产线不准入厂(守护城河)。",
