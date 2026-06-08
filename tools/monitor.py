@@ -202,6 +202,8 @@ def snapshot(run_dir: Path) -> dict:
         "step_now": STEP_HUMAN.get(pr["last_step"], pr["last_step"]),
         "elapsed_s": int(elapsed), "chars": chars, "n_docs": n_docs, "target": target,
         "algo": algo,
+        "env": m.get("env", {}),                               # 工程配置快照(模型/并发/端点)
+        "cfg": m.get("config", {}),                            # per-run 配置(target_tokens/quotas/from-to-only)
         "log_tail": _tail(run_dir / "run.log", 14),
     }
 

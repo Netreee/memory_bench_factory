@@ -22,6 +22,17 @@ def new_run_id(scenario: str) -> str:
     return f"{scenario}__{time.strftime('%Y%m%d-%H%M%S')}"
 
 
+def _env_snapshot() -> dict:
+    """run 启动时快照【工程配置】(模型/并发/端点)进 manifest。让监控显示这一轮【真实跑的】配置,
+    而非读 config 此刻的 env(历史 run / 中途改过 env 都会失真)。★api_key 绝不入快照。"""
+    try:
+        import config
+        return {"model": config.MODEL, "llm_concurrency": config.LLM_CONCURRENCY,
+                "base_url": config.BASE_URL or ""}
+    except Exception:
+        return {}
+
+
 # ════════════════════════════════════════════════════════════════════════════
 # Tracer:每次 LLM 调用记到 <run>/prompts.jsonl(线程安全;网络在锁外 → 真并发)
 # ════════════════════════════════════════════════════════════════════════════
@@ -80,6 +91,8 @@ class Run:
         self.log = self._make_logger()
         self.tracer = Tracer(self)
         self.manifest = self._load_or_init_manifest(tag, config_meta or {})
+        self.manifest["env"] = _env_snapshot()      # 工程配置快照(模型/并发/端点),供监控集中展示
+        self._save_manifest()
 
     # ── 产物读写(stage 只跟 Run 打交道,不碰路径)──
     def write(self, artifact: str, obj):

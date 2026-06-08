@@ -92,6 +92,10 @@ body{background:var(--bg);color:var(--fg);font-family:-apple-system,"PingFang SC
 #barlabel{position:absolute;right:10px;top:0;line-height:18px;font-size:11px;font-family:Menlo,monospace}
 #algo{color:var(--fg);font-size:13px;margin:14px 2px;display:flex;gap:8px;flex-wrap:wrap}
 #algo span{background:var(--card);padding:4px 10px;border-radius:7px}
+#engine{display:flex;gap:7px;flex-wrap:wrap;align-items:center;margin:12px 0 2px;padding:10px 12px;background:#181825;border:1px solid var(--track);border-radius:10px}
+#engine .ehdr{color:var(--mute);font-size:12px;font-weight:700;margin-right:2px}
+#engine .ek{background:var(--card);font-size:12px;padding:4px 10px;border-radius:7px;font-weight:600}
+#engine .ek b{color:var(--acc);font-weight:700;margin-right:5px}
 #llmbreak{display:flex;gap:6px;flex-wrap:wrap;margin:8px 2px}
 #llmbreak .lbhdr{color:var(--mute);font-size:11px;margin-right:2px}
 .lb{background:var(--card);color:var(--mute);font-size:11px;padding:3px 8px;border-radius:6px}
@@ -109,6 +113,7 @@ body{background:var(--bg);color:var(--fg);font-family:-apple-system,"PingFang SC
 </style></head><body>
 <div class="row"><span id="run">等待 run…</span><span class="chip" id="tag" style="display:none"></span></div>
 <div id="status"><span id="dot"></span><span id="statustext">先开窗口、再启动 pipeline 也行——自动 latch 最新 run</span><span id="stats"></span></div>
+<div id="engine"></div>
 <div id="graph"><svg id="gedges"></svg><div id="gnodes"></div></div>
 <div id="lines"></div>
 <div id="hint">▸ 点任意【节点】或【产线】看详情 + 该节点日志切片。运行中节点高亮;orders 一分为七 = 各产线。</div>
@@ -183,6 +188,14 @@ function render(s){
   if(s.stall_s!=null&&s.stall_s>45)stat.push(`<b class="warn">⏸ ${s.stall_s}s 无 LLM 活动</b>`);
   if(s.max_latency_ms>30000)stat.push(`<b class="warn">最慢 ${(s.max_latency_ms/1000).toFixed(0)}s</b>`);
   $('stats').innerHTML=stat.join('');
+  // ⚙ 运行配置(工程信息集中:模型/并发/端点/目标/区间/配额)——这一轮【真实跑的】配置,非读 config 当前 env
+  const ev=s.env||{}, cf=s.cfg||{}, eng=[['模型',ev.model||'?'],['并发',ev.llm_concurrency??'?']];
+  if(ev.base_url)eng.push(['端点',String(ev.base_url).replace(/^https?:\/\//,'').split('/')[0]]);
+  if(cf.target_tokens)eng.push(['目标',(cf.target_tokens/1e6).toFixed(cf.target_tokens>=1e6?1:2)+'M tok']);
+  const seg=(cf.from||cf.to)?`${cf.from||'起'}→${cf.to||'终'}`:(cf.only?'only '+cf.only:'');
+  if(seg)eng.push(['区间',seg]);
+  if(cf.quotas&&Object.keys(cf.quotas).length)eng.push(['配额',Object.entries(cf.quotas).map(([k,v])=>k.split('_')[0]+':'+v).join(' ')]);
+  $('engine').innerHTML='<span class="ehdr">⚙ 运行配置</span>'+eng.map(([k,v])=>`<span class="ek"><b>${esc(k)}</b> ${esc(v)}</span>`).join('');
   drawGraph(s); drawLines(s);
   // LLM 花在哪 + 失败卡在哪个 step
   const HS={'world.batch':'世界','world.repair':'修复','council.observe':'议会观测','council.skeptic':'议会怀疑','council.map':'议会映射','council.medium':'议会媒介','council.style':'议会文风','council.traps':'议会陷阱','council.critique':'议会批判','render.signal':'信号','render.filler':'草堆','render.conflict':'矛盾','phrase':'出题'};
