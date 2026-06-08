@@ -61,10 +61,23 @@ ART = {"input": "00_input.json", "whitepaper": "01_whitepaper.json", "world": "0
        "orders": "03_orders.json", "questions": "04_questions.json", "corpus": "05_corpus.json",
        "grounding": "06_grounded_questions.json"}
 
+# ★作答协议(B类①修复):benchmark 出厂【显式声明】None 的两类语义 + 期望作答,治"None 未定义→理性系统被误判"。
+#   契约层一处声明(非逐题补丁),所有 None 题共享;eval 侧据此把 gold 哨兵映射到人类作答。
+ANSWER_PROTOCOL = {
+    "version": 1,
+    "rules": [
+        "普通问题:答该项在【题面所指时点】的具体值。",
+        "【从未涉及/不存在】:所问项在本场景根本没有(gold 标记 INSUFFICIENT,产线 ABS)→ 期望答『无此项/查无此记录』。",
+        "【曾有但已停止统计】:所问项曾被跟踪、现已停更(gold forgotten=True,产线 FORGET)→ 期望答『已停止统计/不再跟踪』;若问停止【前】的值则照常答值。",
+    ],
+    "two_none_types_distinguished": True,   # ★区分"从未存在"(ABS)vs"曾有已停"(FORGET)是考点
+    "gold_sentinel_map": {"INSUFFICIENT": "无此项/查无此记录", "forgotten=true": "已停止统计/不再跟踪"},
+}
 
 
 def stage_input(run: Run):
     run.write(ART["input"], SCENARIOS[run.scenario])
+    run.write("00_about.json", {"answer_protocol": ANSWER_PROTOCOL})   # ★出厂作答协议(随题库交付,eval 侧读)
 
 
 def stage_whitepaper(run: Run):

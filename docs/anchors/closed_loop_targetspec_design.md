@@ -192,8 +192,19 @@ filler_per_week ≈ (corpus_chars - needle_chars) / n_sess / 800   # 每篇 fill
 ## §10 落地路线(v0 → v2)
 
 - **v0(真地基)— ✅ 已落地**:① `run_lines` 配额驱动 + L1 `_PLAN→_CAP_WEIGHT` 退役(配比非写死);② `build_world` 经 driver patch 白皮书 `entities.count/n_sessions` 消费显式规模 + `invert_rate`(夹 clamp);③ `TargetSpec(min_questions+per_line_min)` 入口 + `build_to_target` driver(**直接调底层 stage 逻辑函数管自己循环,不套 `drive`**,盲审 B3);④ **①订单供给环**(`build_world+run_lines` 多子轮,赤字→`_grow_for_supply` 长世界,绝不渲)**+ ②实测纠偏环**(渲一次→接地→`_floor_status`→不达就按**实测 survival** 重 `invert_rate`+整轮重渲,有界 `max_rounds`)都在 v0;⑤ `line.feasible` 接线兜死循环 + 不可行线 floor → 永久 `UNMET` 不空转;⑥ fail-open 标 `met_status` 留痕 `manifest.algo`。**总下限盈余按比例摊进各线 floor**(消"总数单独差"歧义)。决策逻辑抽 4 个纯函数离线自检。→ "按目标管够题数 + 平衡配比",survival 纠偏内建。
-- **v1**:难度旋钮(`difficulty_score()` 各线 + 切档绝对阈值 + 分层采样 + `manifest.algo.difficulty` 验证)。
-- **v2**:**entity 级增量续渲**(②环不再整轮重渲、大幅降成本)+ 两轴 needle:haystack 精配 + 率模型多点拟合带 CI。
+- **v1(暂缓但★重要,主理人已确认记着)**:难度旋钮(`difficulty_score()` 各线 + 切档绝对阈值 + 分层采样 + `manifest.algo.difficulty` 验证,详 §4)。诚实边界:`difficulty_score` 只是【生成侧代理】,"对模型真难不难"须靠多系统评测的正确率分布校准 → v1 落地要与 `eval/multi_system.py` 联动。
+- **v2**:**entity 级增量续渲**(②环不再整轮重渲、大幅降成本,详 §10.1)+ 两轴 needle:haystack 精配 + 率模型多点拟合带 CI。
+
+## §10.1 增量续渲(v2.1)具体方案 —— 已批准、待实现
+**病**:②实测纠偏环现在【整轮重渲】(floor 不达→`unlink` corpus ckpt→`stage_corpus` 从头),corpus 是最贵步,成本爆炸(`closed_loop.py:127`)。
+**根**:②环把世界【重建】(`stage_world` 重跑 `build_world` 出全新更大世界)→ 旧 corpus 失效→只能整轮重渲。
+**正解(加性长世界 + 只渲增量,★非 ckpt 特判补丁)**:
+1. **`build_world` 加 augment 模式**:`build_world(wp,…,existing=ws)` —— 只生成 `target - len(existing)` 个【新实体】(名避开 existing + `seen_base` 主干),merge 进 existing;`existing=None` 即现行全量。
+2. **`render_corpus` 加 delta**:`render_corpus(…, only_entities=set)` —— 每周【只渲这些新实体】的 signal(filler 已在、不重生),`by_id[s]["docs"].extend(新docs)` 追加;不 `unlink`、不重渲旧实体。
+3. **stage 经 config 信号驱动(不复制 stage 体,守 B3)**:`stage_world` 见 `config["augment"]` + 存在 `02_world.json` → augment;`stage_corpus` 见 `config["render_only"]`(新实体名集)→ delta 追加。
+4. **`closed_loop` ②环改加性**:不再 grow→重建→整轮重渲;改为 augment(ΔN 实体)→ 算 `新实体 = set(新世界)-set(旧世界)` → 置 `config["render_only"]` → delta 渲 → 重 enumerate(世界更大→更多 order)→ 重接地。旧实体 docs 原样保留。
+**自检**:augment 后 `name_collisions=空`(新实体不撞旧)、delta 渲后旧周 docs 数只增不减且旧 doc 不变、`render_only` 子集渲出的 signal 就近新实体可接地。
+**成本**:O(整 corpus) → O(ΔN 实体)。**风险红线**:绝不用"哪周渲过了"的散装 if 兜;只走 augment(加实体)+ delta(渲新实体)两个干净原语 + config 信号,无 ckpt 特判。
 
 ---
 
