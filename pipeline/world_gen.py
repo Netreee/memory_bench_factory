@@ -4,9 +4,78 @@ build_world:并发批次让 LLM 填世界表 → assemble_world 成状态机 →
 """
 from __future__ import annotations
 import json
+import random
 import config
-from pipeline.world_state import assemble_world, validate, WorldState, _strip_disambig, name_collisions
+from pipeline.world_state import (assemble_world, validate, WorldState, _strip_disambig, name_collisions,
+                                   Op, SET, UPDATE, EXPIRE, DELETE, _to_num)
 from pipeline.prompts import render
+
+# ── ★结构后处理(B:L7 没料的根治)──────────────────────────────────────────────
+# LLM 吐的数值轨迹是【无趋势噪声 + 样样每周变】(实测:血压=[130,145,120,135…]、变动数全顶满)。
+# L7-S1(趋势)要的"单调走向"世界里根本没有 → 产 0 单。趋势这种 type-critical 结构【不能靠 prompt 让 LLM 造】
+# (它给不出带精确 margin+末段反转的可证伪趋势,踩坑账#6),必须【确定性代码】构造。
+# 放 world_gen(而非 L7.prepare):趋势是【世界属性】、在世界构造期一次性定,早于任何线 enumerate/渲染
+# → 单一真源不破、不可能矛盾;L7 退回"骑世界";整个 benchmark 也获得真实结构(不止 L7)。
+_TREND_MIN_PTS = 5        # 需 ≥5 个点:单调 n-1 步 + 末段反转 1 步 → margin=n-3≥2(满足 L7 TREND_MARGIN)
+
+
+def _trend_values(n: int, lo: float, hi: float, up: bool, int_like: bool, decimals: int):
+    """造 n 个值:前 n-1 个在 [lo,hi] 内单调,第 n 个【反向一步】(抗 recency 签名)。
+    返回字符串列表;若四舍五入后不能严格单调(值域太窄)→ None(调用方跳过该字段,不注坏趋势)。"""
+    if n < 3 or hi <= lo:
+        return None
+    step = (hi - lo) / (n - 2)
+    raw = [(lo + i * step) if up else (hi - i * step) for i in range(n - 1)]
+    raw.append(raw[-1] - step if up else raw[-1] + step)        # 末段反转一步 → "看最近一段"会判反
+    fmt = (lambda x: str(int(round(x)))) if int_like else (lambda x: f"{x:.{decimals}f}")
+    out = [fmt(x) for x in raw]
+    nums = [float(x) for x in out]
+    mono = all((nums[i] > nums[i - 1]) if up else (nums[i] < nums[i - 1]) for i in range(1, n - 1))
+    rev = (nums[-1] < nums[-2]) if up else (nums[-1] > nums[-2])
+    return out if (mono and rev) else None
+
+
+def imprint_structure(ws: WorldState, log=print, profile: dict | None = None, seed: int = 20260608) -> int:
+    """给一小撮【纯数值、≥5点、无停统、未注过】的字段注入真趋势(单调+末段反转,值域/格式不变)。
+    幂等(已注的实体/字段跳过,augment 只注新);只动数值字段 → 与 L4(category)/L5(text)/L2(person)基质不相交,不撞。
+    停统字段不碰(留给 FORGET/L6)。返回注入字段数。"""
+    rng = random.Random(seed)
+    done = set(getattr(ws, "_trended_fields", []) or [])
+    ws._trended_fields = list(done)
+    cands = []
+    for ent, flds in ws.entities.items():
+        for fname, tl in flds.items():
+            if (ent, fname) in done:
+                continue
+            ops = tl._sorted()
+            if any(o.op in (EXPIRE, DELETE) for o in ops):          # 有停统 → 留给 FORGET/L6,不注趋势
+                continue
+            vals = [o.value for o in ops if o.op in (SET, UPDATE) and o.value]
+            nums = [_to_num(v) for v in vals]
+            if len(vals) < _TREND_MIN_PTS or any(x is None for x in nums):
+                continue
+            cands.append((ent, fname, tl, vals, nums))
+    rng.shuffle(cands)
+    cap = int((profile or {}).get("l7_max_trends", 24))             # 注入上限(够喂 L7 配额、又不淹没全世界震荡多样性)
+    n_done = 0
+    for i, (ent, fname, tl, vals, nums) in enumerate(cands):
+        if n_done >= cap:
+            break
+        lo, hi = min(nums), max(nums)
+        int_like = all(float(x) == int(x) for x in nums)
+        decimals = max((len(v.split(".")[1]) for v in vals if "." in v), default=1)
+        pts = [(o.session, o.date) for o in tl._sorted() if o.op in (SET, UPDATE)]
+        new_vals = _trend_values(len(pts), lo, hi, up=(n_done % 2 == 0), int_like=int_like, decimals=decimals)
+        if new_vals is None:                                        # 值域太窄,造不出严格趋势 → 跳过
+            continue
+        new_ops, prev = [], None
+        for (s, d), v in zip(pts, new_vals):
+            new_ops.append(Op(s, d, SET if prev is None else UPDATE, v, prev)); prev = v
+        tl.ops = new_ops
+        ws._trended_fields.append((ent, fname)); n_done += 1
+    if n_done:
+        log(f"  ★结构后处理:{n_done} 个数值字段注入真趋势(单调+末段反转,值域/格式不变)→ 喂 L7-S1")
+    return n_done
 
 
 def _world_system(profile: dict) -> str:
@@ -94,9 +163,10 @@ def build_world(wp, tracer, log=print, existing=None) -> WorldState:
         existing.entities.update(ws.entities)
         existing.n_sessions = max(existing.n_sessions or 0, ws.n_sessions)
         ws = existing
-    rem = validate(ws, merged)
+    rem = validate(ws, merged)                        # ★validate 在【注趋势前】跑(对 merged 一致,不误报);imprint 产出本就良构,无需复验
     coll = name_collisions(ws)                        # ★Fix3:表面塌缩兜底检测(收集期已按主干去重,这里抓漏网)
     log(f"  ✓ 基础世界:{len(ws.entities)} 实体 / {ws.n_sessions} 周 / 修复后残留缺陷 {len(rem)}"
         + (f" / ⚠表面塌缩近重名 {coll}" if coll else ""))  # 产线基质由 stage_world 的 line.prepare() 叠加
+    imprint_structure(ws, log, profile)               # ★B:注入真趋势(世界属性,早于 orders/render → 不矛盾);L7-S1 据此有料
     return ws
 
