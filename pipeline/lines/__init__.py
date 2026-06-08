@@ -16,13 +16,14 @@ from pipeline.lines.L2_relational import RelationalLine
 from pipeline.lines.L3_process import ProcessLine
 from pipeline.lines.L4_preference import PreferenceLine
 from pipeline.lines.L5_conflict import ConflictLine
+from pipeline.lines.L6_refusal import RefusalLine
 
 # ── 已建成的产线(实例)──
-LINES: list[ProductionLine] = [TimelineLine(), RelationalLine(), ProcessLine(), PreferenceLine(), ConflictLine()]
+LINES: list[ProductionLine] = [TimelineLine(), RelationalLine(), ProcessLine(),
+                               PreferenceLine(), ConflictLine(), RefusalLine()]
 
 # ── 规划但未落地的坐标(只元数据,给议会看完整菜单;建成后从这里删、移进 LINES)──
 PLANNED: list[tuple[str, str, str]] = [
-    ("L6_refusal", "拒答边界", "知道记忆边界,不存在则拒答"),
     ("L7_consolidation", "巩固摘要", "长跨度要点/趋势回忆(非逐字)"),
 ]
 
