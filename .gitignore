@@ -16,13 +16,23 @@ venv/
 # ── 运行产物(每次 run 的 manifest / run.log / prompts.jsonl / 中间产物,可重生)──
 output/
 
+# ── 历史遗留版本(只 ignore,本地保留;共享时不进 git 以免混淆)──
+legacy/
+
 # ── 大参考资料(可重下;要版本化大文件请用 git-lfs 或单独资料仓库)──
 # 第三方论文代码克隆 ~4.5G(各自含 .git,绝不能并入本仓库)
 refs/
-# 调研材料 ~267M
-survey/
-# 论文 PDF(docs/literature/ 等)
+
+# ── 论文 PDF / 大文件(全局排除;survey 下也照样排,见下方负向规则)──
 *.pdf
+
+# ── 调研材料 survey/ ~267M:只版本化【文字 REPORT/.md】,PDF 仍排除 ──
+# 默认整目录排除……
+survey/**
+# ……但放行目录结构 + 所有 .md(全景报告 / 各 REPORT)。*.pdf 仍由上面那行生效。
+!survey/
+!survey/**/
+!survey/**/*.md
 
 # ── 系统 / IDE ──
 .DS_Store
