@@ -90,7 +90,8 @@ def _assemble_whitepaper(views: dict, desc: str) -> dict:
     return {
         "scenario_id": "auto",
         "domain_profile": {"entity_noun": entity_noun, "field_schema": fields,
-                           "doc_genres": genres[:6], "stopped_phrase": stopped},
+                           "doc_genres": genres[:6], "stopped_phrase": stopped,
+                           "preference_axis": mp.get("preference_axis")},   # ★L4 偏好基质(议会出,域无关;无则 None→L4 infeasible)
         "medium": {"type": "documents", "genres": genres[:6], "cadence": "weekly",
                    "candidates": (med.get("common_media") or []) + [m.get("form") for m in (med.get("unconventional_media") or [])]},
         "active_lines": active,

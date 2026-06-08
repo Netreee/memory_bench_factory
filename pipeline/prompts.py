@@ -94,7 +94,8 @@ $defects
     # ★map 内联宪法 taxonomy:用 $taxonomy 占位,调用侧传 taxonomy_prose()
     "council.map": """对照下面这套【记忆挑战坐标(产线 L1–L7)】,逐条判断:本场景是否【天然支持】这条产线?若支持,用本场景的什么【具体结构】落地(哪些字段/关系/事件/偏好/矛盾),并给权重建议(0–1)与 gt 可行性。
 【产线坐标】$taxonomy
-只输出 JSON:{"per_line":[{"line":"L1_timeline","applicable":true,"instantiation":"本场景用..落地","gt_feasible":true,"weight_hint":0.4}]}(L1–L7 每条都判一次)""",
+★若 L4_preference 适用,额外给 `preference_axis`:本场景一个【每周重复发生的【选择/偏好】维度】+ 3–4 个【域相关、表面互不近似】的选项(如办公场景「周会形式:线上/线下/混合」、医疗「随访方式:门诊/电话/上门」)。这是"从散落选择反推偏好"的基质;若本场景没有这种重复选择维度则省略。
+只输出 JSON:{"per_line":[{"line":"L1_timeline","applicable":true,"instantiation":"本场景用..落地","gt_feasible":true,"weight_hint":0.4}],"preference_axis":{"field":"周会形式","options":["线上","线下","混合"]}}(L1–L7 每条都判一次;preference_axis 可省)""",
 
     "council.medium": """发散本场景【所有可能的文档/记录形式】。先穷尽【常见】形式(力求大而全),再补【反常但合理】的(人类一下子想不到、但此领域确实可能存在的)——每个反常项必须给"为何此场景合理"。不是猎奇,是覆盖完整。最后给主媒介组合建议。
 只输出 JSON:{"common_media":[".."],"unconventional_media":[{"form":"..","why_plausible":".."}],"recommended_mix":["..",".."]}""",
