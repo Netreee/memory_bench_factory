@@ -1,6 +1,7 @@
 # ════════════════════════════════════════════════════════════════
 # memory_bench_factory —— 记忆 benchmark 生成器
-# 原则:只版本化【源码 + 设计文档】;大资料 / 运行产物 / 密钥不进 git。
+# 原则(最小追踪):只版本化【源码 + 调研报告(survey/ + docs 里的研究/文献报告)】。
+# 内部文档(设计稿/组会/backlog/pitfalls…)、盲审报告、运行产物、大资料、密钥都不进 git。
 # 注:.gitignore 不支持【行内】注释,# 必须独立成行。
 # ════════════════════════════════════════════════════════════════
 
@@ -33,6 +34,17 @@ survey/**
 !survey/
 !survey/**/
 !survey/**/*.md
+
+# ── docs/ 大量内部文档:默认整目录排除,只放行【调研/文献报告】──
+# 设计稿 / 组会材料 / 盲审报告(blind_review_*)/ history / audit / taxonomy / edge_a 都不进 git(本地保留)。
+docs/*
+!docs/anchors/
+docs/anchors/*
+!docs/anchors/related_work.md
+!docs/anchors/novelty_lit_review.md
+!docs/anchors/benchmark_landscape.md
+!docs/anchors/research_difficulty_distribution.md
+!docs/anchors/research_multiagent_paradigms.md
 
 # ── 系统 / IDE ──
 .DS_Store
