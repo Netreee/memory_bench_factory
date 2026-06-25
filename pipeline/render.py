@@ -1,0 +1,248 @@
+"""
+pipeline.render —— 文本渲染层(从 run_factory_v2 拆出,行为不变)。
+把结构化产物渲染成自然语言文本:世界事实→语料文档(render_corpus + 助手),订单意图→题面(phrase_questions)。
+"""
+from __future__ import annotations
+import json, threading
+import config
+from pipeline.world_state import _date_of, week_label, _to_num, _dicts, EXPIRE, DELETE
+from pipeline.lines import line_for
+from pipeline.prompts import render
+
+
+LEAK_BANNED = ["当前", "现在", "最新", "目前", "截至目前", "迄今", "至今", "一直", "历来",
+               "维持", "保持不变", "累计", "现任", "如今", "始终", "仍为", "仍是", "依旧"]
+
+
+def _corpus_system(profile) -> str:
+    genres = "/".join(profile.get("doc_genres", ["周报", "通报", "邮件"]))
+    stopped = profile.get("stopped_phrase", "停止统计")
+    noun = profile.get("entity_noun", "实体")
+    return render("corpus.system", noun=noun, genres=genres, stopped=stopped, genre0=genres.split("/")[0])
+
+
+def _filler_system(profile) -> str:
+    noun = profile.get("entity_noun", "实体")
+    genres = "/".join(profile.get("doc_genres", ["通知", "纪要", "公告"]))
+    return render("filler.system", noun=noun)
+
+
+def _session_facts(ws, s):
+    facts = []
+    for ent, flds in ws.entities.items():
+        for fname, tl in flds.items():
+            op = next((o for o in tl.ops if o.session == s), None)
+            if op is None:
+                continue
+            stopped = op.op in (EXPIRE, DELETE)
+            facts.append({"entity": ent, "field": fname, "value": None if stopped else op.value, "stopped": stopped})
+    return facts
+
+
+def _tracked_blocklist(ws, profile=None):
+    """草堆禁词表 = 实体名 + 字段名 + 所有【人名类字段】的取值(防 filler 撞被追踪的人名)。
+    ★人名字段从白皮书 `field_schema.kind=="person"` 取(审计 ★1:删掉 '负责/汇报/经理' 中文子串启发式
+    —— 那是 office 味、对非 office 域不可靠:medical 的「主治医师/会诊上级」一个 hint 都不匹配)。域知识只从白皮书来。"""
+    out = set(ws.entities) | {f for flds in ws.entities.values() for f in flds}
+    person_fields = {f.get("name") for f in _dicts((profile or {}).get("field_schema", [])) if f.get("kind") == "person"}
+    for flds in ws.entities.values():
+        for fname, tl in flds.items():
+            if fname in person_fields:
+                for (_s, _d, v) in tl.set_values():
+                    if v and _to_num(v) is None and len(str(v)) >= 2:
+                        out.add(str(v))
+    return out
+
+
+def _render_conflict_docs(ws, s, date, tracer):
+    """★L5:把 session==s 的小道矛盾值渲染成【低可信来源】文档(权威值由正常信号路径已渲,二者同周并存=语料真出现矛盾)。
+    无 ws.conflicts(非 L5 场景)→ 返回 [],对其它场景零副作用。"""
+    out = []
+    for c in (getattr(ws, "conflicts", None) or []):
+        if c.get("session") != s or not c.get("rumor_value"):
+            continue
+        o = tracer.chat_json("render.conflict",
+            [{"role": "system", "content": render("conflict.system")},
+             {"role": "user", "content": render("conflict.user", s=week_label(s), date=date, entity=c["entity"],
+                                                field=c["field"], value=c["rumor_value"], source=c.get("rumor_source", "小道消息"))}],
+            temperature=0.7, max_tokens=8192)
+        # ★不套 LEAK_BANNED:矛盾文档天然是"据传【现在/目前】X 是 Y"的当期传闻,撞防剧透词表会被全滤。
+        #   (LEAK_BANNED 是给【信号文档】防 KU 剧透的;小道文档是另一类——该说"现在"就说,正是冲突设定。)
+        for d in _dicts(o.get("docs") if isinstance(o, dict) else []):
+            if d.get("content"):
+                out.append(d)
+    return out
+
+
+def _chunk(lst, n):
+    for i in range(0, len(lst), n):
+        yield lst[i:i + n]
+
+
+def render_corpus(wp, ws, target_tokens, tracer, corpus, done_weeks, save_cb, log=print, only_entities=None):
+    """only_entities=None:全量渲(每周全实体+filler)。
+    only_entities=set:★增量 delta(§10.1)——【只渲这些新实体的 signal】并【追加】到已有周 docs,
+    不重渲旧实体、不重灌 filler;遍历所有周(新实体跨全程)。给闭环 ②环增量续渲用。"""
+    profile = wp.get("domain_profile", {})
+    sys_sig, sys_fil = _corpus_system(profile), _filler_system(profile)
+    blocked = _tracked_blocklist(ws, profile)
+    # 估算 filler/周 以达目标 token(~1字≈1token)。周并行后不再 early-stop;filler_per_week 已按目标分摊。
+    n_sessions = ws.n_sessions
+    filler_per_week = max(8, round(target_tokens / max(1, n_sessions) / 800))   # 每篇≈800字
+    by_id = {x["session_id"]: x for x in corpus["sessions"]}
+    weeks = list(ws.sessions()) if only_entities else [s for s in ws.sessions() if s not in done_weeks]
+    lock = threading.Lock()
+    fallback_count: list[int] = []                        # 耗尽兜底计数(list.append 线程安全;验收要求趋零)
+
+    def _render_week(s):                                  # ★一周的全部渲染 = 一个并行单元
+        date = _date_of(s)
+        facts = _session_facts(ws, s)
+        if only_entities is not None:                     # ★delta:本周只渲新实体的事实
+            facts = [f for f in facts if f["entity"] in only_entities]
+            if not facts:
+                return s                                  # 新实体本周无事实 → 不加 doc
+        bysku = {}
+        for f in facts:
+            bysku.setdefault(f["entity"], []).append(f)
+        sig_groups = list(_chunk(list(bysku.items()), 2))   # ★2 实体/组:文档更聚焦、归属更清晰、逼渲全(6→3→2)
+        n_batches = (filler_per_week + 5) // 6
+
+        def _render_sig(grp):                             # ★信号块:渲全 + 渲对 —— 每个 (实体,变更) 必须【实体+值就近共现】才算渲到
+            from pipeline.grounding import attributed, STOP_MARKERS   # 渲染期就用出厂接地的同一把尺
+            gf = [f for _e, fs in grp for f in fs]
+            # 待渲事实:非停用 → 验 (实体,值) 就近;停用 → 验 (实体,停用标记) 同篇
+            want_val = [(f["entity"], f["field"], str(f["value"])) for f in gf if f.get("value") and not f.get("stopped")]
+            want_stop = [(f["entity"], f["field"]) for f in gf if f.get("stopped")]
+            # ★禁词豁免(014559 尸检:词表「累计」撞字段名「累计计费工时」→ 整篇核验前被静默丢,27/27 弃题同根)。
+            #   豁免集 = 本组【所有被要求逐字出现的串】= 字段名+实体名+事实值(刀1审计:值含禁词如「维持治疗」
+            #   时,'逐字照抄'与'禁全局口径词'否则构成不可满足约束 → 4 轮必废 → 兜底吸收症状)。
+            #   单一真源(由本组事实派生,非按域手维护);长串先遮,防短串是长串子串。
+            exempt = sorted({f["field"] for f in gf} | {f["entity"] for f in gf}
+                            | {str(f["value"]) for f in gf if f.get("value")}, key=len, reverse=True)
+
+            def _leaks(text):
+                masked = text
+                for nm in exempt:
+                    masked = masked.replace(nm, "■" * len(nm))
+                return [b for b in LEAK_BANNED if b in masked]
+
+            grp_docs, hint = [], ""
+            for _att in range(4):                         # 多给几次重渲机会,强制渲全(世界辛苦生成,必须全用上)
+                out = tracer.chat_json("render.signal",
+                    [{"role": "system", "content": sys_sig},
+                     {"role": "user", "content": render("corpus.user", s=week_label(s), date=date, facts=json.dumps(gf, ensure_ascii=False), hint=hint)}],
+                    temperature=0.6, max_tokens=8192)
+                cand, leak_notes = [], []
+                for d in _dicts(out.get("docs") if isinstance(out, dict) else []):
+                    if not d.get("content"):
+                        continue
+                    hits = _leaks(d["content"])
+                    if hits:                              # 犯禁不再静默丢:记下死因,进诚实反馈(它驮的事实会出现在 missing 里)
+                        leak_notes.append(f"《{(d.get('title') or d.get('type') or '无题')}》因使用全局口径词{hits}被废弃")
+                    else:
+                        cand.append(d)
+                contents = [d.get("content", "") for d in cand]
+                missing = [f"{e}的「{fl}」={v}" for (e, fl, v) in want_val if not attributed(v, e, contents)]   # ★就近归属,非"值出现在某处"
+                missing += [f"{e}的「{fl}」自本期停止" for (e, fl) in want_stop
+                            if not any((e in c) and any(m in c for m in STOP_MARKERS) for c in contents)]
+                grp_docs = cand or grp_docs
+                if not missing:
+                    break
+                # ★hint 如实(老版把"写了但犯禁被废"误报成"没写"→ 重试不收敛):缺什么、为什么缺,分开说
+                hint = (f"\n★ 这些事实在上一版【没有合格呈现】(每条必须让对应实体名与值在同一句/紧邻就近出现,值逐字照抄):{missing}。")
+                if leak_notes:
+                    hint += (f"\n★ 另:上一版 {leak_notes}——重写时把其中事实写进正文,但【删掉这些全局口径词】"
+                             f"(注意:字段名/实体名/事实值本身含这些字的照常写,不算犯禁)。")
+                hint += "逐条重写进正文(仍只写本期)。"
+            # ★fail-loud + 模板兜底(老版 fail-open 静默入库,缺渲泄漏给边B闸弃题):4 轮耗尽仍缺 →
+            #   代码模板补一篇极简备忘(保边B供给,零 LLM),并显式告警。验收要求兜底率趋零——频繁触发=上游病,不是常态通道。
+            contents = [d.get("content", "") for d in grp_docs]
+            left_val = [(e, fl, v) for (e, fl, v) in want_val if not attributed(v, e, contents)]
+            left_stop = [(e, fl) for (e, fl) in want_stop
+                         if not any((e in c) and any(m in c for m in STOP_MARKERS) for c in contents)]
+            if left_val or left_stop:
+                stop_phrase = (profile.get("stopped_phrase") or "停止统计").split("/")[0]
+                lines = [f"{e}本期「{fl}」为{v}。" for (e, fl, v) in left_val]
+                lines += [f"{e}的「{fl}」自本期{stop_phrase}。" for (e, fl) in left_stop]
+                grp_docs = list(grp_docs) + [{"title": f"工作备忘({date})", "type": "备忘", "fact_refs": [],
+                                              "content": f"{date} 备忘:" + "".join(lines), "is_fallback": True}]
+                fallback_count.append(len(lines))         # ★机械验收落点:汇总进末尾日志,不靠肉眼翻周日志
+                log(f"  ⚠耗尽兜底[周{week_label(s)}]:{len(lines)} 条事实 4 轮未渲全,模板补写({sorted({e for e, *_ in left_val + left_stop})})")
+            return grp_docs
+
+        def _render_fil(ci):                              # 一个草堆批
+            want = min(6, filler_per_week - ci * 6)
+            if want <= 0:
+                return []
+            out = tracer.chat_json("render.filler",
+                [{"role": "system", "content": sys_fil},
+                 {"role": "user", "content": render("filler.user", s=week_label(s), date=date, want=want, blocked=sorted(blocked)[:30])}],
+                temperature=0.9, max_tokens=8192)
+            return [d for d in _dicts(out.get("docs") if isinstance(out, dict) else [])
+                    if d.get("content") and not any(b in d.get("content", "") for b in blocked)]
+
+        sig_lists = config.pmap(_render_sig, sig_groups, workers=8)              # 周内并发(全局信号量才是真上限)
+        with lock:                                         # 周乱序完成 → 锁内更新+逐周存盘(断点续渲不丢)
+            if only_entities is not None:                  # ★delta:追加新实体 signal 到【已有周 docs】,接着编号;不灌 filler/conflict
+                docs = list(by_id.get(s, {}).get("docs", []))
+                base = len(docs)
+                for gl in sig_lists:
+                    for d in gl:
+                        d["doc_id"] = f"s{s}_sig_{base}"; base += 1; docs.append(d)
+                by_id[s] = {"session_id": s, "date": date, "docs": docs}   # 旧 docs 原样保留,只增量
+            else:                                          # 全量:本周 signal + filler + 小道矛盾,整周写入
+                fil_lists = config.pmap(_render_fil, list(range(n_batches)), workers=8)
+                docs = []                                  # 周内顺序编号,避免 race(doc_id 含 s,跨周不撞)
+                for gl in sig_lists:
+                    for d in gl:
+                        d["doc_id"] = f"s{s}_sig_{len(docs)}"; docs.append(d)
+                for fl in fil_lists:
+                    for d in fl:
+                        d.update({"doc_id": f"s{s}_fil_{len(docs)}", "is_filler": True, "fact_refs": []}); docs.append(d)
+                for d in _render_conflict_docs(ws, s, date, tracer):      # ★L5:本周小道矛盾文档(非 L5 场景为空)
+                    d.update({"doc_id": f"s{s}_conf_{len(docs)}", "is_conflict": True, "fact_refs": []}); docs.append(d)
+                by_id[s] = {"session_id": s, "date": date, "docs": docs}
+                done_weeks.add(s)
+            corpus["sessions"] = [by_id[k] for k in sorted(by_id)]
+            save_cb()
+            ch = sum(len(dd.get("content", "")) for x in corpus["sessions"] for dd in x["docs"])
+            tag = "delta+" if only_entities is not None else ""
+            log(f"  [周 {s} ✓{tag} {len(done_weeks)}/{n_sessions}] 累计 {sum(len(x['docs']) for x in corpus['sessions'])} 篇 / {ch/1e6:.2f}M 字")
+        return s
+
+    config.pmap(_render_week, weeks, workers=max(1, len(weeks)))   # ★周并行;在飞 API 由全局 LLM_CONCURRENCY 兜住
+    ch = sum(len(dd.get("content", "")) for x in corpus["sessions"] for dd in x["docs"])
+    fb = f";⚠耗尽兜底 {len(fallback_count)} 处/{sum(fallback_count)} 条事实(验收要求趋零)" if fallback_count else ";兜底 0(✓)"
+    log(f"  ✓ 渲染完成:{sum(len(x['docs']) for x in corpus['sessions'])} 篇 / {ch/1e6:.2f}M 字(目标 {target_tokens/1e6:.1f}M){fb}")
+
+
+PHRASE_SYS = render("phrase.system")
+
+
+def phrase_questions(orders, wp, tracer, log=print) -> list[dict]:
+    def _ph(o):                                           # 每条订单独立 → 并发出题
+        line = line_for(o.get("line", ""))                # 出题意图/须隐藏 = 各产线自己的 intent()
+        if line is None:                                  # 兜底(订单都来自已建线,理论不触发)
+            return {**o, "question": ""}
+        intent, hide = line.intent(o)
+        out = tracer.chat_json("phrase",
+            [{"role": "system", "content": PHRASE_SYS},
+             {"role": "user", "content": render("phrase.user", intent=intent, hide=hide)}],
+            temperature=0.5, max_tokens=2048)
+        q = out.get("question", "") if isinstance(out, dict) else ""
+        q = q if isinstance(q, str) else ""
+        # ★主语保真兜底(Q49 悬空代词根治):phrase 偶尔把主语专名改成"他/该案"丢了指代。实体名核(前4字)
+        #   若整个没在题面出现 → 退回 intent 原文(它必含实体名、是完整可答问题)。比"禁代词"软规则多一道硬保证。
+        ent = (o.get("entity") or "").strip()
+        if q and ent and ent[:4] not in q:
+            q = intent
+        return {**o, "question": q}
+    raw = config.pmap(_ph, orders, workers=8)
+    qs = [q for q in raw if q.get("question", "").strip()]    # 丢并发下偶发的空题面
+    dropped = len(raw) - len(qs)
+    by_line = {}
+    for q in qs:
+        by_line[q.get("line", "?")] = by_line.get(q.get("line", "?"), 0) + 1
+    log(f"  ④ 出题:{len(qs)} 题已润色(丢空 {dropped};桥实体/答案不进题面);by_line {by_line}")
+    return qs
+

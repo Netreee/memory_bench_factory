@@ -1,0 +1,54 @@
+# ════════════════════════════════════════════════════════════════
+# memory_bench_factory —— 记忆 benchmark 生成器
+# 原则(最小追踪):只版本化【源码 + 调研报告(survey/ + docs 里的研究/文献报告)】。
+# 内部文档(设计稿/组会/backlog/pitfalls…)、盲审报告、运行产物、大资料、密钥都不进 git。
+# 注:.gitignore 不支持【行内】注释,# 必须独立成行。
+# ════════════════════════════════════════════════════════════════
+
+# ── Python 缓存 / 虚拟环境(venv / venv_39_bak / 任何 venv* 备份都排除)──
+__pycache__/
+*.py[cod]
+.pytest_cache/
+venv*/
+
+# ── 密钥 · 本地配置(命脉,绝不提交)──
+.env
+
+# ── 运行产物(每次 run 的 manifest / run.log / prompts.jsonl / 中间产物,可重生)──
+output/
+
+# ── 运行日志(embed_server / vllm 等服务日志,运行时产物,可重生)──
+*.log
+
+# ── 历史遗留版本(只 ignore,本地保留;共享时不进 git 以免混淆)──
+legacy/
+
+# ── 大参考资料(可重下;要版本化大文件请用 git-lfs 或单独资料仓库)──
+# 第三方论文代码克隆 ~4.5G(各自含 .git,绝不能并入本仓库)
+refs/
+
+# ── 论文 PDF / 大文件(全局排除;survey 下也照样排,见下方负向规则)──
+*.pdf
+
+# ── 调研材料 survey/ ~267M:只版本化【文字 REPORT/.md】,PDF 仍排除 ──
+# 默认整目录排除……
+survey/**
+# ……但放行目录结构 + 所有 .md(全景报告 / 各 REPORT)。*.pdf 仍由上面那行生效。
+!survey/
+!survey/**/
+!survey/**/*.md
+
+# ── docs/ 大量内部文档:默认整目录排除,只放行【调研/文献报告】──
+# 设计稿 / 组会材料 / 盲审报告(blind_review_*)/ history / audit / taxonomy / edge_a 都不进 git(本地保留)。
+docs/*
+!docs/anchors/
+docs/anchors/*
+!docs/anchors/related_work.md
+!docs/anchors/novelty_lit_review.md
+!docs/anchors/benchmark_landscape.md
+!docs/anchors/research_difficulty_distribution.md
+!docs/anchors/research_multiagent_paradigms.md
+
+# ── 系统 / IDE ──
+.DS_Store
+.idea/
