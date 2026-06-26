@@ -18,10 +18,13 @@ from pipeline.lines.L4_preference import PreferenceLine
 from pipeline.lines.L5_conflict import ConflictLine
 from pipeline.lines.L6_refusal import RefusalLine
 from pipeline.lines.L7_consolidation import ConsolidationLine
+from pipeline.lines.L8_transition import TransitionLine
 
 # ── 已建成的产线(实例)──
+# ★L8_transition:结构原型【状态机】招牌线,feasible 只在【有 state_machines 声明】的场景(cs/legal)激活
+#   → office/game 无此线 = 不同场景【结构分叉】的来源(治盲审病根①"换皮不换芯")。
 LINES: list[ProductionLine] = [TimelineLine(), RelationalLine(), ProcessLine(), PreferenceLine(),
-                               ConflictLine(), RefusalLine(), ConsolidationLine()]
+                               ConflictLine(), RefusalLine(), ConsolidationLine(), TransitionLine()]
 
 # ── 规划但未落地的坐标(只元数据,给议会看完整菜单;建成后从这里删、移进 LINES)──
 # ★L1–L7 七条线全部落地。新规划线在此登记(只元数据),建成后移进 LINES。
@@ -103,6 +106,17 @@ def run_lines(wp, ws, log=print, quotas=None) -> list[dict]:
         got = line.enumerate(ws, q, wp)            # 各产线自带代码 gt(护城河);wp 供 L2 等取关系
         orders_out.extend(got)
         fired.append(f"{line.id}:{len(got)}单/配额{q}")
+    # ★结构原型自动激活:auto_activate 线(如 L8 状态机)只要世界里有其基质(feasible)就触发,
+    #   不依赖议会是否在 active_lines 列它 ——「场景结构分叉」应由【世界有没有该结构】决定,而非 LLM 判定。
+    for line in LINES:
+        if getattr(line, "auto_activate", False) and line.id not in seen:
+            ok, why = line.feasible(ws, profile)
+            if ok:
+                seen.add(line.id)
+                q = int(quotas.get(line.id, default_target))
+                got = line.enumerate(ws, q, wp)
+                orders_out.extend(got)
+                fired.append(f"{line.id}:{len(got)}单/配额{q}(结构自动激活)")
     log(f"  产线已跑: {fired or '无'}")
     if skipped:
         log(f"  ⓘ 白皮书激活但跳过: {skipped}")
