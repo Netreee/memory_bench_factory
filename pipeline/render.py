@@ -3,7 +3,10 @@ pipeline.render —— 文本渲染层(从 run_factory_v2 拆出,行为不变)�
 把结构化产物渲染成自然语言文本:世界事实→语料文档(render_corpus + 助手),订单意图→题面(phrase_questions)。
 """
 from __future__ import annotations
-import json, threading
+import json, threading, sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))   # 允许 `python pipeline/render.py` 直跑(找到根目录 config)
 import config
 from pipeline.world_state import _date_of, week_label, _to_num, _dicts, EXPIRE, DELETE
 from pipeline.lines import line_for
@@ -12,6 +15,68 @@ from pipeline.prompts import render
 
 LEAK_BANNED = ["当前", "现在", "最新", "目前", "截至目前", "迄今", "至今", "一直", "历来",
                "维持", "保持不变", "累计", "现任", "如今", "始终", "仍为", "仍是", "依旧"]
+
+# 盲判别器"不确定/读不出"措辞(判别器明确表达"读不出"→ 该 atom 未忠实渲染)。
+_DISC_UNSURE = ["不确定", "无法确定", "读不出", "读不到", "不清楚", "未提及", "未提到",
+                "没有提到", "没有提及", "无法判断", "无从", "看不出", "歧义", "不明确",
+                "信息不足", "无此", "查无", "找不到", "未找到", "无法读出"]
+
+
+def _dim_norm(s) -> str:
+    """★量纲严格归一(死钉④):只做"去空格 + 全角→半角",★保留尾部 %/单位/小数点不剥。
+    与 world_state._norm / eval.judge._norm 的关键区别:那两个 .rstrip('%。.') 会把
+    "78%"→"78" 抹平双量纲;本函数【保留 %】,使 _dim_norm("78%")!="0.78"、!="78"。"""
+    if s is None:
+        return ""
+    t = str(s).strip().replace(" ", "").replace("　", "")
+    t = t.translate(str.maketrans("０１２３４５６７８９％．", "0123456789%."))
+    return t
+
+
+def _is_unsure(ans: str) -> bool:
+    """判别器是否表达了"读不出/不确定"。"""
+    a = _dim_norm(ans).lower()
+    if not a:
+        return True
+    return any(_dim_norm(m).lower() in a for m in _DISC_UNSURE)
+
+
+def _strict_eq(read: str, gt: str) -> bool:
+    """★量纲严格对账(死钉①④):判别器读出的 read 是否严格等于世界真值 gt。
+    - 先排除"不确定"类措辞(读不出 → 不算还原)。
+    - 量纲敏感:用 _dim_norm(保留 %),"78%" != "0.78"、"78%" != "78"(双量纲必暴露)。
+    - 严判 EM(归一后逐字相等),不做子串、不剥 %、不数值近似——任一放宽都会放过双量纲。"""
+    if read is None or _is_unsure(read):
+        return False
+    return _dim_norm(read) == _dim_norm(gt)
+
+
+def _discriminate_one(docs, entity, field, tracer):
+    """派一个【盲读者 agent】只读 docs、答 (entity,field) 的值。
+    ★死钉①③:输入只有 docs(渲染正文)+ (entity,field),绝不喂 true_value/gt/fact_refs。
+    返回判别器读出的 answer 字符串(读不出/异常 → 返回 ''=不确定,绝不 fail-open 放行)。"""
+    try:
+        out = tracer.chat_json("render.discriminate",
+            [{"role": "system", "content": render("discriminate.system")},
+             {"role": "user", "content": render("discriminate.user",
+                                                docs="\n\n".join(d for d in docs if d),
+                                                entity=entity, field=field)}],
+            temperature=0.0, max_tokens=1024)
+    except Exception as e:                                # 调用/解析异常 → 当作读不出(参 judge.py:57-59),宁可重渲
+        print(f"[discriminate] 调用失败(计为读不出): {type(e).__name__}: {str(e)[:80]}")
+        return ""
+    ans = out.get("answer") if isinstance(out, dict) else None
+    return str(ans) if ans is not None else ""
+
+
+def _discriminator_recovers(docs, entity, field, true_value, tracer):
+    """★渲染链第一步核心忠实检:盲读者据 docs 能否唯一、按对量纲还原 (entity,field) 的世界真值?
+    返回 (recovered: bool, read_answer: str)。
+    - recovered=True  ⟺ 判别器读出的值与 true_value【量纲严格相等】(_strict_eq)= 忠实渲染。
+    - recovered=False ⟺ 读不出/读成"不确定"/对不上(含双量纲 78%↔0.78、多跳歧义)= 未忠实渲染 → 进 missing。
+    ★死钉①③:true_value 只在【本函数代码侧】用于对账,绝不进判别器 messages(判别器只收 docs+实体+字段)。"""
+    ans = _discriminate_one(docs, entity, field, tracer)
+    return (_strict_eq(ans, str(true_value)), ans)
 
 
 def _corpus_system(profile) -> str:
@@ -107,12 +172,31 @@ def render_corpus(wp, ws, target_tokens, tracer, corpus, done_weeks, save_cb, lo
         sig_groups = list(_chunk(list(bysku.items()), 2))   # ★2 实体/组:文档更聚焦、归属更清晰、逼渲全(6→3→2)
         n_batches = (filler_per_week + 5) // 6
 
-        def _render_sig(grp):                             # ★信号块:渲全 + 渲对 —— 每个 (实体,变更) 必须【实体+值就近共现】才算渲到
-            from pipeline.grounding import attributed, STOP_MARKERS   # 渲染期就用出厂接地的同一把尺
+        def _render_sig(grp):                             # ★信号块:渲全 + 渲对 —— 盲判别器据渲文能否唯一还原 (实体,字段) 才算渲到
+            from pipeline.grounding import STOP_MARKERS    # ★只借停用标记(STOP_MARKERS);忠实检不再用 §G 的 attributed(死钉②不同尺)
             gf = [f for _e, fs in grp for f in fs]
-            # 待渲事实:非停用 → 验 (实体,值) 就近;停用 → 验 (实体,停用标记) 同篇
+            # 待渲事实:非停用 → 派盲判别器读 (实体,字段) 的值,代码量纲严格对账;停用 → 验 (实体,停用标记) 同篇
             want_val = [(f["entity"], f["field"], str(f["value"])) for f in gf if f.get("value") and not f.get("stopped")]
             want_stop = [(f["entity"], f["field"]) for f in gf if f.get("stopped")]
+
+            def _discriminate(contents):
+                """★盲判别器忠实检(死钉①③):对每个 want_val atom 派一个盲读者只读 contents 答值,
+                代码量纲严格对账;对每个 want_stop atom 验停用标记同篇。
+                返回 (miss_val: list[str], miss_stop: list[str]),供 missing/hint 管道复用。"""
+                # value atom:判别器并发(各 atom 独立),true_value 只在代码对账侧用,绝不进 prompt
+                def _one(item):
+                    e, fl, v = item
+                    ok, ans = _discriminator_recovers(contents, e, fl, v, tracer)
+                    if ok:
+                        return None
+                    read = "不确定" if (ans is None or _is_unsure(ans)) else ans
+                    return f"{e}的「{fl}」(应承载值={v}):盲读者据文档读出的是『{read}』,与应承载的值不一致/读不出"
+                miss_val = [m for m in config.pmap(_one, want_val, workers=8) if m]
+                # stopped atom:期望判别器读出"停止/不再统计"语义;此处复用 §G 停用标记同篇检(refusal 语义,非 _strict_eq)
+                miss_stop = [f"{e}的「{fl}」应让读者读出『自本期停止统计』,但文档未表达停用"
+                             for (e, fl) in want_stop
+                             if not any((e in c) and any(m in c for m in STOP_MARKERS) for c in contents)]
+                return miss_val, miss_stop
             # ★禁词豁免(014559 尸检:词表「累计」撞字段名「累计计费工时」→ 整篇核验前被静默丢,27/27 弃题同根)。
             #   豁免集 = 本组【所有被要求逐字出现的串】= 字段名+实体名+事实值(刀1审计:值含禁词如「维持治疗」
             #   时,'逐字照抄'与'禁全局口径词'否则构成不可满足约束 → 4 轮必废 → 兜底吸收症状)。
@@ -142,9 +226,8 @@ def render_corpus(wp, ws, target_tokens, tracer, corpus, done_weeks, save_cb, lo
                     else:
                         cand.append(d)
                 contents = [d.get("content", "") for d in cand]
-                missing = [f"{e}的「{fl}」={v}" for (e, fl, v) in want_val if not attributed(v, e, contents)]   # ★就近归属,非"值出现在某处"
-                missing += [f"{e}的「{fl}」自本期停止" for (e, fl) in want_stop
-                            if not any((e in c) and any(m in c for m in STOP_MARKERS) for c in contents)]
+                miss_val, miss_stop = _discriminate(contents)   # ★忠实检从机械 attributed 换成盲判别器对账
+                missing = miss_val + miss_stop
                 grp_docs = cand or grp_docs
                 if not missing:
                     break
@@ -154,20 +237,16 @@ def render_corpus(wp, ws, target_tokens, tracer, corpus, done_weeks, save_cb, lo
                     hint += (f"\n★ 另:上一版 {leak_notes}——重写时把其中事实写进正文,但【删掉这些全局口径词】"
                              f"(注意:字段名/实体名/事实值本身含这些字的照常写,不算犯禁)。")
                 hint += "逐条重写进正文(仍只写本期)。"
-            # ★fail-loud + 模板兜底(老版 fail-open 静默入库,缺渲泄漏给边B闸弃题):4 轮耗尽仍缺 →
-            #   代码模板补一篇极简备忘(保边B供给,零 LLM),并显式告警。验收要求兜底率趋零——频繁触发=上游病,不是常态通道。
+            # ★fail-loud 弃段(删 K=V fail-open 兜底):轮次耗尽后再跑一次盲判别器,仍不可还原的 atom →
+            #   【不】再往 grp_docs 硬注 K=V 模板备忘(那是 fail-open、稳过 §G、把缺渲症状吸收掉),而是【弃段】:
+            #   grp_docs 不追加任何东西,缺的 atom 让出厂 §G 接地闸自然弃题;只显式告警 + 计 fallback_count(语义=弃段计数)。
             contents = [d.get("content", "") for d in grp_docs]
-            left_val = [(e, fl, v) for (e, fl, v) in want_val if not attributed(v, e, contents)]
-            left_stop = [(e, fl) for (e, fl) in want_stop
-                         if not any((e in c) and any(m in c for m in STOP_MARKERS) for c in contents)]
-            if left_val or left_stop:
-                stop_phrase = (profile.get("stopped_phrase") or "停止统计").split("/")[0]
-                lines = [f"{e}本期「{fl}」为{v}。" for (e, fl, v) in left_val]
-                lines += [f"{e}的「{fl}」自本期{stop_phrase}。" for (e, fl) in left_stop]
-                grp_docs = list(grp_docs) + [{"title": f"工作备忘({date})", "type": "备忘", "fact_refs": [],
-                                              "content": f"{date} 备忘:" + "".join(lines), "is_fallback": True}]
-                fallback_count.append(len(lines))         # ★机械验收落点:汇总进末尾日志,不靠肉眼翻周日志
-                log(f"  ⚠耗尽兜底[周{week_label(s)}]:{len(lines)} 条事实 4 轮未渲全,模板补写({sorted({e for e, *_ in left_val + left_stop})})")
+            miss_val, miss_stop = _discriminate(contents)
+            left = miss_val + miss_stop
+            if left:
+                fallback_count.append(len(left))          # ★机械验收落点(语义改为"弃段计数"):汇总进末尾日志
+                ents = sorted({m.split("的「")[0] for m in left})
+                log(f"  ⚠fail-loud弃段[周{week_label(s)}]:{len(left)} 个 atom 多轮重渲后盲读者仍不可还原,弃段不入库({ents})")
             return grp_docs
 
         def _render_fil(ci):                              # 一个草堆批
@@ -212,7 +291,7 @@ def render_corpus(wp, ws, target_tokens, tracer, corpus, done_weeks, save_cb, lo
 
     config.pmap(_render_week, weeks, workers=max(1, len(weeks)))   # ★周并行;在飞 API 由全局 LLM_CONCURRENCY 兜住
     ch = sum(len(dd.get("content", "")) for x in corpus["sessions"] for dd in x["docs"])
-    fb = f";⚠耗尽兜底 {len(fallback_count)} 处/{sum(fallback_count)} 条事实(验收要求趋零)" if fallback_count else ";兜底 0(✓)"
+    fb = f";⚠fail-loud弃段 {len(fallback_count)} 处/{sum(fallback_count)} 个 atom 未忠实渲染(验收要求趋零)" if fallback_count else ";弃段 0(✓)"
     log(f"  ✓ 渲染完成:{sum(len(x['docs']) for x in corpus['sessions'])} 篇 / {ch/1e6:.2f}M 字(目标 {target_tokens/1e6:.1f}M){fb}")
 
 
@@ -245,4 +324,101 @@ def phrase_questions(orders, wp, tracer, log=print) -> list[dict]:
         by_line[q.get("line", "?")] = by_line.get(q.get("line", "?"), 0) + 1
     log(f"  ④ 出题:{len(qs)} 题已润色(丢空 {dropped};桥实体/答案不进题面);by_line {by_line}")
     return qs
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# 单测:盲判别器忠实检(★不打真 API——monkeypatch tracer.chat_json 返回桩)
+#   跑法:./venv/bin/python pipeline/render.py
+# ════════════════════════════════════════════════════════════════════════════
+def _self_test() -> bool:
+    checks = []
+
+    def ck(name, cond):
+        checks.append((bool(cond), name))
+
+    # ── 量纲严格对账原语:保留 %,绝不归一蒙混 ──
+    ck("_strict_eq 同量纲相等", _strict_eq("0.78", "0.78"))
+    ck("★双量纲不等(78% != 0.78)", not _strict_eq("78%", "0.78"))
+    ck("★裸数不等(78 != 0.78)", not _strict_eq("78", "0.78"))
+    ck("★带%与不带不等(78% != 78)", not _strict_eq("78%", "78"))
+    ck("全角→半角后相等", _strict_eq("０.７８", "0.78"))
+    ck("含单位逐字相等", _strict_eq("320万", "320万"))
+    ck("'不确定'判不还原", not _strict_eq("不确定", "0.78"))
+    ck("空答判不还原", not _strict_eq("", "0.78"))
+
+    # ── _discriminator_recovers 端到端(桩判别器:据 docs 抠出 entity 那句里的值;★绝不看 true_value)──
+    #   桩模拟盲读者:从 docs 里找含 entity 的句子、读出"为/是"后面那个 token;读不出/歧义回"不确定"。
+    def _fake_tracer_factory():
+        class _T:
+            seen_prompts = []   # 留痕:验判别器 prompt 里【绝不含】true_value(死钉③)
+
+            def chat_json(self, step, messages, **kw):
+                user = messages[1]["content"]
+                _T.seen_prompts.append(user)
+                # 桩盲读者:从 user 里夹的 docs 文本读 entity 的值(纯字符串启发,不依赖外部世界)
+                docs = user
+                import re as _re
+                # 找 "<...命中率...>0.78" 或 "命中率78%" 这类:简单抓"命中率"后第一个数字串(含%)
+                if "命中率" in docs:
+                    m = _re.search(r"命中率[为是:]?\s*([0-9.]+%?)", docs)
+                    if m:
+                        return {"answer": m.group(1)}
+                # 负责人歧义:文档里出现两个不同负责人 → 盲读者答"不确定"
+                if "负责人" in docs:
+                    names = set(_re.findall(r"负责人[为是:]?\s*([一-龥]{2,3})", docs))
+                    if len(names) == 1:
+                        return {"answer": names.pop()}
+                    return {"answer": "不确定"}    # 多负责人歧义 / 读不出
+                # K=V 句 "X本期「Y」为Z":抠 Z
+                m = _re.search(r"为([0-9.]+%?)", docs)
+                if m:
+                    return {"answer": m.group(1)}
+                return {"answer": "不确定"}
+        return _T()
+
+    # (a) 干净自然句:命中率0.78 → 判别器还原 0.78 → pass
+    t = _fake_tracer_factory()
+    docs_a = ["本周天枢数据部运行平稳,经统计本期命中率0.78,团队士气高涨。"]
+    ok_a, ans_a = _discriminator_recovers(docs_a, "天枢数据部", "命中率", "0.78", t)
+    ck("(a) 干净自然句 0.78 → 还原 pass", ok_a and ans_a.startswith("0.78"))
+
+    # (b) 双量纲:文档写 78%、世界 0.78 → 判别器读出 78% ≠ 0.78 → fail
+    t = _fake_tracer_factory()
+    docs_b = ["本周天枢数据部表现优异,本期命中率78%,继续保持。"]
+    ok_b, ans_b = _discriminator_recovers(docs_b, "天枢数据部", "命中率", "0.78", t)
+    ck("(b) ★双量纲 78%≠0.78 → fail", (not ok_b) and ans_b == "78%")
+
+    # (c) 一部多负责人歧义:文档里两个负责人 → 判别器答"不确定" → fail
+    t = _fake_tracer_factory()
+    docs_c = ["项目组本周负责人为王皓,另据交接,该项目负责人为李明,职责待厘清。"]
+    ok_c, ans_c = _discriminator_recovers(docs_c, "项目组", "负责人", "王皓", t)
+    ck("(c) 多负责人歧义 → 判别器不确定 → fail", (not ok_c) and _is_unsure(ans_c))
+
+    # (d) K=V 句 "X本期「Y」为Z":能还原 → pass(K=V 不自然但忠实,本步只管忠实)
+    t = _fake_tracer_factory()
+    docs_d = ["2025-01-06 备忘:天枢数据部本期「命中率」为0.78。"]
+    ok_d, ans_d = _discriminator_recovers(docs_d, "天枢数据部", "命中率", "0.78", t)
+    ck("(d) K=V 句能还原 → pass(忠实)", ok_d and ans_d.startswith("0.78"))
+
+    # ── 死钉③守护:判别器 prompt 里【绝不出现】true_value/gt ──
+    all_prompts = "".join(t.seen_prompts) if hasattr(t, "seen_prompts") else ""
+    # 复用 (a) 那次的桩痕迹做断言(true_value="0.78" 也在 docs 文本里,无法只查 0.78;
+    #   改查 prompt 里没有"应承载/gt/真值/true_value"这类把答案喂进去的字样)
+    leaked = any(kw in p for p in (_fake_tracer_factory().seen_prompts or [""]) for kw in ("真值", "gt", "应承载", "true_value"))
+    ck("死钉③:判别器 prompt 不含 gt/真值字样", not leaked)
+    # 直接验 prompt 构造:user 模板只含 docs+entity+field,不含我们传的 true_value 关键标记
+    sample_user = render("discriminate.user", docs="文档正文", entity="某实体", field="某字段")
+    ck("死钉③:user 模板只含 docs/entity/field", "某实体" in sample_user and "某字段" in sample_user
+       and "真值" not in sample_user and "gt" not in sample_user.lower())
+
+    npass = sum(1 for ok, _ in checks if ok)
+    for ok, name in checks:
+        print(f"  {'✓' if ok else '✗'} {name}")
+    print(f"[render self-test] {npass}/{len(checks)} PASS")
+    return npass == len(checks)
+
+
+if __name__ == "__main__":
+    import sys as _sys
+    _sys.exit(0 if _self_test() else 1)
 
