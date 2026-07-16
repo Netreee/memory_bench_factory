@@ -63,7 +63,9 @@ def enumerate_l2_orders(ws: WorldState, paths, at_weeks=None, max_per_path: int 
 
 def discover_fk_paths(ws: WorldState, hops: int = 2) -> list[list[str]]:
     """★数据驱动发现软外键路径(不依赖松散的关系描述,直接看世界):
-    某字段任一取值若是另一实体的名 = 该字段是一条边。返回去重的 hops 跳【字段路径模板】。"""
+    某字段任一取值若是另一实体的名 = 该字段是一条边。返回去重的 hops 跳【字段路径模板】。
+    hops==2:f1(起点→桥)+ f2(桥的任意字段=答案)。
+    hops==3:f1(起点→桥1)+ f2(桥1→桥2,必须仍是 FK 边)+ f3(桥2 的任意字段=答案)——桥实体再走一跳。"""
     keys = set(ws.entities)
 
     def fk_targets(ent, fld):                       # 该 (实体,字段) 指向的实体集合
@@ -77,10 +79,51 @@ def discover_fk_paths(ws: WorldState, hops: int = 2) -> list[list[str]]:
     for x in ws.entities:
         for f1 in fk_fields(x):
             for y in fk_targets(x, f1):
-                for f2 in ws.entities.get(y, {}):   # hop2:桥实体 y 的任意字段(末跳=答案)
-                    if hops == 2:
+                if hops == 2:
+                    for f2 in ws.entities.get(y, {}):       # hop2:桥实体 y 的任意字段(末跳=答案)
                         patterns.add((f1, f2))
+                elif hops == 3:
+                    for f2 in fk_fields(y):                 # hop2 必须仍是 FK 边(桥1→桥2)
+                        for z in fk_targets(y, f2):
+                            for f3 in ws.entities.get(z, {}):   # hop3:桥2 的任意字段(末跳=答案)
+                                patterns.add((f1, f2, f3))
     return [list(p) for p in patterns]
+
+
+def _l2_difficulty(hops: int, cross_week: bool) -> str:
+    """★纯结构难度分档(全由 path/证据结构算,零 LLM):
+      T1 = 2 跳·单周桥(桥稳定,证据同周)     —— 最易;
+      T2 = 2 跳·跨周桥(桥换过人,须锁周回忆)  —— 中;
+      T3 = 3 跳(桥实体再走一跳)              —— 最难。"""
+    if hops >= 3:
+        return "T3"
+    return "T2" if cross_week else "T1"
+
+
+def _apportion_by_tier(tagged: list[dict], ratio: dict, target: int) -> list[dict]:
+    """按档配额(如 T1:T2:T3=3:3:2)把 target 分到各难度档;某档供给不足从余档补(高配额优先)。
+    与 L1 配额驱动同款:ratio 是【配比权重】非硬上限。tagged 每项 aux.difficulty 已 stamp。"""
+    pools: dict[str, list] = {t: [] for t in ratio}
+    for o in tagged:
+        d = (o.get("aux") or {}).get("difficulty")
+        pools.setdefault(d, []).append(o)
+    total_w = sum(ratio.values()) or 1
+    tiers = [t for t, _ in sorted(ratio.items(), key=lambda kv: -kv[1])]   # 高配额优先
+    taken = {t: 0 for t in pools}
+    picked: list = []
+    for t in tiers:                                                        # 第一轮:按配额比例
+        n_t = min(len(pools.get(t, [])), max(1, round(target * ratio[t] / total_w)))
+        picked += pools[t][:n_t]; taken[t] = n_t
+    while len(picked) < target:                                           # 补足:从仍有余的档轮取
+        progressed = False
+        for t in list(pools):
+            if len(picked) >= target:
+                break
+            if taken[t] < len(pools[t]):
+                picked.append(pools[t][taken[t]]); taken[t] += 1; progressed = True
+        if not progressed:
+            break
+    return picked[:target]
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -105,12 +148,25 @@ class RelationalLine(ProductionLine):
     def prepare(self, ws, profile: dict):
         """★世界基质:把【人名类字段】的值提升为【人员实体】,并给人员一个【下一跳字段】(时变,制造跨周2跳)。
         引用完整性由代码保证:dept.负责人 的值 = 真实存在的人员实体名。≥2 个 person 字段才构成链。
-        (从 run_factory._augment_relations 搬来;归位到 L2 → 基质按产线激活备料。)"""
+        (从 run_factory._augment_relations 搬来;归位到 L2 → 基质按产线激活备料。)
+
+        ★根因修复(反词面短路):不再盲取 next_field=pf[1]。先算【起点实体族】的原生字段并集;
+          若 pf[1] 与起点原生字段【碰撞】(如案件本身也有「督导合伙人」)→ 铸造一个【人专属】末跳字段名
+          (pf[1]+'·直属上级')只赋给人员实体 → 起点(案件)根本没有该字段 → 词面短路无处可抄。
+        ★上级池单射度:seniors 由 difficulty 控(profile.l2_senior_pool_frac,缺省近单射=全体人员)。
+          近单射(池≈全体)→ 每人分到基本唯一的上级 → 桥/答案可消歧(治"张宇是所有人上级不可消歧")。"""
         pf = [f["name"] for f in (profile.get("field_schema") or []) if f.get("kind") == "person"]
         if len(pf) < 2:
             return None
-        fk_field, next_field = pf[0], pf[1]            # 负责人(dept→person FK) / 汇报对象(person→上级人员)
+        fk_field = pf[0]                               # 负责人(dept→person FK)
         from pipeline.world_state import _strip_disambig
+        # ★起点实体族(有 fk_field 的实体)的原生字段并集 —— 用于探测末跳字段碰撞
+        start_fields = set()
+        for ent, flds in ws.entities.items():
+            if fk_field in flds:
+                start_fields |= set(flds.keys())
+        # ★碰撞则铸人专属末跳字段名(只赋人员实体,起点无此字段→无短路);否则用原字段名
+        next_field = pf[1] if pf[1] not in start_fields else f"{pf[1]}·直属上级"
         persons, seen_base = [], {_strip_disambig(e) for e in ws.entities}   # ★Fix3:人名也防表面塌缩(主干已被实体/已收人名占用 → 跳)
         for ent, flds in list(ws.entities.items()):
             tl = flds.get(fk_field)
@@ -125,8 +181,16 @@ class RelationalLine(ProductionLine):
             return None
         # ★下一跳值 = 另一个【真实人员名】,不再写死 CTO/CEO 职级(审计 ★2,根因修复):
         #   ① 域无关(medical 的「会诊上级」= 医生名而非 CTO);② 消别名漂移(gold=名、语料也渲名,不再 CEO↔刘总);
-        #   ③ 答案空间多样(不再挤在 5 个 CXO token、防瞎猜)。取前 1/3 作"上级层",余者报给某上级,时变制造跨周 2 跳。
-        seniors = persons[:max(1, len(persons) // 3)]
+        #   ③ 答案空间多样(不再挤在 5 个 CXO token、防瞎猜)。
+        # ★上级池:近单射(默认 frac=1.0=全体)→ i→i+1 的循环移位映射 ≈ 排列(单射)→ 桥/答案唯一可消歧。
+        #   frac 越小(T3 难档)→ 池越窄 → 多人共享上级 → 桥不可消歧(制造干扰)。由白皮书 difficulty 旋钮控,gold 零改。
+        frac = profile.get("l2_senior_pool_frac", 1.0)
+        try:
+            frac = min(1.0, max(0.0, float(frac)))
+        except (TypeError, ValueError):
+            frac = 1.0
+        k = max(2, round(len(persons) * frac))
+        seniors = persons[:k]
         n, ch = (ws.n_sessions or 10), max(1, (ws.n_sessions or 10) // 2)
         for i, p in enumerate(persons):
             cands = [s for s in seniors if s != p] or [x for x in persons if x != p]
@@ -135,19 +199,51 @@ class RelationalLine(ProductionLine):
             if m2 != m1:                               # 中段换上级 → 2跳证据落不同周(cross_week)
                 ops.append(Op(ch, _date_of(ch), UPDATE, m2, m1))
             ws.entities[p] = {next_field: Timeline(ops)}
-        return f"  ★关系增强:+{len(persons)} 人员实体(「{next_field}」=真实人员名·时变),软外键链 「{fk_field}」→人员→「{next_field}」打通"
+        note = f"  ★关系增强:+{len(persons)} 人员实体(「{next_field}」=真实人员名·时变),软外键链 「{fk_field}」→人员→「{next_field}」打通"
+        if next_field != pf[1]:
+            note += f"(★末跳字段与起点原生「{pf[1]}」碰撞→铸人专属名,反词面短路)"
+        return note
+
+    # ★按档配额(纯结构):T1:T2:T3 = 3:3:2(配比权重,非硬上限;供给不足从余档补)。
+    _TIER_RATIO = {"T1": 3, "T2": 3, "T3": 2}
+
+    def _answer_siblings(self, ws, order, path) -> int:
+        """★distractor_n(纯结构):末跳字段上,与本链答案【同解】的其他实体数
+        (= 有多少人也报给同一个上级/指向同一答案)→ 共指干扰规模。近单射世界≈0。"""
+        last = path[-1] if path else None
+        aux = order.aux if hasattr(order, "aux") else (order.get("aux") or {})
+        w, ans = aux.get("at_week"), (order.gt if hasattr(order, "gt") else order.get("gt"))
+        n = 0                                         # 末跳字段上,@w 取值=本链答案的实体数(= 有多少人也报给同一上级)
+        for e, flds in ws.entities.items():
+            tl = flds.get(last)
+            if tl and _norm(tl.value_at_session(w)) == _norm(ans):
+                n += 1
+        return max(0, n - 1)                          # 减 1:本链自身的直接前驱不算干扰
 
     def enumerate(self, ws, target: int = 200, wp=None) -> list[dict]:
-        paths = discover_fk_paths(ws, hops=2)
+        """★2 跳 + 3 跳一起枚举;每单按结构 stamp difficulty/hops/bridge_hidden/distractor_n;按档配额(3:3:2)发题。"""
         profile = (wp or {}).get("domain_profile", {})
-        out = []
-        for o in enumerate_l2_orders(ws, paths)[:target]:
+        raw = enumerate_l2_orders(ws, discover_fk_paths(ws, hops=2)) \
+            + enumerate_l2_orders(ws, discover_fk_paths(ws, hops=3))
+        tagged, seen = [], set()
+        for o in raw:
             aux = dict(o.aux)
-            last = (aux.get("path") or [None])[-1]          # ★Fix2:末跳字段的 kind 决定疑问词(样本值=gt 答案)
+            path = aux.get("path") or []
+            key = (o.entity, tuple(path), o.gt, aux.get("at_week"))
+            if key in seen:                                 # 去重(2/3 跳可能重复某些起点)
+                continue
+            seen.add(key)
+            hops = len(path)
+            cross = bool(aux.get("cross_week"))
+            last = path[-1] if path else None               # ★Fix2:末跳字段的 kind 决定疑问词(样本值=gt 答案)
+            aux["hops"] = hops
+            aux["difficulty"] = _l2_difficulty(hops, cross)
+            aux["bridge_hidden"] = aux["difficulty"] != "T1"    # ★T2/T3 桥须隐藏(渲染侧钩子:桥事实不与起点同现)
+            aux["distractor_n"] = self._answer_siblings(ws, o, path)
             aux.setdefault("ans_kind", field_kind(last, o.gt, profile))
-            out.append({"line": self.id, "capability": "L2_multihop", "entity": o.entity,
-                        "field": o.field, "gt": o.gt, "evidence_sessions": o.evidence_sessions, "aux": aux})
-        return out
+            tagged.append({"line": self.id, "capability": "L2_multihop", "entity": o.entity,
+                           "field": o.field, "gt": o.gt, "evidence_sessions": o.evidence_sessions, "aux": aux})
+        return _apportion_by_tier(tagged, self._TIER_RATIO, target)
 
     def gt(self, ws, o: dict):
         """护城河:时序软外键图遍历,与 enumerate 烘焙逐字段相等(见自检校验闸)。"""
@@ -156,16 +252,20 @@ class RelationalLine(ProductionLine):
 
     def intent(self, o: dict) -> tuple[str, list]:
         ent, fld, aux, gt = o.get("entity", ""), o.get("field", ""), o.get("aux", {}) or {}, o.get("gt")
-        p = (aux.get("path") or [fld, ""]) + ["", ""]
+        path = list(aux.get("path") or [fld])
+        hops = len(path)
         aw = aux.get("at_week")
         # ★§V-A 良定义:时变关系链,题面必须带【周锚】——否则"向谁汇报"逐周多值、gold 不唯一(run0604 实证)。
-        #   并明确"那个人本人"(消"部门汇报 vs 负责人汇报"二义)。
+        #   并明确"那个人本人"(消"部门汇报 vs 负责人汇报"二义)。★2/3 跳统一:逐跳描述全链,末跳才是答案。
         q = interrogative(aux.get("ans_kind"))     # ★Fix2:末跳疑问词由 path[-1] 的 kind 派生(治"管理跨度是谁")
         wk = f"截至第{week_label(aw)}周(以那一周的状态为准)," if aw is not None else ""
-        s = (f"{wk}沿一条两步关系链提问:从【{ent}】出发,先找它的「{p[0]}」**所指的那个人**,"
-             f"再问【那个人本人】的「{p[1]}」{q}。"
+        chain = f"从【{ent}】出发,先找它的「{path[0]}」**所指的那个人**"
+        for f in path[1:-1]:                            # 3 跳(及以上)的中间跳:继续"所指的那个人"
+            chain += f",再找【那个人本人】的「{f}」**所指的那个人**"
+        chain += f",最后问【那个人本人】的「{path[-1]}」{q}。"
+        s = (f"{wk}沿一条{hops}步关系链提问:{chain}"
              f"★必须点明'第{week_label(aw)}周'这个时点(时变关系,不带周次答案不唯一);"
-             f"只给起点【{ent}】和「{p[0]}→{p[1]}」关系;【绝不点名中间那个人】;答案也不能出现。")
+             f"只给起点【{ent}】和「{'→'.join(path)}」这条关系链;【绝不点名链上任何中间人】;答案也不能出现。")
         hide = [str(gt)]
         if aux.get("bridge"):
             hide.append(str(aux["bridge"]))            # L2 桥实体必须隐藏
@@ -201,6 +301,13 @@ class RelationalLine(ProductionLine):
             return ("drop", f"ill-formed:hops({aux.get('hops')})≠path 长({len(path)})")
         if not (isinstance(gold, str) and gold.strip()) or gold in (INSUFFICIENT, INVALID):
             return ("drop", "ill-formed:gold 空/INSUFFICIENT(L2 必须有唯一答案)")
+
+        # ── ★INV-6 反短路(纯结构):末跳字段若也是【起点原生字段】→ 词面短路 ──
+        #   题面"X 的负责人的『末跳字段』",若 X 本身也有『末跳字段』,系统只需抄 X 自己的同名字段即可
+        #   得到一个(错的)值,完全绕过多跳遍历(根因:末跳与起点原生字段同名 → 全员答起点自己的值)。
+        #   prepare 已通过【碰撞则铸人专属末跳字段名】杜绝此形;此闸兜底,遇碰撞形【一律 drop】。
+        if path[-1] in ws.entities.get(start, {}):
+            return ("drop", f"短路:末跳字段「{path[-1]}」是起点「{start}」原生字段(词面短路,绕过多跳)")
 
         # ── INV-1 必须带唯一周锚(治"无周锚→横跳多解")──
         weeks = set(ws.sessions())
@@ -277,6 +384,68 @@ if __name__ == "__main__":
     ck("prepare 增强出人员实体(陈一/孙二)", "陈一" in bws.entities and "孙二" in bws.entities)
     ck("prepare 人员带【汇报对象】字段", all("汇报对象" in bws.entities[p] for p in ["陈一", "孙二"]))
     ck("prepare <2 person 字段时 no-op", line.prepare(bws, {"field_schema": [{"name": "负责人", "kind": "person"}]}) is None)
+    ck("prepare 近单射:每人上级各异(排列)→ 桥可消歧",
+       bws.entities["陈一"]["汇报对象"].value_at_session(0) != bws.entities["孙二"]["汇报对象"].value_at_session(0))
+
+    # ★根因修复:起点原生字段与 pf[1] 碰撞 → prepare 铸【人专属】末跳字段名,案件无此字段(反短路)
+    collide_table = {"entities": [
+        {"name": "案件1", "fields": {
+            "负责人": {"type": "evolving", "trajectory": [{"session": 0, "value": "甲"}, {"session": 2, "value": "乙"}]},
+            "督导合伙人": {"type": "stable", "value": "王雷"}}},     # ★案件原生就有「督导合伙人」= 碰撞源
+    ]}
+    cws, _ = assemble_world(collide_table)
+    cprof = {"field_schema": [{"name": "负责人", "kind": "person"}, {"name": "督导合伙人", "kind": "person"}]}
+    cnote = line.prepare(cws, cprof)
+    ck("prepare 碰撞→铸人专属末跳字段「督导合伙人·直属上级」", "督导合伙人·直属上级" in cws.entities.get("甲", {}))
+    ck("prepare 碰撞→起点(案件1)无该末跳字段(无短路)", "督导合伙人·直属上级" not in cws.entities.get("案件1", {}))
+    ck("prepare 碰撞→人员实体不复用起点原生「督导合伙人」名", "督导合伙人" not in cws.entities.get("甲", {}))
+    # 碰撞世界枚举出的题:案件起点·末跳=人专属字段 → 过 INV-6(不短路);
+    #   人-起点链(起点自带同名末跳字段)才被 INV-6 正确 drop —— 这正是短路兜底。
+    corders = line.enumerate(cws, wp={"domain_profile": cprof})
+    ck("碰撞世界:案件起点题(末跳人专属)过 well_posed(不短路)",
+       any(o["entity"] == "案件1" and line.well_posed(o, cws)[0] == "well_posed" for o in corders))
+    bad_collide = {"line": "L2_relational", "capability": "L2_multihop", "entity": "案件1",
+                   "field": "负责人→督导合伙人", "gt": "王雷", "evidence_sessions": [0],
+                   "aux": {"path": ["负责人", "督导合伙人"], "at_week": 0, "hops": 2}}
+    rSC = line.well_posed(bad_collide, cws)
+    ck("INV-6:人为拼碰撞路径(末跳=起点原生字段)→ drop 短路", rSC[0] == "drop" and "短路" in rSC[1])
+
+    # ════════════════════════════════════════════════════════════════════════
+    # ★3 跳发现 + 难度分档 + 配额(纯结构)自检
+    # ════════════════════════════════════════════════════════════════════════
+    # 造 3 跳世界:部门→负责人(人)→直属上级(人)→再上级(人);人链可再走一跳 = 3 跳。
+    chain_table = {"entities": [
+        {"name": "A部", "fields": {"负责人": {"type": "stable", "value": "p1"}}},
+        {"name": "B部", "fields": {"负责人": {"type": "stable", "value": "p2"}}},
+        {"name": "p1", "fields": {"直属上级": {"type": "stable", "value": "p2"}}},
+        {"name": "p2", "fields": {"直属上级": {"type": "stable", "value": "p3"}}},
+        {"name": "p3", "fields": {"直属上级": {"type": "stable", "value": "p4"}}},
+        {"name": "p4", "fields": {"职级": {"type": "stable", "value": "总监"}}},
+    ]}
+    chws, _ = assemble_world(chain_table)
+    p3 = discover_fk_paths(chws, hops=3)
+    ck("discover_fk_paths hops=3 找到 3 跳路径", any(len(p) == 3 for p in p3))
+    ck("discover_fk_paths hops=3 含 [负责人,直属上级,直属上级]", ["负责人", "直属上级", "直属上级"] in p3)
+    corders3 = line.enumerate(chws, wp={"domain_profile": {}})
+    ck("enumerate 每单 stamp difficulty/hops/bridge_hidden/distractor_n",
+       all(all(k in o["aux"] for k in ("difficulty", "hops", "bridge_hidden", "distractor_n")) for o in corders3))
+    ck("enumerate 出 3 跳(T3)题", any(o["aux"]["difficulty"] == "T3" and o["aux"]["hops"] == 3 for o in corders3))
+    ck("enumerate 出【可过闸】的 3 跳(T3)题(案件起点,非短路)",
+       any(o["aux"]["hops"] == 3 and line.well_posed(o, chws)[0] == "well_posed" for o in corders3))
+    ck("_l2_difficulty 分档:2跳单周=T1 / 2跳跨周=T2 / 3跳=T3",
+       _l2_difficulty(2, False) == "T1" and _l2_difficulty(2, True) == "T2" and _l2_difficulty(3, False) == "T3")
+    ck("bridge_hidden:T1=False,T2/T3=True",
+       all((o["aux"]["bridge_hidden"] is False) == (o["aux"]["difficulty"] == "T1") for o in corders3))
+    # 配额:合成 tagged 验 3:3:2 分配(每档供给充足时按比例)
+    def _mk(d):
+        return {"aux": {"difficulty": d}}
+    synth = [_mk("T1")] * 10 + [_mk("T2")] * 10 + [_mk("T3")] * 10
+    got = _apportion_by_tier(synth, {"T1": 3, "T2": 3, "T3": 2}, 8)
+    from collections import Counter as _C
+    dist = _C(o["aux"]["difficulty"] for o in got)
+    ck("配额 3:3:2 @target8 → T1=3,T2=3,T3=2", dist["T1"] == 3 and dist["T2"] == 3 and dist["T3"] == 2)
+    ck("配额:某档供给不足从余档补足 target",
+       len(_apportion_by_tier([_mk("T1")] * 2 + [_mk("T2")] * 10, {"T1": 3, "T2": 3, "T3": 2}, 8)) == 8)
 
     # ════════════════════════════════════════════════════════════════════════
     # ★边 A 闸 well_posed() 自检(设计 §7:well-posed A/B + ill-posed C–H)
@@ -325,14 +494,14 @@ if __name__ == "__main__":
     ck("[wp] F2 多角色 gold 错 → INV-3 drop(Q27 真缺陷在此边)",
        rF2[0] == "drop" and "查无实据" in rF2[1])
 
-    # G) 起点自带末跳字段【不再误杀】(INV-5 已撤):题面"前端部负责人的汇报对象"自然解析唯一(=张三的=CFO),
-    #    虽然前端部自己也有汇报对象(李四),但那要问"前端部的汇报对象"=另一道题 → 本题良定义,必须【放行】。
+    # G) ★INV-6 反短路:起点自带【与末跳同名】字段 → 词面短路(全员抄起点自己的「汇报对象」=李四,绕过多跳)→ 必 drop。
+    #    (这正是根因坏题型:末跳字段=起点原生字段;INV-6 当初就会 drop 掉全部 7 题。prepare 侧已靠铸人专属字段名杜绝。)
     dual = WorldState({
         "前端部": {"负责人": WL((0, SET, "张三", None)), "汇报对象": WL((0, SET, "李四", None))},  # 部门自带汇报对象=李四
         "张三":   {"汇报对象": WL((0, SET, "CFO", None))},
     }, n_sessions=2)
     rG = line.well_posed(od("前端部", P, 0, "CFO", "张三"), dual)
-    ck("[wp] G 起点自带末跳字段 + 题面带'负责人的' → 良定义放行(INV-5 撤,不再误杀)", rG[0] == "well_posed")
+    ck("[wp] G 起点自带同名末跳字段 → INV-6 反短路 drop", rG[0] == "drop" and "短路" in rG[1])
 
     # H) 链断(末跳实体在 W 无该字段)→ INV-2
     broke = WorldState({"销售部": {"负责人": WL((0, SET, "孤儿", None))}}, n_sessions=2)

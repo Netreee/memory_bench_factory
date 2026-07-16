@@ -38,7 +38,7 @@ from eval.memory_interface import EmbedMemory, _chunk
 from eval.embed_cache import cached_embed, cache_size
 from eval import qa_cache
 from eval.baseline_r1 import unified_answer
-from eval.judge import judge, judge_answer, is_judgeable, gold_display, judge_spec
+from eval.judge import judge, judge_answer, is_judgeable, gold_display, judge_spec, classify_refusal, judge_l2_partial
 
 # ── 默认评测集(office_v3) ───────────────────────────────────────────────────
 DEFAULT_BENCH = ROOT / "output" / "factory_v2_office_v3" / "06_questions.json"
@@ -305,6 +305,7 @@ def run_system(name: str, questions: list, sys_instance, workers: int = WORKERS,
             "_qh": qh,
             "line": q["line"], "capability": q["capability"],
             "question": q["question"], "gt": q.get("gt"),
+            "aux": q.get("aux"),                             # ★L6 透传:判分需 aux.lure.value(吐诱饵=判错)
             "gold_set": gold_display(q), "mode": mode,
             "judgeable": is_judgeable(q),
         }
@@ -344,8 +345,13 @@ def run_system(name: str, questions: list, sys_instance, workers: int = WORKERS,
         else:
             try:
                 qd = {"capability": rec["capability"], "gt": rec.get("gt"),
-                      "question": rec["question"]}
+                      "question": rec["question"], "aux": rec.get("aux")}
                 rec["correct"] = bool(judge_answer(qd, pred, use_llm=True))
+                if rec["capability"] == "L6_refusal":       # ★三分桶(报表用):refuse/lure/other
+                    lure = ((rec.get("aux") or {}).get("lure") or {}).get("value")
+                    rec["refusal_bucket"] = classify_refusal(pred, lure)
+                if rec["capability"] == "L2_multihop":      # ★L2 部分 credit:gt=1.0 / 桥=0.5 / 否则 0
+                    rec["partial"] = judge_l2_partial(qd, pred, use_llm=True)
             except Exception as e:
                 rec["correct"] = False
                 rec["judge_error"] = f"{type(e).__name__}:{str(e)[:60]}"

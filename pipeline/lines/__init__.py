@@ -19,12 +19,20 @@ from pipeline.lines.L5_conflict import ConflictLine
 from pipeline.lines.L6_refusal import RefusalLine
 from pipeline.lines.L7_consolidation import ConsolidationLine
 from pipeline.lines.L8_transition import TransitionLine
+from pipeline.lines.L9_induction import InductionLine
+from pipeline.lines.L10_admission import AdmissionLine
 
 # ── 已建成的产线(实例)──
 # ★L8_transition:结构原型【状态机】招牌线,feasible 只在【有 state_machines 声明】的场景(cs/legal)激活
 #   → office/game 无此线 = 不同场景【结构分叉】的来源(治盲审病根①"换皮不换芯")。
+# ★L9_induction:条件归纳招牌线,auto_activate——prepare 声明阶跃规则 + 注入执行实例(ws.rule_instances)后即触发;
+#   从【单条情境→动作】实例归纳 IF-THEN 函数,并在【未见 trigger 值 x*】上外推(function-on-unseen)。
+#   gold=apply_rule 纯查表;闭选项 MC EM 避开 llm_judge;canon 层防检索捷径;唯一性闸保 gold 硬(与 L8 换皮无关)。
+# ★L10_admission:写入期【非泄露】招牌线,auto_activate——prepare 注入敏感基质(ws.sensitive)后即触发,
+#   与 L6 读取期拒答正交(L6 考"别瞎编缺席值",L10 考"记得敏感原文也别逐字吐")。
 LINES: list[ProductionLine] = [TimelineLine(), RelationalLine(), ProcessLine(), PreferenceLine(),
-                               ConflictLine(), RefusalLine(), ConsolidationLine(), TransitionLine()]
+                               ConflictLine(), RefusalLine(), ConsolidationLine(), TransitionLine(),
+                               InductionLine(), AdmissionLine()]
 
 # ── 规划但未落地的坐标(只元数据,给议会看完整菜单;建成后从这里删、移进 LINES)──
 # ★L1–L7 七条线全部落地。新规划线在此登记(只元数据),建成后移进 LINES。
@@ -131,6 +139,14 @@ def prepare_lines(wp, ws, log=print):
     for aid in [l.get("line") for l in wp.get("active_lines", [])]:
         line = line_for(aid)
         if line and line.id not in seen:
+            seen.add(line.id)
+            note = line.prepare(ws, profile)
+            if note:
+                log(note)
+    # ★结构原型自动激活线(如 L10 敏感注入):即便议会未列进 active_lines,也要 prepare 其基质,
+    #   否则 feasible 恒 False、run_lines 的 auto_activate 无从触发(与 run_lines 同款兜底)。
+    for line in LINES:
+        if getattr(line, "auto_activate", False) and line.id not in seen:
             seen.add(line.id)
             note = line.prepare(ws, profile)
             if note:

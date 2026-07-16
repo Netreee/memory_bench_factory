@@ -139,6 +139,39 @@ def _render_conflict_docs(ws, s, date, tracer):
     return out
 
 
+_SENS_FIELD_LABEL = {"secret": "登录口令", "pii_id": "身份证号", "bankcard": "银行卡号", "apikey": "API 密钥"}
+
+
+def _render_sensitive_docs(ws, s, date):
+    """★L10:把 session==s 的敏感注入渲染成【确定性写入文档】(user 供出 X / assistant 已记录)。
+    ★绕开 LLM(不调 tracer):代码直接 Template.substitute → 保证 X 逐字 + 就近实体落地(G3 反退化 L6)。
+    无 ws.sensitive(非 L10 场景)→ 返回 [],对其它场景零副作用。"""
+    out = []
+    for c in (getattr(ws, "sensitive", None) or []):
+        if c.get("session") != s or not c.get("value"):
+            continue
+        label = c.get("field") or _SENS_FIELD_LABEL.get(c.get("stype"), "敏感信息")
+        content = render("sensitive.template", date=date, entity=c["entity"],
+                         field_label=label, value=c["value"])
+        out.append({"type": "记忆写入", "content": content})
+    return out
+
+
+def _render_rule_docs(ws, s, date):
+    """★L9:把 session==s 的条件归纳执行实例渲染成【确定性单条情境→动作】文档(用 surface 表面串,canon 层)。
+    ★绕开 LLM(不调 tracer):代码直接 Template.substitute → 保证只渲【一条情境+一个处置】、绝不写一般化规则句。
+    无 ws.rule_instances(非 L9 场景)→ 返回 [],对其它场景零副作用。"""
+    out = []
+    for i in (getattr(ws, "rule_instances", None) or []):
+        if i.get("session") != s or i.get("surface_action") is None:
+            continue
+        content = render("rule.template", date=date, inst_id=i.get("inst_id", ""),
+                         trigger_field=i.get("trigger_field", ""), x=i.get("x", ""),
+                         unit=i.get("unit", ""), surface_action=i.get("surface_action", ""))
+        out.append({"type": "处置记录", "content": content})
+    return out
+
+
 def _chunk(lst, n):
     for i in range(0, len(lst), n):
         yield lst[i:i + n]
@@ -280,6 +313,10 @@ def render_corpus(wp, ws, target_tokens, tracer, corpus, done_weeks, save_cb, lo
                         d.update({"doc_id": f"s{s}_fil_{len(docs)}", "is_filler": True, "fact_refs": []}); docs.append(d)
                 for d in _render_conflict_docs(ws, s, date, tracer):      # ★L5:本周小道矛盾文档(非 L5 场景为空)
                     d.update({"doc_id": f"s{s}_conf_{len(docs)}", "is_conflict": True, "fact_refs": []}); docs.append(d)
+                for d in _render_sensitive_docs(ws, s, date):             # ★L10:本周敏感写入文档(确定性模板,X 逐字就近;非 L10 场景为空)
+                    d.update({"doc_id": f"s{s}_sens_{len(docs)}", "is_sensitive": True, "fact_refs": []}); docs.append(d)
+                for d in _render_rule_docs(ws, s, date):                  # ★L9:本周条件归纳执行实例(确定性单条情境→动作;非 L9 场景为空)
+                    d.update({"doc_id": f"s{s}_rule_{len(docs)}", "is_rule_instance": True, "fact_refs": []}); docs.append(d)
                 by_id[s] = {"session_id": s, "date": date, "docs": docs}
                 done_weeks.add(s)
             corpus["sessions"] = [by_id[k] for k in sorted(by_id)]
@@ -304,6 +341,10 @@ def phrase_questions(orders, wp, tracer, log=print) -> list[dict]:
         if line is None:                                  # 兜底(订单都来自已建线,理论不触发)
             return {**o, "question": ""}
         intent, hide = line.intent(o)
+        # ★确定性出题 bypass(L9 闭选项 MC):选项串必须逐字保真、LLM 润色会打乱选项/丢 gold → 破坏纯代码 EM。
+        #   直接用 intent 原文作题面(它已是完整可答的 MC 题,含 held-out x* + 全部选项)。
+        if getattr(line, "deterministic_phrasing", False):
+            return {**o, "question": intent}
         out = tracer.chat_json("phrase",
             [{"role": "system", "content": PHRASE_SYS},
              {"role": "user", "content": render("phrase.user", intent=intent, hide=hide)}],

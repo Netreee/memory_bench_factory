@@ -52,3 +52,11 @@ docs/anchors/*
 # ── 系统 / IDE ──
 .DS_Store
 .idea/
+
+# 原始数据/汇报产物(大文件+含PII,不入库)
+recall_logs.zip
+*.crdownload
+request&respone*.csv
+海尔*.xlsx
+73汇报/
+Ryan
