@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from collections import Counter
 from pipeline.lines.base import ProductionLine, Order
-from pipeline.world_state import WorldState, gt_event_order, _norm, EXPIRE, DELETE
+from pipeline.world_state import WorldState, gt_event_order, _norm, UPDATE, EXPIRE, DELETE
 
 MIN_EVENTS = 3                                          # 一道排序题至少要 3 个事件才有料
 

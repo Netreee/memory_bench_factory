@@ -21,11 +21,30 @@ INSUFFICIENT = "INSUFFICIENT_EVIDENCE"  # 哨兵:字段从未出现(ABS)
 
 
 def _to_num(s: Any) -> Optional[float]:
-    """从 '2.5%' / '15次' / '1.8' 抽数值,抽不出返回 None。"""
+    """从 '2.5%' / '15次' / '1.8' / '1,050' 抽数值,抽不出返回 None。
+    ★先剥千分位逗号(value_shape 审计 HIGH):'1,050' 旧版在逗号截断成 1.0,使累计量(会破千)的单调/值域
+      跨周比较假阳/假阴。半/全角逗号都剥(累计工时这类大额字段 LLM 常写千分位)。"""
     if s is None:
         return None
-    m = re.search(r"-?\d+\.?\d*", str(s))
+    m = re.search(r"-?\d+\.?\d*", str(s).replace(",", "").replace("，", ""))
     return float(m.group()) if m else None
+
+
+_UNIT_MULT = {"千": 1e3, "万": 1e4, "亿": 1e8}     # 中文大数单位(固定数学事实,非按字段名猜)
+
+
+def _magnitude(s: Any) -> Optional[float]:
+    """值的【绝对量级】= 数值 × 中文大数单位后缀。让 '9000'、'1.2万'、'2亿' 在同一把尺上可比。
+    ★value_shape 跨周比较(单调/值域)专用(审计 HIGH 的根治:按单位归一再比,而非只剥某一种写法符号)。
+    剥逗号(走 _to_num)+ 识别 千/万/亿。无后缀=量级即数值本身。抽不出返回 None。"""
+    n = _to_num(s)
+    if n is None:
+        return None
+    t = str(s)
+    for suf, mult in _UNIT_MULT.items():
+        if suf in t:
+            return n * mult
+    return n
 
 
 def _norm(s: Any) -> str:
@@ -116,14 +135,19 @@ class WorldState:
             "absent_fields": self.absent_fields,
             "n_sessions": self.n_sessions,
             "conflicts": self.conflicts,
+            # ★imprint 已注趋势标记必须随世界落盘(刀1审计·高危):否则闭环 ②环 augment 从盘重载后
+            #   done 集为空 → 旧实体被【复注且 shuffle 翻向】,而 delta 续渲不重渲旧 docs → 语料与 canonical 矛盾。
+            "_trended_fields": [list(t) for t in getattr(self, "_trended_fields", [])],
         }
 
     @classmethod
     def from_dict(cls, d: dict) -> "WorldState":
         ents = {e: {f: Timeline([Op(**o) for o in ops]) for f, ops in flds.items()}
                 for e, flds in d.get("entities", {}).items()}
-        return cls(ents, d.get("cascades", []), d.get("absent_fields", []), d.get("n_sessions", 0),
-                   d.get("conflicts", []))
+        ws = cls(ents, d.get("cascades", []), d.get("absent_fields", []), d.get("n_sessions", 0),
+                 d.get("conflicts", []))
+        ws._trended_fields = [tuple(t) for t in d.get("_trended_fields", [])]
+        return ws
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -285,17 +309,42 @@ def _shape_issues(ws: WorldState):
     return issues
 
 
-def validate(ws: WorldState, table: dict = None) -> list[dict]:
+def validate(ws: WorldState, table: dict = None, profile: dict = None) -> list[dict]:
     """★W.3 世界质量【结构化缺陷清单】(CRITIC 修复轮:算出的缺陷不丢、定向重生成坏字段)。
     每条 = {entity, field, type, detail}。type:
-      monotonic     —— 数值轨迹单调(极值落端点),MR 退化;
-      fake_evolving —— 声明 evolving 却全程只有 1 个值(且没停用)= 没演化起来。
-    table = LLM 原始世界表(用于判 declared type);缺省则跳过 fake_evolving。"""
+      monotonic          —— 数值轨迹单调(极值落端点),MR 退化;
+      fake_evolving      —— 声明 evolving 却全程只有 1 个值(且没停用)= 没演化起来;
+      illegal_transition —— ★C1③:白皮书 state_machines 声明了【单向状态序】的字段,取值倒流/出界
+                            (014559 实证:状态倒流写在世界 canonical 本身,4/34 实体)。
+                            opt-in:只查声明了 states 的字段,绝不碰 L4 选择流等合法往复字段。
+    table = LLM 原始世界表(用于判 declared type);缺省则跳过 fake_evolving。
+    profile = 白皮书 domain_profile(取 state_machines);缺省则跳过 illegal_transition。"""
     decl = {}
-    for e in (table or {}).get("entities", []):
+    for e in _dicts((table or {}).get("entities", [])):
         nm = e.get("name") or e.get("id")
-        for fn, sp in (e.get("fields") or {}).items():
+        for fn, sp in _dict(e.get("fields")).items():
+            sp = _dict(sp)
             decl[(nm, fn)] = sp.get("type") or ("stable" if ("value" in sp and "trajectory" not in sp) else "evolving")
+    sm = {m.get("field"): [str(x) for x in (m.get("states") or [])]
+          for m in _dicts((profile or {}).get("state_machines"))
+          if m.get("field") and isinstance(m.get("states"), list) and len(m.get("states")) >= 2}
+    # ★声明自检(刀1审计):states 含 _norm 重复(如 [a,b,a])会让 idx 塌缩、把合法推进误判倒流 → 整条声明作废跳过
+    sm = {f: sts for f, sts in sm.items() if len({_norm(x) for x in sts}) == len(sts)}
+    # ★value_shape(累计工时非单调根治·183626 三轮坐实):议会声明数值字段的"值形状"(单调/值域),代码机械执行。
+    #   shape[field] = {"mono": "up"/"down"/None, "range": [lo,hi]/None}。域知识从白皮书来(议会声明),非代码猜字段名。
+    shape = {}
+    for f in _dicts((profile or {}).get("field_schema", [])):
+        nm, mono, rng = f.get("name"), f.get("monotonic"), f.get("range")
+        if nm and (mono in ("up", "down") or (isinstance(rng, (list, tuple)) and len(rng) == 2)):
+            lo_hi = None
+            try:
+                if isinstance(rng, (list, tuple)) and len(rng) == 2:
+                    lo_hi = (float(rng[0]), float(rng[1]))
+                    if lo_hi[0] >= lo_hi[1]:           # 声明自检:值域非法(下≥上)→ 作废该 range
+                        lo_hi = None
+            except (TypeError, ValueError):
+                lo_hi = None
+            shape[nm] = {"mono": mono if mono in ("up", "down") else None, "range": lo_hi}
     out: list[dict] = []
     for ent, flds in ws.entities.items():
         for fname, tl in flds.items():
@@ -303,16 +352,54 @@ def validate(ws: WorldState, table: dict = None) -> list[dict]:
             nums = [(s, _to_num(v)) for (s, _, v) in sv if _to_num(v) is not None]
             distinct = {_norm(v) for (_, _, v) in sv}
             has_stop = any(o.op in (DELETE, EXPIRE) for o in tl.ops)
-            if len(nums) >= 3:
+            fshape = shape.get(fname) or {}
+            mono_decl = fshape.get("mono")
+            # ★既有 monotonic(MR 退化)检查:豁免 sm 字段【及声明了单调形状的字段】——后者"必须单调"与"不许单调"相反,
+            #   不豁免会与 monotonic_violation 乒乓(刀1审计同款死锁)。
+            if len(nums) >= 3 and fname not in sm and not mono_decl:
                 sess = [s for s, _ in nums]
                 vals = [n for _, n in nums]
                 amax, amin = sess[vals.index(max(vals))], sess[vals.index(min(vals))]
                 if {amax, amin} <= {sess[0], sess[-1]}:
                     out.append({"entity": ent, "field": fname, "type": "monotonic",
                                 "detail": "数值轨迹单调(极值落首/尾)→ 需让峰或谷落在【非端点】的中间某周"})
+            # ★value_shape 单调:声明 up→只增不减、down→只减不增,违反即缺陷(交 CRITIC 修复)。
+            #   用【绝对量级 _magnitude】比较(审计 HIGH 根治:按单位归一,'9000万'<'1.2亿' 才判对,不被混量纲假阳假阴)
+            mags = [(s, _magnitude(v)) for (s, _, v) in sv if _magnitude(v) is not None]
+            if mono_decl and len(mags) >= 2:
+                mv = [m for _, m in mags]
+                bad_i = next((i for i in range(1, len(mv))
+                              if ((mv[i] < mv[i - 1]) if mono_decl == "up" else (mv[i] > mv[i - 1]))), None)
+                if bad_i is not None:
+                    word = "只增不减(累计/合计类)" if mono_decl == "up" else "只减不增"
+                    sym = "<" if mono_decl == "up" else ">"   # 审计 LOW:符号随方向,否则 down 字段文案符号写反误导修复
+                    out.append({"entity": ent, "field": fname, "type": "monotonic_violation",
+                                "detail": f"该字段值须{word},但第{mags[bad_i][0]}周量级 {mv[bad_i]:g} {sym} 前值 {mv[bad_i-1]:g}"
+                                          f"(逆向)→ 重写为单向【不减/不增】(可个别周持平、但整体要演化)的轨迹"})
+            # ★value_shape 值域:声明 [lo,hi],出界即缺陷(同样按量级比,值域端点为该字段单位下的数;无量纲字段=数值本身)
+            rng = fshape.get("range")
+            if rng:
+                oob = [(s, m) for (s, m) in mags if not (rng[0] <= m <= rng[1])]
+                if oob:
+                    out.append({"entity": ent, "field": fname, "type": "out_of_range",
+                                "detail": f"该字段值须在 [{rng[0]:g},{rng[1]:g}] 内,但 {[(s, f'{m:g}') for s, m in oob[:3]]} 出界 → 重写到值域内"})
             if decl.get((ent, fname)) == "evolving" and len(distinct) < 2 and not has_stop:
                 out.append({"entity": ent, "field": fname, "type": "fake_evolving",
                             "detail": "标 evolving 却全程只有 1 个值 → 需给【≥2 个不同值】的演化轨迹"})
+            order = sm.get(fname)
+            if order:
+                idx = {_norm(x): i for i, x in enumerate(order)}
+                last, bad = -1, None
+                for (_s, _d, v) in sv:
+                    i = idx.get(_norm(v))
+                    if i is None:
+                        bad = f"取值「{v}」不在声明状态表 {order} 内"; break
+                    if i < last:
+                        bad = f"状态倒流:「{v}」出现在更后阶段之后(声明顺序 {order})"; break
+                    last = i
+                if bad:
+                    out.append({"entity": ent, "field": fname, "type": "illegal_transition",
+                                "detail": f"{bad} → 须按声明顺序【单向推进】重写该字段轨迹(可跳级、不可回头)"})
     return out
 
 
@@ -380,12 +467,23 @@ def _as_int(x, default=0):
             return default
 
 
+def _dict(x) -> dict:
+    """非 dict → {}。LLM 偶发把"对象"吐成 list/str/标量,防下游 .get()/.items() AttributeError 崩整 stage。"""
+    return x if isinstance(x, dict) else {}
+
+
+def _dicts(x) -> list:
+    """只保留 list 里的 dict 元素(LLM 偶发把"对象数组"吐成 list-of-str / 混杂类型);非 list → []。
+    用在所有"for 元素 in LLM输出列表 → 元素.get(...)"的消费点,把畸形元素丢弃而非崩(契合"歧义直接 drop")。"""
+    return [d for d in x if isinstance(d, dict)] if isinstance(x, list) else []
+
+
 def _traj_to_ops(traj: list[dict], date_of) -> list[Op]:
     """把 [{session,value}] 轨迹 diff 成 ops:首现=SET、变值=UPDATE、value 为空=EXPIRE(停统计)。
     值持续不变则不记 op(由 value_at fold 前向填充,IE-locate 扫全程仍能命中)。"""
     ops: list[Op] = []
     last = None
-    for p in sorted(traj, key=lambda x: _as_int(x.get("session"), 0)):
+    for p in sorted(_dicts(traj), key=lambda x: _as_int(x.get("session"), 0)):
         s, v = _as_int(p.get("session"), 0), p.get("value")
         if v is None or str(v).strip() == "":
             if last is not None:
@@ -406,17 +504,18 @@ def assemble_world(table: dict, base: str = "2025-01-06", step_days: int = 7) ->
     entities: dict[str, dict[str, Timeline]] = {}
     max_sess = 0
 
-    for ent in table.get("entities", []):
+    for ent in _dicts(table.get("entities", [])):
         name = ent.get("name") or ent.get("id")
         if not name:
             continue
         flds: dict[str, Timeline] = {}
-        for fname, spec in (ent.get("fields") or {}).items():
+        for fname, spec in _dict(ent.get("fields")).items():
+            spec = _dict(spec)
             if (spec.get("type") == "stable") or ("value" in spec and "trajectory" not in spec):
                 flds[fname] = Timeline([Op(0, date_of(0), SET, str(spec.get("value")), None)])
             else:
                 traj = spec.get("trajectory", [])
-                for p in traj:
+                for p in _dicts(traj):
                     max_sess = max(max_sess, _as_int(p.get("session"), 0))
                 ops = _traj_to_ops(traj, date_of)
                 if ops:
@@ -425,8 +524,8 @@ def assemble_world(table: dict, base: str = "2025-01-06", step_days: int = 7) ->
             entities[name] = flds
 
     # 套级联(DAG):trigger 触发时,在 effect 字段注入预声明的替代值(可解性)
-    for c in table.get("cascades", []):
-        eff, trig = c.get("effect", {}), c.get("trigger", {})
+    for c in _dicts(table.get("cascades", [])):
+        eff, trig = _dict(c.get("effect")), _dict(c.get("trigger"))
         e, f, val = eff.get("entity"), eff.get("field"), eff.get("set")
         sess = _as_int(trig.get("session"), None) if trig.get("session") is not None else None
         if not (e and f and val is not None and sess is not None):
@@ -440,7 +539,7 @@ def assemble_world(table: dict, base: str = "2025-01-06", step_days: int = 7) ->
         op = Op(sess, date_of(sess), SET if prev is None else UPDATE, str(val), prev)
         entities.setdefault(e, {}).setdefault(f, Timeline([])).ops.append(op)
 
-    absent = list(table.get("absent_fields", []))
+    absent = [f for f in table.get("absent_fields", []) if isinstance(f, str)]
     ws = WorldState(entities, table.get("cascades", []), absent, n_sessions=max_sess + 1)
 
     # 校验(非致命,收集 issues)
@@ -451,8 +550,9 @@ def assemble_world(table: dict, base: str = "2025-01-06", step_days: int = 7) ->
             issues.append(f"absent_field '{f}' 实际出现,已移除"); absent.remove(f)
     for ename, flds in entities.items():
         for fname, tl in flds.items():
-            spec = next((s for e in table.get("entities", []) if (e.get("name") or e.get("id")) == ename
-                         for fn, s in (e.get("fields") or {}).items() if fn == fname), {})
+            spec = next((s for e in _dicts(table.get("entities", [])) if (e.get("name") or e.get("id")) == ename
+                         for fn, s in _dict(e.get("fields")).items() if fn == fname), {})
+            spec = _dict(spec)
             if spec.get("type") == "evolving":
                 distinct = {_norm(v) for (_, _, v) in tl.set_values()}
                 if len(distinct) < 2 and not any(o.op in (DELETE, EXPIRE) for o in tl.ops):

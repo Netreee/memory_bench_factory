@@ -1,15 +1,13 @@
 """
-eval.memory_interface — 记忆系统接口 + DMXAPI dense 实现。
+eval.memory_interface — 本地 bge embedding + EmbedMemory(baseline dense 检索)。
 
-接口对齐 OfficeMem eval_onpolicy.MemorySystem(ingest/retrieve/reset),
-方便后续替换成真 simpleMem(SimpleRAGMemory)或 R1/R2/R3 adaptor。
-
-EmbedMemory:机制等同 simpleMem — DMXAPI 向量 + numpy 余弦,无外部 DB。
+EmbedMemory:机制等同 simpleMem — 本地向量 + numpy 余弦,无外部 DB。
   ★ 关键:retrieve 是【选择性 top-k】,这正是信号竞争(M3)赖以触发的检索瓶颈:
     旧值在多 period 文档高频出现 → top-k 更可能命中旧值文档 → R1 合成出旧值(M3)。
+
+统一接口定义在 eval.memory_systems.base.MemorySystem。
 """
 from __future__ import annotations
-from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Optional
 import sys
@@ -20,48 +18,36 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import config
 
 
-class MemorySystem(ABC):
-    """记忆系统抽象接口(对齐 OfficeMem)。"""
-
-    @abstractmethod
-    def ingest(self, text: str, doc_id: str = "", metadata: Optional[dict] = None) -> None:
-        ...
-
-    @abstractmethod
-    def retrieve(self, query: str, top_k: int = 5) -> list:
-        """返回 top_k 个文本片段(list[str])。"""
-        ...
-
-    @abstractmethod
-    def reset(self) -> None:
-        ...
+# ── 统一本地 embedder(bge-small-zh-v1.5, 512维)─────────────────────────────
+# 全系统(baseline/mem0/zep/amem)统一走本地 embed:① 同底座 = 公平(消除 embedder 混淆);
+# ② 本地零延迟 = 躲开 DMXAPI embedding 的延迟/抖动(此前 mem0/zep 内部 embedder 因此卡死)。
+# DMXAPI 只留给文本 LLM(答题/抽取/笔记分析)。纯编码(不加 bge 查询指令)→ 与各外部
+# 系统内部用法一致(它们没法替自己加指令),跨系统口径统一。
+EMBED_MODEL = "bge-small-zh-v1.5"
+_LOCAL_HF_ID = "BAAI/bge-small-zh-v1.5"
+_local_embedder = None
+import threading as _threading
+_embedder_lock = _threading.Lock()
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Embedding 工具(DMXAPI text-embedding-3-small,dim=1536)
-# ─────────────────────────────────────────────────────────────────────────────
+def _get_embedder():
+    global _local_embedder
+    if _local_embedder is None:
+        with _embedder_lock:
+            if _local_embedder is None:
+                from sentence_transformers import SentenceTransformer
+                _local_embedder = SentenceTransformer(_LOCAL_HF_ID)
+    return _local_embedder
 
-def embed_texts(texts: list, model: str = "text-embedding-3-small",
-                retries: int = 5) -> list:
-    """批量 embed,返回 list[np.ndarray(float32)]。
 
-    DMXAPI 的 connect/handshake 偶发失败(冷连接尤甚)。ingest 长语料时是上百次连发,
-    单篇连撞几次就会炸整轮 → 多给几次重试 + 温和退避,扛过短促抖动。
-    """
-    import time
-    last_err = None
-    for attempt in range(retries):
-        try:
-            # ★单次超时(30s):死 socket 下若不设超时,create() 会无限挂起,重试逻辑根本轮不到。
-            #   超时 → 抛异常 → 退避重试,才能扛过死连接(根因:不是抖动,是挂起)。
-            resp = config.client.embeddings.create(model=model, input=texts, timeout=30)
-            return [np.array(d.embedding, dtype=np.float32) for d in resp.data]
-        except Exception as e:
-            last_err = e
-            if attempt < retries - 1:
-                time.sleep(min(2.0 * (attempt + 1), 8.0))
-                continue
-    raise RuntimeError(f"embed_texts {retries} 次后仍失败: {last_err}")
+def embed_texts(texts: list, model: str = EMBED_MODEL) -> list:
+    """本地 bge-small-zh-v1.5 编码(512维, L2归一化),返回 list[np.ndarray(float32)]。"""
+    if not texts:
+        return []
+    emb = _get_embedder()
+    arr = emb.encode(list(texts), normalize_embeddings=True,
+                     show_progress_bar=False, batch_size=64)
+    return [np.asarray(v, dtype=np.float32) for v in arr]
 
 
 def _chunk(text: str, max_chars: int = 220) -> list:
@@ -85,10 +71,10 @@ def _chunk(text: str, max_chars: int = 220) -> list:
     return chunks or [text]
 
 
-class EmbedMemory(MemorySystem):
-    """DMXAPI dense 检索记忆(机制 = simpleMem)。"""
+class EmbedMemory:
+    """本地 dense 检索记忆(机制 = simpleMem,被 SimpleMem adapter 内部使用)。"""
 
-    def __init__(self, model: str = "text-embedding-3-small", chunk: bool = True,
+    def __init__(self, model: str = EMBED_MODEL, chunk: bool = True,
                  chunk_chars: int = 220):
         self.model = model
         self.chunk = chunk
@@ -114,21 +100,26 @@ class EmbedMemory(MemorySystem):
             self._meta.append({**(metadata or {}), "doc_id": doc_id})
             self._vecs.append(v)
 
-    def retrieve(self, query: str, top_k: int = 5) -> list:
+    def _topk(self, query: str, top_k: int):
+        """返回 (idx_array, sims_array)；库空时返回 (None, None)。"""
         if not self._vecs:
-            return []
-        qv = embed_texts([query], self.model)[0]
+            return None, None
+        from eval.embed_cache import cached_embed
+        qv = cached_embed([query], self.model)[0]
         M = np.stack(self._vecs)
         sims = (M @ qv) / (np.linalg.norm(M, axis=1) * (np.linalg.norm(qv) + 1e-8) + 1e-8)
         idx = np.argsort(-sims)[:top_k]
+        return idx, sims
+
+    def retrieve(self, query: str, top_k: int = 5) -> list:
+        idx, _ = self._topk(query, top_k)
+        if idx is None:
+            return []
         return [self._docs[i] for i in idx]
 
     def retrieve_with_meta(self, query: str, top_k: int = 5) -> list:
         """诊断用:返回 [(text, meta, score)]。"""
-        if not self._vecs:
+        idx, sims = self._topk(query, top_k)
+        if idx is None:
             return []
-        qv = embed_texts([query], self.model)[0]
-        M = np.stack(self._vecs)
-        sims = (M @ qv) / (np.linalg.norm(M, axis=1) * (np.linalg.norm(qv) + 1e-8) + 1e-8)
-        idx = np.argsort(-sims)[:top_k]
         return [(self._docs[i], self._meta[i], float(sims[i])) for i in idx]

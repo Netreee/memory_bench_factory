@@ -30,9 +30,8 @@ if not API_KEY:
 if not MODEL:
     sys.exit("[配置错误] 未找到 MODEL,请检查 .env。")
 
-# ★显式分段超时:死掉的代理 socket 会让"读"无限阻塞(float 总超时偶尔不触发)。
-#   read=300s 足够 reasoning 模型吐满 8192;connect/write/pool 收紧 → 死连接快速失败,
-#   交给 chat_json 的 3 次重试换一条新连接,根治"僵尸 socket 永久挂起"。
+# ★socket 级超时(防死连接,不防慢代理):read 是 per-recv 300s,代理持续发数据就不触发。
+#   总响应时间由 chat() 的 DEADLINE_S 截止;这里只管 connect/write/pool 快速失败。
 client = OpenAI(api_key=API_KEY, base_url=BASE_URL,
                 timeout=httpx.Timeout(300.0, connect=15.0, write=30.0, pool=15.0),
                 max_retries=0)   # 重试逻辑在 chat_json 里(带退避+日志),SDK 层不重复重试
@@ -41,19 +40,28 @@ client = OpenAI(api_key=API_KEY, base_url=BASE_URL,
 #   这一个数 = "API 能同时扛多少不抽风"的旋钮(env: LLM_CONCURRENCY,默认 8)。
 LLM_CONCURRENCY = int(os.getenv("LLM_CONCURRENCY", "8"))
 _LLM_SEM = threading.BoundedSemaphore(LLM_CONCURRENCY)
+DEADLINE_S = int(os.getenv("LLM_DEADLINE_S", "600"))
 
 
 def chat(messages, temperature=0.7, top_p=1.0, max_tokens=4096):
-    """对 chat/completions 的薄封装。全局信号量限在飞并发;retry 的 sleep 在 chat_json 里、不占槽。"""
-    with _LLM_SEM:                       # 只在真正打 API 时占一个槽,异常/返回即释放
-        resp = client.chat.completions.create(
-            model=MODEL,
-            messages=messages,
-            temperature=temperature,
-            top_p=top_p,
-            max_tokens=max_tokens,
-        )
-    return resp.choices[0].message.content
+    """薄封装:信号量限并发 + daemon 线程限总时间(DEADLINE_S)。"""
+    with _LLM_SEM:
+        rv = [None, None]
+        def _do():
+            try:
+                rv[0] = client.chat.completions.create(
+                    model=MODEL, messages=messages,
+                    temperature=temperature, top_p=top_p, max_tokens=max_tokens)
+            except Exception as e:
+                rv[1] = e
+        t = threading.Thread(target=_do, daemon=True)
+        t.start()
+        t.join(timeout=DEADLINE_S)
+        if t.is_alive():
+            raise TimeoutError(f"LLM 调用超总截止 {DEADLINE_S}s")
+        if rv[1] is not None:
+            raise rv[1]
+    return rv[0].choices[0].message.content
 
 
 def _strip_code_fence(text):

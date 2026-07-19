@@ -21,14 +21,16 @@ R1_SYSTEM = """你是一个基于检索记忆的问答助手。
 4. 答案要【极简】:只给最终值(一个词、人名、数字或短语),不要解释、不要复述问题。"""
 
 
-def r1_answer(question: str, snippets: list, max_tokens: int = 2048) -> str:
-    """R1 单轮合成。snippets: list[str]。返回精简答案字符串。"""
+def r1_answer(question: str, snippets: list, max_tokens: int = 2048,
+              system: str = "") -> str:
+    """R1 单轮合成。snippets: list[str]。返回精简答案字符串。
+    system:覆盖默认系统提示(用于注入随题库交付的【答题约定】协议)。"""
     if not snippets:
         ctx = "(无检索结果)"
     else:
         ctx = "\n\n".join(f"[片段{i+1}] {s}" for i, s in enumerate(snippets))
     msgs = [
-        {"role": "system", "content": R1_SYSTEM},
+        {"role": "system", "content": system or R1_SYSTEM},
         {"role": "user", "content": (
             f"【检索片段】\n{ctx}\n\n"
             f"【问题】{question}\n\n"
@@ -40,3 +42,29 @@ def r1_answer(question: str, snippets: list, max_tokens: int = 2048) -> str:
     except Exception as e:
         return f"[R1_ERROR:{type(e).__name__}]"
     return (ans or "").strip()
+
+
+def unified_answer(question: str, context: str, protocol: str = "",
+                   max_tokens: int = 2048) -> str:
+    """统一答题函数:所有记忆系统共用。context 由系统的 retrieve() 产出。"""
+    sys_prompt = R1_SYSTEM + ("\n\n" + protocol if protocol else "")
+    msgs = [
+        {"role": "system", "content": sys_prompt},
+        {"role": "user", "content": (
+            f"【参考资料】\n{context}\n\n"
+            f"【问题】{question}\n\n"
+            f"请只给最终答案(极简):"
+        )},
+    ]
+    import time as _time
+    for attempt in range(3):
+        try:
+            ans = (config.chat(msgs, temperature=0.0, max_tokens=max_tokens) or "").strip()
+            if ans:
+                return ans
+        except Exception as e:
+            if attempt < 2:
+                _time.sleep(2 ** attempt)
+                continue
+            return f"[ANSWER_ERROR:{type(e).__name__}]"
+    return ans

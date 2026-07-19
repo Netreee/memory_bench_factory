@@ -1,0 +1,36 @@
+{
+  "task_id": "game_001",
+  "scenario": "game",
+  "description": "Test whether a memory system can retain environment rules, item location, and a prior failed action across sessions.",
+  "sessions": [
+    {
+      "session_id": "s1",
+      "date": "2026-07-01",
+      "turns": [
+        {
+          "turn_id": 1,
+          "user": "We learned three things in the dungeon: the silver door requires the blue key, the blue key is in the library, and trying to open the door directly already failed.",
+          "env": "The direct open-door action returned: locked, blue key required.",
+          "expected_memory_write": "Silver door requires the blue key; blue key is in the library; direct opening failed."
+        }
+      ]
+    },
+    {
+      "session_id": "s2",
+      "date": "2026-07-02",
+      "turns": [
+        {
+          "turn_id": 1,
+          "user": "I need to get through the silver door now. What should I do next?",
+          "env": "You are at the dungeon entrance.",
+          "expected_memory_use": "Go to the library, get the blue key, then open the silver door."
+        }
+      ]
+    }
+  ],
+  "gold": {
+    "required_memory": "The silver door requires the blue key, and the blue key is in the library.",
+    "success_condition": "The answer says to obtain the blue key from the library before opening the silver door.",
+    "failure_condition": "The answer tries to open the silver door directly or omits the blue key location."
+  }
+}

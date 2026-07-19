@@ -93,7 +93,7 @@ def build_to_target(run: Run, spec: TargetSpec, max_rounds: int = 2, order_subro
 
     last = {"kept": [], "report": {}, "growable": [], "permanent": []}
     met = False
-    config = run.manifest["config"]
+    run_cfg = run.manifest["config"]
     prev_entities = None                                                         # round1 世界实体集,作 ②环增量续渲的 delta 基线
     for rnd in range(1, max_rounds + 1):
         run.log(f"╠═ 第 {rnd}/{max_rounds} 轮 ══════════════════════════════")
@@ -102,8 +102,8 @@ def build_to_target(run: Run, spec: TargetSpec, max_rounds: int = 2, order_subro
         sw.setdefault("timeline", {})["n_sessions"] = params.n_sessions
         wp.setdefault("domain_profile", {})["l5_max_conflicts"] = params.max_n_conflicts
         run.write(ART["whitepaper"], wp)
-        config["quotas"] = dict(params.target_orders)                            # ★经 config 喂配额给 stage_orders(不内联 run_lines)
-        config["augment"] = (rnd > 1)                                            # ★rnd>1:stage_world 增量 augment(在既有世界上长新实体,§10.1)
+        run_cfg["quotas"] = dict(params.target_orders)                            # ★经 config 喂配额给 stage_orders(不内联 run_lines)
+        run_cfg["augment"] = (rnd > 1)                                            # ★rnd>1:stage_world 增量 augment(在既有世界上长新实体,§10.1)
         run._save_manifest()
 
         # ── ① 订单供给环:直调 stage_world + stage_orders(便宜,绝不渲);供不上 → 长世界重跑 ──
@@ -134,10 +134,10 @@ def build_to_target(run: Run, spec: TargetSpec, max_rounds: int = 2, order_subro
             _run_stage(run, "corpus", stage_corpus, ART["corpus"])
         else:
             new_ents = sorted(set(ws.entities) - prev_entities)                  # ★只渲【新实体】,旧实体 docs 不重渲
-            config["render_only"] = new_ents
+            run_cfg["render_only"] = new_ents
             run.log(f"║  增量续渲:+{len(new_ents)} 新实体(旧 {len(prev_entities)} 实体 docs 不动,省整轮重渲)")
             _run_stage(run, "corpus", stage_corpus, ART["corpus"])
-            config.pop("render_only", None)
+            run_cfg.pop("render_only", None)
             prev_entities = set(ws.entities)
         _run_stage(run, "grounding", stage_grounding, ART["grounding"])
 
@@ -170,7 +170,7 @@ def build_to_target(run: Run, spec: TargetSpec, max_rounds: int = 2, order_subro
         run.set_algo(met_status=f"UNMET: {unmet}")
         run.log(f"╚═ ✗ 旋钮未达标(UNMET,已尽 {max_rounds} 轮):{unmet}。题库仍写出(fail-open,留痕 met_status)。")
     run.manifest["current_stage"] = ""
-    config.pop("augment", None); config.pop("render_only", None)                 # ★清增量信号,免泄漏到后续 --only 重跑
+    run_cfg.pop("augment", None); run_cfg.pop("render_only", None)                 # ★清增量信号,免泄漏到后续 --only 重跑
     run.set_status("done")
     return last["kept"], ("MET" if met else "UNMET")
 

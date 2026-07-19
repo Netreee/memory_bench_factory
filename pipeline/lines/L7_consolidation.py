@@ -9,7 +9,7 @@ pipeline.lines.L7_consolidation —— L7 长跨度趋势归纳产线。设计�
   【v1 记此,未做】S3 阶段对比(前k周 vs 后m周变了哪些字段)——gold 是【字段名集合】,集合型接地/判分脆,
     易引入歧义,故 v0 不做(本着"源头做对、不贪多、不造软 gold")。
 
-★命脉(设计 §6):趋势天生"软"。TREND_MARGIN 是 v0 默认值,DoD 要求【真实序列实测"代码标签 vs 人类标签分歧率"定标】
+★命脉(设计 §6):趋势天生"软"。NET_FRAC 是 v0 默认值,DoD 要求【真实序列实测"代码标签 vs 人类标签分歧率"定标】
   (复用 L4 众数-margin 那套);分歧高 = 这型不可靠,像 W5/roles_of 一样毙掉。当前为离线自检默认值,未经真实定标。
 ★签名:S1 强制【末段反向】(抗 recency)——纯单调到底的序列"看最近一段"就蒙对、退化成 KU,well_posed 必 drop。
 """
@@ -19,7 +19,7 @@ import random
 from pipeline.lines.base import ProductionLine
 from pipeline.world_state import WorldState, _to_num, _norm, _strip_disambig
 
-TREND_MARGIN = 2          # 上升:升步数 − 降步数 ≥ 2(未经真实定标,见 DoD)
+NET_FRAC = 0.30           # ★趋势=【首末净方向】(对齐 ANSWER_PROTOCOL v3),|末−首| ≥ NET_FRAC×摆幅 才算清晰;否则波动→不产
 T_MIN = 4                 # 趋势至少 4 个数值点(太短无"长跨度"可言)
 CMP_MARGIN = 2            # 对比:冠军 change 数 − 亚军 ≥ 2(防平手)
 CMP_MAX_CAND = 4          # 对比候选集上限(题面列出,自足可答)
@@ -40,25 +40,30 @@ def _numeric_seq(tl) -> list:
 
 
 def _trend_label(nums: list):
-    """确定性趋势分类器:升步/降步差 ≥ TREND_MARGIN → 上升/下降;否则 None(波动/不清晰 → 不产,不造软 gold)。"""
+    """★确定性趋势分类器 = 【首末净方向】(对齐 ANSWER_PROTOCOL v3"趋势=首末净方向"):
+    净位移 |末−首| ≥ NET_FRAC×摆幅(max−min)→ 上升/下降;否则 None(净位移太小=波动/不清晰,不产软 gold)。
+    ★旧版用"升降步数差"是协议未声明前的代理:对'单调+末反转'恰好一致,但对'中段深谷/末段突变'等
+      形状会与协议打架(174925 趋势形状模板化的修复要多形状,逼对齐到协议本身的口径)。"""
     if len(nums) < T_MIN:
         return None
-    ups = sum(1 for i in range(1, len(nums)) if nums[i] > nums[i - 1])
-    downs = sum(1 for i in range(1, len(nums)) if nums[i] < nums[i - 1])
-    if ups - downs >= TREND_MARGIN:
+    span = max(nums) - min(nums)
+    if span <= 0:
+        return None
+    net = nums[-1] - nums[0]
+    if net >= NET_FRAC * span:
         return "上升"
-    if downs - ups >= TREND_MARGIN:
+    if -net >= NET_FRAC * span:
         return "下降"
     return None
 
 
 def _anti_recency(nums: list, label: str) -> bool:
-    """★抗 recency 签名:末段方向必须【反】于整体趋势(升势末点下挫 / 降势末点回升)。
-    否则"只看最近一段"就蒙对 → 退化成 KU,不是长跨度归纳。"""
-    if len(nums) < 2:
+    """★抗"看局部"签名:序列里【至少一处局部反向】于整体净方向(末段反挫 / 中段深谷 / 前段平缓相反…)。
+    保证"只看某个局部窗口"会判错 → 逼跨全程整合(不是只看最近/只看某段)。形状无关,与多形状 imprint 配套。"""
+    if len(nums) < 2 or label not in ("上升", "下降"):
         return False
-    last = nums[-1] - nums[-2]
-    return (last < 0) if label == "上升" else (last > 0) if label == "下降" else False
+    up = label == "上升"
+    return any((nums[i] < nums[i - 1]) if up else (nums[i] > nums[i - 1]) for i in range(1, len(nums)))
 
 
 def _change_count(tl) -> int:
@@ -78,9 +83,8 @@ class ConsolidationLine(ProductionLine):
     requires: list[str] = ["multi_event_timelines"]   # 需演化字段(趋势/变动才有料),口径同 L3
 
     def feasible(self, ws, profile: dict) -> tuple[bool, str]:
-        """有清晰趋势字段 ∨ 有跨实体对比机会 → 可产。两者都缺 → 跳(避免无效产 0 单)。"""
-        has_s1 = any(_trend_label(_numeric_seq(tl)) and _anti_recency(_numeric_seq(tl), _trend_label(_numeric_seq(tl)))
-                     for flds in ws.entities.values() for tl in flds.values())
+        """有【imprint 种下的】趋势字段 ∨ 有跨实体对比机会 → 可产。两者都缺 → 跳(避免无效产 0 单)。"""
+        has_s1 = bool(getattr(ws, "_trended_fields", None))   # ★只认 imprint planted 的趋势(见 _enum_trend)
         has_s2 = any(len(c) >= 2 for c in self._field_candidates(ws).values())
         tags = (["S1趋势"] if has_s1 else []) + (["S2对比"] if has_s2 else [])
         if tags:
@@ -114,14 +118,20 @@ class ConsolidationLine(ProductionLine):
         return picked
 
     def _enum_trend(self, ws) -> list[dict]:
-        """S1:数值字段全程清晰升/降(且末段反向 = 抗 recency)。"""
+        """S1:只对【imprint 真正种下趋势的字段】(ws._trended_fields)出题。
+        ★审计 HIGH 根治:旧版扫【所有】数值字段跑 _trend_label,而'首末净方向'对纯噪声放行率 62.7%
+          → 非 imprint 的 LLM 噪声字段(如 4 点 [57,56,68,10])照产 gold=下降 的软题,违反本线契约
+          '模棱两可一律跳'。改为只骑 planted 趋势(噪声字段根本不判),从根上杜绝软 gold——契合
+          'LLM 给噪声、代码种结构、L7 骑结构'的设计本意,非去调分类器阈值猜噪声(那才是打地鼠)。"""
+        trended = set(getattr(ws, "_trended_fields", []) or [])
         out = []
-        for ent, flds in ws.entities.items():
-            for fname, tl in flds.items():
-                nums = _numeric_seq(tl)
-                label = _trend_label(nums)
-                if not label or not _anti_recency(nums, label):
-                    continue
+        for (ent, fname) in sorted(trended):
+            tl = ws.entities.get(ent, {}).get(fname)
+            if tl is None:
+                continue
+            nums = _numeric_seq(tl)
+            label = _trend_label(nums)
+            if label and _anti_recency(nums, label):
                 out.append({"line": self.id, "capability": "L7_consolidation", "entity": ent, "field": fname,
                             "gt": label,
                             "evidence_sessions": sorted({s for (s, _d, v) in tl.set_values() if _to_num(v) is not None}),
@@ -170,12 +180,13 @@ class ConsolidationLine(ProductionLine):
         if sub == "S1_trend":
             nums = _numeric_seq(ws.entities.get(ent, {}).get(fld))
             label = _trend_label(nums)
-            if label is None:
-                return ("drop", f"无清晰趋势:「{ent}.{fld}」升降步差 < {TREND_MARGIN}(模棱两可,不产软 gold)")
-            if _norm(label) != _norm(order.get("gt")):
+            if label is None:                             # _trend_label 即【首末净方向】判定(≥NET_FRAC×摆幅),与 ANSWER_PROTOCOL v3 同口径
+                return ("drop", f"无清晰趋势:「{ent}.{fld}」首末净位移 < {NET_FRAC:.0%}×摆幅(模棱两可,不产软 gold)")
+            if _norm(label) != _norm(order.get("gt")):    # gold 必须 == 世界重算的首末净方向(护城河)
                 return ("drop", f"gold 锚错:gt={order.get('gt')!r} ≠ 世界重算趋势 {label!r}")
-            if not _anti_recency(nums, label):
-                return ("drop", f"抗 recency 不成立:「{ent}.{fld}」末段未反向(看最近一段即泄漏趋势 → 退化 KU)")
+            if not _anti_recency(nums, label):            # ∃局部反向:逼跨全程整合(只看某局部窗口会判错)
+                return ("drop", f"抗 recency 不成立:「{ent}.{fld}」无局部反向(看局部即泄漏趋势 → 退化 KU)")
+            # 注:旧版此处另有"net_label==label"独立闸;_trend_label 改首末净方向后它恒成立=死分支,已删(审计点名死码)。
             return ("well_posed", "")
 
         if sub == "S2_compare":
@@ -280,6 +291,7 @@ if __name__ == "__main__":
             "负责人": {"type": "stable", "value": "孙浩"}}},                                  # 变动 0 次
     ], "n_sessions": 5}
     ws, _ = assemble_world(table)
+    ws._trended_fields = [("研发部", "缺陷数")]   # ★模拟 imprint 已种趋势(L7 只骑 planted 字段;真实路径由 world_gen.imprint 设)
 
     ok, why = line.feasible(ws, {})
     ck("feasible True(有 S1+S2)", ok is True and "S1" in why and "S2" in why)
@@ -309,13 +321,22 @@ if __name__ == "__main__":
     ck("S2 well_posed 过", s2 and line.well_posed(s2, ws) == ("well_posed", ""))
 
     # ── IP:well_posed 必 drop 的坏题 ──
-    # IP1 波动(升降平):缺陷数 10→20→10→20 → _trend_label=None
+    # IP1 波动(首末净位移过小 < NET_FRAC×摆幅):10→20→15→11,首=10 末=11 净移1、摆幅10 → _trend_label=None
+    #   ★注:按协议"趋势=首末净方向",纯振荡但首末分明(如 10→20→10→20,末=max)是【上升】、可裁,不再算波动;
+    #     只有【首末几乎持平】才算无清晰趋势——这正是 v3 协议与旧 ups-downs 代理的差别。
     flat_ws, _ = assemble_world({"entities": [{"name": "A部", "fields": {"x": {"type": "evolving",
         "trajectory": [{"session": 0, "value": "10"}, {"session": 1, "value": "20"},
-                       {"session": 2, "value": "10"}, {"session": 3, "value": "20"}]}}}], "n_sessions": 4})
+                       {"session": 2, "value": "15"}, {"session": 3, "value": "11"}]}}}], "n_sessions": 4})
     ip1 = {"line": line.id, "capability": "L7_consolidation", "entity": "A部", "field": "x",
            "gt": "上升", "aux": {"sub": "S1_trend"}, "evidence_sessions": [0, 1, 2, 3]}
-    ck("IP1 波动→drop(无清晰趋势)", line.well_posed(ip1, flat_ws)[0] == "drop")
+    ck("IP1 首末持平→drop(净位移过小)", line.well_posed(ip1, flat_ws)[0] == "drop")
+    # IP1b 纯振荡但首末分明(末=max):按协议=上升、可裁(不再误杀为波动)
+    osc_ws, _ = assemble_world({"entities": [{"name": "B部", "fields": {"y": {"type": "evolving",
+        "trajectory": [{"session": 0, "value": "10"}, {"session": 1, "value": "20"},
+                       {"session": 2, "value": "10"}, {"session": 3, "value": "20"}]}}}], "n_sessions": 4})
+    ip1b = {"line": line.id, "capability": "L7_consolidation", "entity": "B部", "field": "y",
+            "gt": "上升", "aux": {"sub": "S1_trend"}, "evidence_sessions": [0, 1, 2, 3]}
+    ck("IP1b 振荡但首末分明→上升可裁(协议=首末净方向)", line.well_posed(ip1b, osc_ws) == ("well_posed", ""))
 
     # IP2 纯单调到底(抗 recency 失败):10→20→30→40→50 → 上升但末段同向
     mono_ws, _ = assemble_world({"entities": [{"name": "B部", "fields": {"y": {"type": "evolving",

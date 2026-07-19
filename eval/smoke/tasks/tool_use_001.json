@@ -1,0 +1,36 @@
+{
+  "task_id": "tool_use_001",
+  "scenario": "tool_use",
+  "description": "Test whether a memory system can retain a tool-call failure and reuse the corrected parameter format later.",
+  "sessions": [
+    {
+      "session_id": "s1",
+      "date": "2026-07-01",
+      "turns": [
+        {
+          "turn_id": 1,
+          "user": "Schedule a database backup for July 8 at 9 PM.",
+          "env": "The tool call failed: Invalid date format. Use YYYY-MM-DD HH:MM.",
+          "expected_memory_write": "Scheduling tool requires date format YYYY-MM-DD HH:MM."
+        }
+      ]
+    },
+    {
+      "session_id": "s2",
+      "date": "2026-07-04",
+      "turns": [
+        {
+          "turn_id": 1,
+          "user": "Schedule a cache warmup for July 12 at 6:30 AM.",
+          "env": "Use the scheduling tool if you know the correct parameter format.",
+          "expected_memory_use": "Use 2026-07-12 06:30 as the datetime format."
+        }
+      ]
+    }
+  ],
+  "gold": {
+    "required_memory": "The scheduling tool requires YYYY-MM-DD HH:MM datetime strings.",
+    "success_condition": "The answer or action uses 2026-07-12 06:30 and does not repeat the invalid natural-language date format.",
+    "failure_condition": "The answer repeats a natural-language date or omits the required YYYY-MM-DD HH:MM format."
+  }
+}

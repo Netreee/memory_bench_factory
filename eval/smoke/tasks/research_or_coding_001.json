@@ -1,0 +1,36 @@
+{
+  "task_id": "research_or_coding_001",
+  "scenario": "research_or_coding",
+  "description": "Test whether a memory system can retain sparse repository setup constraints and reuse them in a later reproduction plan.",
+  "sessions": [
+    {
+      "session_id": "s1",
+      "date": "2026-07-01",
+      "turns": [
+        {
+          "turn_id": 1,
+          "user": "Repo setup note: use Python 3.10, run pip install -e . before experiments, and keep the graphlib-extra dependency below 2.0 because 2.x breaks the loader.",
+          "env": "The setup note was found in the repo troubleshooting guide.",
+          "expected_memory_write": "Python 3.10; pip install -e . before experiments; graphlib-extra must be <2.0."
+        }
+      ]
+    },
+    {
+      "session_id": "s2",
+      "date": "2026-07-05",
+      "turns": [
+        {
+          "turn_id": 1,
+          "user": "Give me the reproduction steps for that repo.",
+          "env": "The user expects steps that respect previously discovered setup constraints.",
+          "expected_memory_use": "Include Python 3.10, pip install -e ., and graphlib-extra <2.0."
+        }
+      ]
+    }
+  ],
+  "gold": {
+    "required_memory": "The repo requires Python 3.10, pip install -e . before experiments, and graphlib-extra below 2.0.",
+    "success_condition": "The reproduction plan includes all three setup constraints and does not recommend graphlib-extra 2.x.",
+    "failure_condition": "The plan misses any required constraint or recommends graphlib-extra 2.x."
+  }
+}

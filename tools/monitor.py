@@ -89,6 +89,20 @@ def _last_stage_in_log(p: Path) -> str:
     return ""
 
 
+def _closed_loop_state(run_dir: Path) -> dict:
+    """从 run.log 尾提取闭环 build_to_target 的最近状态(第几轮 / 谁赤字 / 在长世界重建)——只为可观测。
+    闭环会倒回重跑 world,这几行让"为什么又在跑 world"可见,不靠猜。非闭环 run 全空。"""
+    rnd = deficit = grow = ""
+    for ln in _tail(run_dir / "run.log", 250):
+        if "═ 第" in ln and "轮" in ln:
+            rnd = "第" + ln.split("第", 1)[1].split("轮", 1)[0].strip() + "轮"
+        elif "赤字" in ln and "{" in ln:
+            deficit = ln.split("赤字", 1)[1].strip()
+        elif "长世界" in ln and "重建" in ln:
+            grow = ln.split("→", 1)[-1].strip()
+    return {"round": rnd, "deficit": deficit, "grow": grow}
+
+
 def resolve_run(pin: str | None) -> Path | None:
     if pin:
         d = RUNS_DIR / pin
@@ -102,9 +116,9 @@ def resolve_run(pin: str | None) -> Path | None:
 # 镜像 pipeline/lines 注册表(built=已建产线 / 否则规划中)。硬编码以保持监控零 import pipeline。
 LINES_ALL = [
     ("L1_timeline", "时间线", True), ("L2_relational", "关系多跳", True),
-    ("L3_process", "过程序列", True), ("L5_conflict", "冲突可信", True),
-    ("L4_preference", "偏好隐式", False), ("L6_refusal", "拒答边界", False),
-    ("L7_consolidation", "巩固摘要", False),
+    ("L3_process", "过程序列", True), ("L4_preference", "偏好隐式", True),
+    ("L5_conflict", "冲突可信", True), ("L6_refusal", "拒答边界", True),
+    ("L7_consolidation", "巩固摘要", True),
 ]
 
 
@@ -136,23 +150,23 @@ def snapshot(run_dir: Path) -> dict:
     m = _read_json(run_dir / "manifest.json") or {}
     sd = m.get("stages", {})
     status = m.get("status", "?")
-    # 当前 stage:优先 manifest.current_stage(E 探针);兜底解析日志 / 第一个未完成
-    current = m.get("current_stage", "") or ""
-    if current and sd.get(current, {}).get("done"):
-        current = ""
-    if not current and status == "running":
+    # 当前 stage:status=running 时【信任】manifest.current_stage(E 探针);非运行态无 current。
+    # ★闭环 build_to_target 会【重跑已 done 的 stage】(world→orders→well_posed→[赤字]→world…),
+    #   此刻 current_stage 指向的 stage 其 done 仍是上一轮留下的 True——绝不能据此清空,那恰恰是【正在重跑】。
+    #   (旧逻辑"current 指向 done 就清空"会把重跑中的 world 误判成已完成 → 没有节点高亮,像卡死。)
+    current = (m.get("current_stage", "") or "") if status == "running" else ""
+    if status == "running" and not current:                    # 仅 current_stage 缺失才兜底推断
         current = _last_stage_in_log(run_dir / "run.log") or \
             next((s for s in STAGE_ORDER if not sd.get(s, {}).get("done")), "")
-        if current and sd.get(current, {}).get("done"):
-            current = ""
+    rerun = bool(current and sd.get(current, {}).get("done"))   # 当前 stage 已 done 过却又是 current = 闭环倒带重跑
 
     stages = []
     for s in STAGE_ORDER:
         info = sd.get(s, {})
-        if info.get("done"):
-            stages.append((s, "done", info.get("elapsed_s")))
-        elif s == current:                                     # E:running 用 started_ts 实时计时
+        if s == current:                                       # ★当前(含【重跑已 done】的)优先标 running,实时计时
             stages.append((s, "running", (now - info["started_ts"]) if info.get("started_ts") else None))
+        elif info.get("done"):
+            stages.append((s, "done", info.get("elapsed_s")))
         else:
             stages.append((s, "pending", None))
 
@@ -204,6 +218,8 @@ def snapshot(run_dir: Path) -> dict:
         "algo": algo,
         "env": m.get("env", {}),                               # 工程配置快照(模型/并发/端点)
         "cfg": m.get("config", {}),                            # per-run 配置(target_tokens/quotas/from-to-only)
+        "rerun": rerun,                                        # ★当前 stage 是否闭环倒带重跑(让"看似卡死"现形)
+        "loop": _closed_loop_state(run_dir) if status == "running" else {},  # 闭环轮次/赤字/重建(可观测)
         "log_tail": _tail(run_dir / "run.log", 14),
     }
 
@@ -421,8 +437,11 @@ def launch(pin: str | None, interval: float):
             m_corpus.config(text=f"{s['n_docs']}篇")
 
         now = s["step_now"]
-        now_lb.config(text=(f"⟳ 正在:{now}" if now and s["status"] == "running" else
-                            ("✓ 完成" if s["status"] == "done" else "")))
+        nt = (f"⟳ 正在:{now}" if now and s["status"] == "running" else ("✓ 完成" if s["status"] == "done" else ""))
+        if s.get("rerun") and s.get("loop"):                   # ★闭环倒带:别让重跑看着像卡死
+            lp = s["loop"]
+            nt += f"  ·  闭环{lp.get('round', '')}倒回重跑 {s['current']}" + (f"(赤字 {lp['deficit']})" if lp.get("deficit") else "")
+        now_lb.config(text=nt)
 
         # 语料进度条(语料阶段才有真总量)
         bar_c.delete("all")

@@ -148,7 +148,8 @@ function drawGraph(s){
   $('gnodes').innerHTML=Object.entries(NODES).map(([id,[x,y]])=>{
     const [state,el]=st[id]||['pending',null];
     const cls=state==='done'?'gnode done':state==='running'?'gnode run':state==='failed'?'gnode err':'gnode';
-    const sub=state==='done'?(el?Math.round(el)+'s':'✓'):state==='running'?(el?Math.round(el)+'s ⟳':'⟳ 运行'):'待';
+    const rr=s.rerun&&id===s.current;   // ★闭环倒带重跑该 stage
+    const sub=state==='done'?(el?Math.round(el)+'s':'✓'):state==='running'?((el?Math.round(el)+'s ':'')+(rr?'⟳重跑':'⟳')):'待';
     return `<div class="${cls}${sel===id?' sel':''}" style="left:${x}%;top:${y}px" title="${NTIP[id]||''}" onclick="showDetail('${id}')"><b>${NLABEL[id]}</b><i>${sub}</i></div>`;
   }).join('');
   const svg=$('gedges'); svg.setAttribute('width',W); svg.setAttribute('height',H);   // ★显式尺寸,否则 SVG 画布为 0、箭头不显
@@ -204,7 +205,9 @@ function render(s){
     return `<span class="lb${e?' lberr':''}">${HS[k]||k} ${v}${e?' ⚠'+e:''}</span>`;}).join('');
   $('llm').textContent=s.llm; $('elapsed').textContent=dur(s.elapsed_s);
   $('corpus').textContent=s.target?(s.chars/1e6).toFixed(2)+'M':(s.n_docs+'篇');
-  $('now').textContent=(s.step_now&&s.status==='running')?('⟳ 正在:'+s.step_now):(s.status==='done'?'✓ 完成':'');
+  let nt=(s.step_now&&s.status==='running')?('⟳ 正在:'+s.step_now):(s.status==='done'?'✓ 完成':'');
+  if(s.rerun&&s.loop){const lp=s.loop; nt+=`　·　闭环${lp.round||''}倒回重跑 ${s.current}`+(lp.deficit?`(赤字 ${lp.deficit})`:'');}
+  $('now').textContent=nt;
   const pct=s.target?Math.min(1,s.chars/s.target):0;
   $('fill').style.width=(pct*100)+'%';
   $('barlabel').textContent=s.target?`${(s.chars/1e6).toFixed(2)}M / ${(s.target/1e6).toFixed(1)}M (${Math.round(pct*100)}%)`:'';

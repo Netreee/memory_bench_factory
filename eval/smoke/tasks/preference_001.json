@@ -1,0 +1,36 @@
+{
+  "task_id": "preference_001",
+  "scenario": "preference",
+  "description": "Test whether a memory system can retain user communication and code-language preferences across sessions.",
+  "sessions": [
+    {
+      "session_id": "s1",
+      "date": "2026-07-01",
+      "turns": [
+        {
+          "turn_id": 1,
+          "user": "For future technical explanations, I prefer concise answers, Python examples first, and very little background exposition.",
+          "env": "",
+          "expected_memory_write": "User prefers concise technical answers, Python examples first, and minimal background."
+        }
+      ]
+    },
+    {
+      "session_id": "s2",
+      "date": "2026-07-03",
+      "turns": [
+        {
+          "turn_id": 1,
+          "user": "Explain memoization to me.",
+          "env": "",
+          "expected_memory_use": "Answer concisely and use Python for the first code example."
+        }
+      ]
+    }
+  ],
+  "gold": {
+    "required_memory": "The user prefers concise answers, Python examples first, and little background exposition.",
+    "success_condition": "The answer is concise and gives a Python example before any other language.",
+    "failure_condition": "The answer is long, background-heavy, or uses another language before Python."
+  }
+}

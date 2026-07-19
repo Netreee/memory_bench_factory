@@ -1,0 +1,26 @@
+{
+  "baselines": [
+    "fullcontext"
+  ],
+  "non_target_baselines": [
+    "iterative"
+  ],
+  "excluded": [
+    "simplemem"
+  ],
+  "target_systems": [
+    "mem0",
+    "zep",
+    "memos",
+    "amem",
+    "letta",
+    "hipporag",
+    "raptor",
+    "mirix"
+  ],
+  "notes": {
+    "simplemem": "Explicitly excluded from the 8 target systems for this smoke-test phase.",
+    "fullcontext": "Offline upper-bound baseline used for runner sanity checks.",
+    "iterative": "Existing non-target baseline; not counted as one of the 8 target systems."
+  }
+}

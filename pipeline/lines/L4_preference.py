@@ -34,11 +34,14 @@ def _mode(values: list) -> tuple:
     return (mode_raw, n_mode, n_runner, unique)
 
 
-def _build_choice_seq(options: list, n: int, seed: int) -> tuple:
+def _build_choice_seq(options: list, n: int, seed: int, pref_idx: int = 0) -> tuple:
     """确定性构造有偏选择流:偏好项 pref≈RATIO·n、其余打散、★末位≠pref(抗 recency)。
-    保证【唯一众数 + 领先 ≥MARGIN(n 够大时)+ latest≠pref】= 源头即良定义。"""
+    保证【唯一众数 + 领先 ≥MARGIN(n 够大时)+ latest≠pref】= 源头即良定义。
+    ★pref_idx:偏好项【跨实体轮转】(患者 i → 第 i%k 个选项),否则全注 options[0] → 一组题 gold 全同、
+      零区分度(run110317 盲审实锤:14 题全=门诊复诊)。轮转让被问者众数分散、≠全局众数。"""
     rng = random.Random(seed)
-    pref, others = options[0], options[1:] or options
+    pref = options[pref_idx % len(options)]
+    others = [o for o in options if o != pref] or options
     n_pref = max(MARGIN + 1, round(RATIO * n))
     n_pref = min(n_pref, n - 1)                      # 至少留 1 期给非 pref(保证末位可≠pref)
     seq = [pref] * n_pref + [others[i % len(others)] for i in range(n - n_pref)]
@@ -60,6 +63,12 @@ class PreferenceLine(ProductionLine):
     requires: list[str] = ["preference_axis"]       # 需白皮书给【选择/偏好维度】
 
     CHOICE_FIELD_TAG = "倾向"                         # 注入字段名后缀(与原字段区分)
+
+    def _choice_field(self, field: str) -> str:
+        """注入字段名:轴名 + TAG;★轴名本身已以 TAG 结尾则不再叠(014559:轴'本期处理策略倾向'
+        被拼成'…倾向倾向',渲染 LLM 把叠词塌缩回单'倾向',与世界原字段混同 → Q30 类污染)。
+        配套:central_office 已把轴字段(±'倾向'变体)从 field_schema 剔除,世界生成不再造竞争时间线。"""
+        return field if field.endswith(self.CHOICE_FIELD_TAG) else f"{field}{self.CHOICE_FIELD_TAG}"
 
     def _axis(self, profile: dict):
         ax = (profile or {}).get("preference_axis") or {}
@@ -90,12 +99,17 @@ class PreferenceLine(ProductionLine):
         n = ws.n_sessions or 0
         if n < K_MIN:
             return None
-        cf = f"{field}{self.CHOICE_FIELD_TAG}"
+        cf = self._choice_field(field)
+        # ★老产物守卫(刀1审计):老 run 的世界可能带叠词字段「{cf}倾向」(旧 TAG 拼接产物)。新代码续跑老 run
+        #   会静默换字段名 → L4 退化/双流并存。检测到即显式告警(不迁移,建议全新 run)。
+        legacy = f"{cf}{self.CHOICE_FIELD_TAG}"
+        if any(legacy in flds for flds in ws.entities.values()):
+            return f"  ⚠L4 检测到老叠词字段「{legacy}」(旧版产物):新命名规则不兼容续跑,跳过注入——请用全新 run"
         targets = [e for e, flds in ws.entities.items() if len(flds) >= 2 and cf not in flds]  # 主体实体(避开单字段人员)
         if not targets:
             return None
         for i, ent in enumerate(targets):
-            seq, _pref = _build_choice_seq(opts, n, seed=20260608 + i)
+            seq, _pref = _build_choice_seq(opts, n, seed=20260608 + i, pref_idx=i)   # ★pref 跨实体轮转,防 gold 全同退化
             prev = None
             ops = []
             for s, v in enumerate(seq):              # 每期都表态(复选)→ 散落证据,逼聚合
@@ -108,7 +122,7 @@ class PreferenceLine(ProductionLine):
         field, opts = self._axis((wp or {}).get("domain_profile", {}))
         if not field:
             return []
-        cf = f"{field}{self.CHOICE_FIELD_TAG}"
+        cf = self._choice_field(field)
         out = []
         for ent, flds in ws.entities.items():
             tl = flds.get(cf)
@@ -210,6 +224,9 @@ if __name__ == "__main__":
     ck("校验闸:gt() 复算 == 烘焙", all(line.gt(ws, o) == o["gt"] for o in orders))
     ck("★签名:众数 ≠ 最近一次(抗 recency)", all(_norm(o["gt"]) != _norm(o["aux"]["latest"]) for o in orders))
     ck("领先 ≥MARGIN", all((o["aux"]["n_pref"] - o["aux"]["n_runner"]) >= MARGIN for o in orders))
+    # ★防退化(run110317 实锤):pref 跨实体轮转 → 多实体 gold 必须分散,不准全同(零区分度)
+    golds = {_norm(o["gt"]) for o in orders}
+    ck("★轮转防退化:多实体 gold 分散(3实体×3选项 → ≥2 个不同)", len(golds) >= min(2, len(orders)) and (len(golds) >= 2 if len(orders) >= 2 else True))
 
     intent, hide = line.intent(o0)
     ck("题面强制聚合(含'整体/一贯'+'别只看最近')", ("整体" in intent or "一贯" in intent) and "最近" in intent)

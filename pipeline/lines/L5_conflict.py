@@ -81,7 +81,8 @@ def inject_conflicts(ws: WorldState, profile: dict, max_n: int = 3, seed: int = 
         own = {_norm(v) for (_s, _d, v) in sv}             # ★本实体该字段【所有周】真值
         # 小道值必须来自【别的实体】,不能是本实体别周真值——否则"传闻"实为本实体过去/未来真值,
         # 矛盾退化成合法时效演化(好系统会按 recency 给竞争正解,gold 不再唯一可辩护)。见 L5 well_posed I7。
-        wrong = sorted(v for v in pool.get(fname, ()) if _norm(v) not in own)
+        # 排己:传闻值不得 == 主体专名(否则题面既要点主语又要藏该值 → 悬空代词,见 well_posed I8)
+        wrong = sorted(v for v in pool.get(fname, ()) if _norm(v) not in own and _norm(v) != _norm(ent))
         if not wrong:
             continue
         conflicts.append({
@@ -144,11 +145,11 @@ class ConflictLine(ProductionLine):
             return c["authoritative_value"]                # 规则:信权威源
         return o.get("gt")
 
-    # ── ★边 A 闸:良定义 well_posed(I0–I7,设计见 docs/anchors/edge_a/L5_well_posed.md §4)──
+    # ── ★边 A 闸:良定义 well_posed(I0–I8,设计见 docs/anchors/edge_a/L5_well_posed.md §4)──
     def well_posed(self, order: dict, ws) -> tuple:
         """边 A 良定义闸:order 的 gold(权威值)是否为该矛盾题在世界里【唯一、合法】的答案,
         且传闻是真干扰。纯代码、确定性、零 LLM、绝不碰 corpus。与 ground() 对称。
-        返回 ("well_posed","") 或 ("drop", reason)。reason 取首个失败项(顺序 I0→I7)。"""
+        返回 ("well_posed","") 或 ("drop", reason)。reason 取首个失败项(顺序 I0→I3→I8→I4→I7)。"""
         aux = order.get("aux") or {}
         ent, fld, s = order.get("entity"), order.get("field"), aux.get("session")
         auth, rumor = aux.get("authoritative_value"), aux.get("rumor_value")
@@ -175,6 +176,12 @@ class ConflictLine(ProductionLine):
             # I3 真矛盾
             if _norm(auth) == _norm(rumor):
                 return ("drop", f"假矛盾:权威值与传闻值相等({auth!r}),无冲突")
+
+            # I8 主体可命名:主体专名不得 == 任一隐藏值(auth/rumor)。否则题面要【既点主语又藏该值】,
+            #    phrase 只能把主语降级成"他/该案"代词 → 题面悬空、无法作答(裸代词病题)。源头已由
+            #    inject_conflicts 排己防生成,此处 fail-closed 兜住(将来改 inject / 加裁决规则也不漏)。
+            if _norm(ent) in (_norm(auth), _norm(rumor)):
+                return ("drop", f"主体不可命名:主体专名 {ent!r} 撞隐藏值(auth={auth!r}/rumor={rumor!r}),题面会失去指代")
 
             # I4 唯一合法权威解:世界在该 session 的 canonical = 唯一、合法、== 权威值(canonical 当裁判)
             canon = self._canonical_at(ws, ent, fld, s)
@@ -382,6 +389,10 @@ if __name__ == "__main__":
     ckwp("9 order/世界不一致(I1)",
          _mk(wp_table, [_conf("搜索部", "负责人", 3, "王强", "周明")],
              _order("搜索部", "负责人", 3, "王强", "赵岩")), "drop", "order/世界不一致")
+    # 补:I8 主体不可命名(传闻值 == 主体专名)→ drop(根治"他的督导合伙人"类悬空代词)
+    ckwp("10 主体不可命名/传闻==主体(I8)",
+         _mk(wp_table, [_conf("搜索部", "负责人", 3, "王强", "搜索部")],
+             _order("搜索部", "负责人", 3, "王强", "搜索部")), "drop", "主体不可命名")
 
     npass = sum(1 for ok, _ in checks if ok)
     for ok, name in checks:
