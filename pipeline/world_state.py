@@ -733,11 +733,15 @@ def assemble_world(table: dict, base: str = "2025-01-06", step_days: int = 7,
                    blueprint: dict | None = None, existing: WorldState | None = None) -> tuple[WorldState, list[str]]:
     """把 LLM 世界表编译成真值状态机。
 
-    传入 ``blueprint`` 时额外校验实体类型，并把 relation 编译成 source 的软外键
-    Timeline、把 domain event 的 effect 编译成普通 Op；旧调用不传蓝图时行为保持不变。
+    传入 ``blueprint`` 时额外校验实体类型，并按 relation.field 在两个端点的唯一
+    归属把关系编译成 owner 的软外键 Timeline，再把 domain event 的 effect 编译成
+    普通 Op；同类型自关系约定由 source/from 持有字段。旧调用不传蓝图时行为保持不变。
     """
     if blueprint is not None:
-        from pipeline.world_blueprint import normalize_world_blueprint
+        try:
+            from pipeline.world_blueprint import normalize_world_blueprint, relation_owner_side
+        except ModuleNotFoundError:  # 兼容 `python pipeline/world_state.py` 的文档化自检入口
+            from world_blueprint import normalize_world_blueprint, relation_owner_side
         blueprint = normalize_world_blueprint(blueprint)
         temporal = blueprint.get("temporal_model") or {}
         step_days = _as_int(temporal.get("step_days"), step_days)
@@ -753,10 +757,19 @@ def assemble_world(table: dict, base: str = "2025-01-06", step_days: int = 7,
                       for tid, t in bp_types.items()}
     field_specs = {tid: {f.get("name"): f for f in t.get("fields", []) if f.get("name")}
                    for tid, t in bp_types.items()}
+
     relation_fields: dict[str, set[str]] = {}
+    relation_owner_sides: dict[str, str] = {}
     event_fields: dict[str, set[str]] = {}
     for rel in (blueprint or {}).get("relation_types", []):
-        relation_fields.setdefault(rel.get("from_type"), set()).add(rel.get("field"))
+        side = relation_owner_side(blueprint, rel)
+        if side is None:
+            issues.append(
+                f"relation type {rel.get('id') or '?'} 字段 {rel.get('field')!r} 在两个端点间没有唯一 owner")
+            continue
+        relation_owner_sides[rel.get("id")] = side
+        owner_type = rel.get("from_type") if side == "from" else rel.get("to_type")
+        relation_fields.setdefault(owner_type, set()).add(rel.get("field"))
     for event in (blueprint or {}).get("event_types", []):
         roles = event.get("roles") or {}
         for effect in event.get("effect_fields") or []:
@@ -889,7 +902,12 @@ def assemble_world(table: dict, base: str = "2025-01-06", step_days: int = 7,
                 relation_ids.add(old_rel["id"])
             relation_edges.add((rid, old_rel.get("from"), old_rel.get("to"),
                                 _as_int(old_rel.get("session"), 0)))
-        for rel in _dicts(table.get("relations", [])):
+        # Timeline 编译必须与 LLM 数组顺序无关；同一 owner.field 按时间正序判断真实变化/no-op。
+        relation_rows = sorted(
+            _dicts(table.get("relations", [])),
+            key=lambda item: (_as_int(item.get("session"), -1), str(item.get("id") or "")),
+        )
+        for rel in relation_rows:
             rtype = rel_types.get(rel.get("type"))
             instance_id = rel.get("id")
             src, dst = rel.get("from"), rel.get("to")
@@ -917,7 +935,12 @@ def assemble_world(table: dict, base: str = "2025-01-06", step_days: int = 7,
             if edge in relation_edges:
                 issues.append(f"relation {instance_id} 重复边:{src}->{dst}@{sess}")
                 continue
-            if not _inject(src, rtype["field"], sess, dst, f"relation {instance_id}"):
+            owner_side = relation_owner_sides.get(rtype["id"])
+            if owner_side is None:
+                issues.append(f"relation {instance_id} 无法确定字段 owner")
+                continue
+            owner, referenced = (src, dst) if owner_side == "from" else (dst, src)
+            if not _inject(owner, rtype["field"], sess, referenced, f"relation {instance_id}"):
                 issues.append(f"relation {instance_id} 没有形成合法 FK 变化")
                 continue
             relations.append(dict(rel))
@@ -931,12 +954,23 @@ def assemble_world(table: dict, base: str = "2025-01-06", step_days: int = 7,
         event_types = {e["id"]: e for e in blueprint.get("event_types", [])}
         event_counts: dict[str, int] = {}
         event_by_id: dict[str, dict] = {}
+        event_instances: set[tuple] = set()
         for old_event in events:
             if old_event.get("id"):
                 event_by_id[old_event["id"]] = old_event
             etid = old_event.get("type")
             event_counts[etid] = event_counts.get(etid, 0) + 1
-        for event in _dicts(table.get("events", [])):
+            event_instances.add((
+                etid,
+                _as_int(old_event.get("session"), -1),
+                tuple(sorted((str(role), str(entity))
+                             for role, entity in _dict(old_event.get("participants")).items())),
+            ))
+        event_rows = sorted(
+            _dicts(table.get("events", [])),
+            key=lambda item: (_as_int(item.get("session"), -1), str(item.get("id") or "")),
+        )
+        for event in event_rows:
             decl = event_types.get(event.get("type"))
             eid = event.get("id")
             participants = _dict(event.get("participants"))
@@ -957,6 +991,13 @@ def assemble_world(table: dict, base: str = "2025-01-06", step_days: int = 7,
             sess = _as_int(event.get("session"), -1)
             if sess < 0 or (session_limit and sess >= session_limit):
                 issues.append(f"event {eid} session 非法:{event.get('session')}")
+                continue
+            event_instance = (
+                decl["id"], sess,
+                tuple(sorted((str(role), str(entity)) for role, entity in participants.items())),
+            )
+            if event_instance in event_instances:
+                issues.append(f"event {eid} 重复实例:{decl['id']}@{sess} participants={participants}")
                 continue
             allowed_effects = {(x.get("role"), x.get("field"))
                                for x in decl.get("effect_fields", []) if isinstance(x, dict)}
@@ -998,6 +1039,7 @@ def assemble_world(table: dict, base: str = "2025-01-06", step_days: int = 7,
             clean_event = {**event, "session": sess, "effects": clean_effects}
             events.append(clean_event)
             event_by_id[eid] = clean_event
+            event_instances.add(event_instance)
             event_counts[decl["id"]] = event_counts.get(decl["id"], 0) + 1
             max_sess = max(max_sess, sess)
         for event_id, decl in event_types.items():
@@ -1010,7 +1052,8 @@ def assemble_world(table: dict, base: str = "2025-01-06", step_days: int = 7,
             delay = _as_int(rule.get("delay_sessions"), 0)
             for child in events:
                 parent = event_by_id.get(child.get("caused_by"))
-                if (parent and parent.get("type") == rule.get("trigger_event")
+                if (parent and parent.get("id") != child.get("id")
+                        and parent.get("type") == rule.get("trigger_event")
                         and child.get("type") == rule.get("effect_event")
                         and child.get("session") - parent.get("session") == delay):
                     witnesses.append((parent, child))
@@ -1048,8 +1091,12 @@ def assemble_world(table: dict, base: str = "2025-01-06", step_days: int = 7,
         for rel in relations:
             decl = next((r for r in blueprint.get("relation_types", []) if r.get("id") == rel.get("type")), None)
             if decl:
-                witnesses.add((rel.get("from"), decl.get("field"), _as_int(rel.get("session"), 0),
-                               _norm(rel.get("to"))))
+                owner_side = relation_owner_sides.get(decl.get("id"))
+                if owner_side:
+                    owner, referenced = ((rel.get("from"), rel.get("to")) if owner_side == "from"
+                                         else (rel.get("to"), rel.get("from")))
+                    witnesses.add((owner, decl.get("field"), _as_int(rel.get("session"), 0),
+                                   _norm(referenced)))
         for event in events:
             for effect in _dicts(event.get("effects", [])):
                 value = effect.get("set", effect.get("value"))
@@ -1216,6 +1263,100 @@ def _self_test() -> bool:
     ck("assemble absent 剔除矛盾(P0出),保留季度营收",
        "P0缺陷率" not in ws2.absent_fields and "季度营收" in ws2.absent_fields, True)
     ck("assemble issues 报了 P0 矛盾", any("P0缺陷率" in i for i in issues), True)
+
+    # typed relation：字段可唯一归属于 from 或 to；同类型自关系固定由 from/source 持有。
+    relation_bp = {
+        "version": 1,
+        "entity_types": [
+            {"id": "a", "noun": "甲类", "count": 2, "primary": True, "fields": [
+                {"name": "正向引用", "kind": "reference"},
+                {"name": "同类引用", "kind": "reference"},
+                {"name": "阶段", "kind": "status", "states": ["初始", "完成"]},
+            ]},
+            {"id": "b", "noun": "乙类", "count": 1, "primary": False, "fields": [
+                {"name": "反向引用", "kind": "reference"},
+                {"name": "标签", "kind": "text"},
+            ]},
+        ],
+        "relation_types": [
+            {"id": "from_owned", "from_type": "a", "to_type": "b",
+             "field": "正向引用", "temporal": False, "min_count": 1},
+            {"id": "to_owned", "from_type": "a", "to_type": "b",
+             "field": "反向引用", "temporal": True, "min_count": 2},
+            {"id": "self_owned", "from_type": "a", "to_type": "a",
+             "field": "同类引用", "temporal": False, "min_count": 1},
+        ],
+        "event_types": [{
+            "id": "finish", "label": "完成阶段", "roles": {"actor": "a"},
+            "effect_fields": [{"role": "actor", "field": "阶段"}], "min_count": 1,
+        }],
+        "temporal_model": {"unit": "round", "cadence": "per_round",
+                           "n_sessions": 3, "step_days": 1},
+        "causal_rules": [],
+        "evidence_channels": ["测试记录"],
+    }
+    relation_table = {
+        "entities": [
+            {"name": "A1", "type": "a", "fields": {
+                "阶段": {"type": "stable", "value": "初始"}}},
+            {"name": "A2", "type": "a", "fields": {}},
+            {"name": "B1", "type": "b", "fields": {
+                "标签": {"type": "stable", "value": "乙一"}}},
+        ],
+        "relations": [
+            {"id": "rf1", "type": "from_owned", "from": "A1", "to": "B1", "session": 0},
+            {"id": "rt1", "type": "to_owned", "from": "A1", "to": "B1", "session": 0},
+            {"id": "rt2", "type": "to_owned", "from": "A2", "to": "B1", "session": 2},
+            {"id": "rs1", "type": "self_owned", "from": "A1", "to": "A2", "session": 0},
+        ],
+        "events": [{
+            "id": "ev1", "type": "finish", "session": 1,
+            "participants": {"actor": "A1"},
+            "effects": [{"entity": "A1", "field": "阶段", "set": "完成"}],
+        }],
+    }
+    typed_rel, typed_rel_issues = assemble_world(relation_table, blueprint=relation_bp)
+    ck("typed relation from-owner 写 source.field=target",
+       gt_ie(typed_rel, "A1", "正向引用", 0), "B1")
+    ck("typed relation to-owner 写 target.field=source",
+       gt_ie(typed_rel, "B1", "反向引用", 0), "A1")
+    ck("typed relation to-owner 时序更新由新 source 见证",
+       gt_ie(typed_rel, "B1", "反向引用", 2), "A2")
+    ck("typed self-relation 约定由 source 持有",
+       gt_ie(typed_rel, "A1", "同类引用", 0), "A2")
+    ck("typed relation owner 同步到缺字段排除与 witness 校验", typed_rel_issues, [])
+
+    reversed_table = deepcopy(relation_table)
+    reversed_table["relations"] = list(reversed(reversed_table["relations"]))
+    reversed_table["events"] = list(reversed(reversed_table["events"]))
+    reversed_world, reversed_issues = assemble_world(reversed_table, blueprint=relation_bp)
+    ck("typed relation/event 编译与 LLM 数组顺序无关",
+       reversed_issues == [] and reversed_world.to_dict() == typed_rel.to_dict(), True)
+
+    duplicate_event_table = deepcopy(relation_table)
+    duplicate_event_table["events"].append({
+        "id": "ev2", "type": "finish", "session": 1,
+        "participants": {"actor": "A1"},
+        "effects": [{"entity": "A1", "field": "阶段", "set": "完成"}],
+    })
+    duplicate_event_world, duplicate_event_issues = assemble_world(
+        duplicate_event_table, blueprint=relation_bp)
+    ck("typed event 同 type/session/participants 不得靠不同 id 重复计数",
+       len(duplicate_event_world.events) == 1
+       and any("重复实例" in issue for issue in duplicate_event_issues), True)
+
+    self_causal_bp = deepcopy(relation_bp)
+    self_causal_bp["causal_rules"] = [{
+        "id": "self_loop", "trigger_event": "finish", "effect_event": "finish",
+        "delay_sessions": 0,
+    }]
+    self_causal_table = deepcopy(relation_table)
+    self_causal_table["events"][0]["caused_by"] = "ev1"
+    self_causal_world, self_causal_issues = assemble_world(
+        self_causal_table, blueprint=self_causal_bp)
+    ck("typed causal 单事件不得 caused_by 自己形成自环见证",
+       not self_causal_world.cascades
+       and any("没有 caused_by 事件见证" in issue for issue in self_causal_issues), True)
 
     # V11 Tier 0:ORDER / DURATION / pre_expire / 形状
     ev = gt_event_order(ws, E)

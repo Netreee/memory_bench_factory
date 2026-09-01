@@ -19,16 +19,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from pipeline.world_blueprint import (
     normalize_world_blueprint,
+    relation_capacity,
+    relation_owner_side,
     structure_signature,
     validate_world_blueprint,
 )
-from pipeline.central_office import _assemble_whitepaper, central_office
+from pipeline.central_office import (_assemble_whitepaper, _observed_blueprint_issues,
+                                     central_office)
 from pipeline.lines import prepare_lines
 from pipeline.lines.L2_relational import RelationalLine
 from pipeline.lines.L4_preference import PreferenceLine
 from pipeline.prompts import render as render_prompt
 from pipeline.render import _corpus_system, _missing_event_narratives, _session_facts
-from pipeline.world_gen import build_world
+from pipeline.world_gen import _wire_declared_causality, build_world
 from pipeline.world_state import WorldState, assemble_world, _date_of
 
 
@@ -53,7 +56,9 @@ def _game_whitepaper() -> dict:
                  "fields": [{"name": "defeat_status", "kind": "status"},
                             {"name": "drop_item", "kind": "reference"}]},
                 {"id": "equipment", "noun": "装备", "count": 4,
-                 "fields": [{"name": "enhance_level", "kind": "numeric"}]},
+                 "fields": [{"name": "enhance_level", "kind": "numeric"},
+                            {"name": "acquisition_status", "kind": "status",
+                             "states": ["unowned", "owned"]}]},
                 {"id": "quest", "noun": "任务", "count": 3,
                  "fields": [{"name": "quest_status", "kind": "status"},
                             {"name": "target_boss", "kind": "reference"}]},
@@ -72,7 +77,7 @@ def _game_whitepaper() -> dict:
                 {"id": "defeat_boss", "label": "击败首领", "roles": {"actor": "player", "target": "boss"},
                  "effect_fields": [{"role": "target", "field": "defeat_status"}], "min_count": 1},
                 {"id": "acquire_item", "label": "获得装备", "roles": {"owner": "player", "item": "equipment"},
-                 "effect_fields": [{"role": "owner", "field": "equipped_item"}], "min_count": 1},
+                 "effect_fields": [{"role": "item", "field": "acquisition_status"}], "min_count": 1},
                 {"id": "complete_quest", "label": "完成任务", "roles": {"actor": "player", "quest": "quest"},
                  "effect_fields": [{"role": "quest", "field": "quest_status"}], "min_count": 1},
             ],
@@ -97,7 +102,8 @@ def _office_whitepaper() -> dict:
                 {"id": "employee", "noun": "员工", "count": 5, "primary": True,
                  "fields": [{"name": "employment_status", "kind": "status"},
                             {"name": "employee_department", "kind": "reference"},
-                            {"name": "owned_project", "kind": "reference"}]},
+                            {"name": "transfer_status", "kind": "status",
+                             "states": ["stable", "transferred"]}]},
                 {"id": "department", "noun": "部门", "count": 2,
                  "fields": [{"name": "budget_owner", "kind": "person"},
                             {"name": "budget", "kind": "reference"}]},
@@ -115,7 +121,7 @@ def _office_whitepaper() -> dict:
                 {"id": "member_of", "from_type": "employee", "to_type": "department",
                  "field": "employee_department", "temporal": True, "min_count": 1},
                 {"id": "owns", "from_type": "employee", "to_type": "project",
-                 "field": "owned_project", "temporal": True, "min_count": 1},
+                 "field": "owner", "temporal": True, "min_count": 1},
                 {"id": "has_milestone", "from_type": "project", "to_type": "milestone",
                  "field": "milestone", "temporal": False, "min_count": 1},
                 {"id": "controls_budget", "from_type": "department", "to_type": "budget",
@@ -125,7 +131,7 @@ def _office_whitepaper() -> dict:
             ],
             "event_types": [
                 {"id": "employee_transfer", "label": "员工调动", "roles": {"employee": "employee", "to": "department"},
-                 "effect_fields": [{"role": "employee", "field": "employee_department"}], "min_count": 1},
+                 "effect_fields": [{"role": "employee", "field": "transfer_status"}], "min_count": 1},
                 {"id": "budget_revision", "label": "预算修订", "roles": {"budget": "budget"},
                  "effect_fields": [{"role": "budget", "field": "approved_amount"}], "min_count": 1},
                 {"id": "milestone_complete", "label": "里程碑完成", "roles": {"milestone": "milestone"},
@@ -158,10 +164,11 @@ def _rename_vocabulary(wp: dict) -> dict:
             field["name"] = f"field_{i}_{j}"
             field_ids[(old_type, old_field)] = field["name"]
     for i, rel in enumerate(bp["relation_types"]):
-        old_source = rel["from_type"]
+        old_source, old_target = rel["from_type"], rel["to_type"]
+        owner = old_source if (old_source, rel["field"]) in field_ids else old_target
         rel["id"] = f"relation_{i}"
-        rel["from_type"], rel["to_type"] = type_ids[old_source], type_ids[rel["to_type"]]
-        rel["field"] = field_ids[(old_source, rel["field"])]
+        rel["from_type"], rel["to_type"] = type_ids[old_source], type_ids[old_target]
+        rel["field"] = field_ids[(owner, rel["field"])]
     for event in bp["event_types"]:
         old_event = event["id"]
         old_roles = dict(event["roles"])
@@ -250,6 +257,36 @@ except ValueError:
     wrong_shape_rejected = True
 ck("① blueprint 不得只同名覆盖、却改写 few-shot 的 kind/unit/range", wrong_shape_rejected)
 
+sentinel_observed = {
+    "observed_fields": [
+        {"name": "level", "kind": "numeric", "unit": "可省", "monotonic": "不适用",
+         "range": [None, ""]},
+        {"name": "无", "kind": "未知"},
+        None,
+    ],
+}
+ck("① observe 可选占位不会伪装成 blueprint 硬冲突",
+   _observed_blueprint_issues(game, sentinel_observed) == [])
+ck("① observe 半空 range 仍 fail-closed",
+   bool(_observed_blueprint_issues(game, {
+       "observed_fields": [{"name": "level", "kind": "numeric", "range": [None, 100]}],
+   })))
+ck("① observe 畸形字段行返回明确 schema 问题而不崩溃",
+   _observed_blueprint_issues(game, {"observed_fields": [42]})
+   == ["observe.observed_fields[0] 必须是 object"])
+clean_media_views = _views_with_blueprint(_game_whitepaper())
+clean_media_views["observe"].update({
+    "observed_media": ["", "无", "任务日志"],
+    "stopped_phrase_seen": "不适用",
+})
+clean_media_draft = _assemble_whitepaper(clean_media_views, "游戏")
+ck("① observe 空媒介不污染 evidence，真实媒介保留",
+   "任务日志" in clean_media_draft["world_blueprint"]["evidence_channels"]
+   and "" not in clean_media_draft["world_blueprint"]["evidence_channels"]
+   and "无" not in clean_media_draft["world_blueprint"]["evidence_channels"])
+ck("① observe 停用措辞占位回退默认值",
+   clean_media_draft["domain_profile"]["stopped_phrase"] == "停止/失效")
+
 
 # ════════ ② normalize + fail-closed ════════
 legacy_wp = {
@@ -309,6 +346,90 @@ same_field_bp = {
 }
 ck("② 跨类型同名字段约束一致则允许", validate_world_blueprint(
     normalize_world_blueprint(same_field_bp)) == [])
+
+reverse_owner_bp = deepcopy(same_field_bp)
+reverse_owner_bp["entity_types"][1]["fields"].append(
+    {"name": "关联甲", "kind": "reference", "unit": "entity_id"})
+reverse_owner_bp["relation_types"][0]["field"] = "关联甲"
+reverse_owner_bp["entity_types"][0]["fields"] = [
+    field for field in reverse_owner_bp["entity_types"][0]["fields"]
+    if field["name"] != "关联乙"
+]
+ck("② relation 字段只属于 to_type 时合法",
+   validate_world_blueprint(normalize_world_blueprint(reverse_owner_bp)) == [])
+ck("② relation owner 只在两个端点局部推断",
+   relation_owner_side(reverse_owner_bp, reverse_owner_bp["relation_types"][0]) == "to")
+
+both_endpoints_own_bp = deepcopy(same_field_bp)
+both_endpoints_own_bp["entity_types"][1]["fields"].append(
+    {"name": "关联乙", "kind": "reference"})
+_must_reject("② relation 字段同时属于异类型两端 fail-closed", both_endpoints_own_bp)
+
+neither_endpoint_owns_bp = deepcopy(same_field_bp)
+neither_endpoint_owns_bp["relation_types"][0]["field"] = "未声明关联"
+_must_reject("② relation 字段不属于异类型任一端 fail-closed", neither_endpoint_owns_bp)
+
+non_reference_owner_bp = deepcopy(same_field_bp)
+non_reference_owner_bp["entity_types"][0]["fields"][1]["kind"] = "category"
+_must_reject("② relation owner 字段必须为 reference", non_reference_owner_bp)
+
+schema_foreign_key_bp = deepcopy(same_field_bp)
+schema_foreign_key_bp["entity_types"][0]["fields"][1]["target_type"] = "b"
+_must_reject("② reference 目标不得用 schema 外键重复表达", schema_foreign_key_bp)
+
+dangling_reference_bp = deepcopy(same_field_bp)
+dangling_reference_bp["entity_types"][1]["fields"].append(
+    {"name": "悬空引用", "kind": "reference"})
+_must_reject("② reference 字段必须绑定且只绑定一个 relation", dangling_reference_bp)
+
+reused_reference_bp = deepcopy(same_field_bp)
+reused_reference_bp["relation_types"].append({
+    "id": "links_again", "from_type": "a", "to_type": "b",
+    "field": "关联乙", "temporal": True, "min_count": 1,
+})
+_must_reject("② 多个 relation type 不得复用同一 owner 字段", reused_reference_bp)
+
+event_writes_relation_bp = deepcopy(same_field_bp)
+event_writes_relation_bp["event_types"][0].update({
+    "roles": {"subject": "a"},
+    "effect_fields": [{"role": "subject", "field": "关联乙"}],
+})
+_must_reject("② event effect 不得写 relation-owned reference 字段", event_writes_relation_bp)
+
+static_over_capacity_bp = deepcopy(reverse_owner_bp)
+static_over_capacity_bp["relation_types"][0]["min_count"] = 2
+_must_reject("② static 标量 FK min_count 不得超过 owner 数量", static_over_capacity_bp)
+temporal_singleton_bp = deepcopy(static_over_capacity_bp)
+temporal_singleton_bp["relation_types"][0]["temporal"] = True
+_must_reject("② temporal FK 只有一个可引用实体时不能用重复 no-op 凑 min_count", temporal_singleton_bp)
+temporal_alternating_bp = deepcopy(temporal_singleton_bp)
+temporal_alternating_bp["entity_types"][0]["count"] = 2
+ck("② temporal FK 有两个可引用实体时可跨 session 形成变化",
+   relation_capacity(temporal_alternating_bp, temporal_alternating_bp["relation_types"][0]) == 4
+   and validate_world_blueprint(normalize_world_blueprint(temporal_alternating_bp)) == [])
+
+causal_out_of_window_bp = deepcopy(same_field_bp)
+causal_out_of_window_bp["causal_rules"] = [{
+    "id": "too_late", "trigger_event": "changes", "effect_event": "changes",
+    "delay_sessions": 4,
+}]
+_must_reject("② causal delay 必须落在时间窗内", causal_out_of_window_bp)
+
+self_relation_bp = deepcopy(same_field_bp)
+self_relation_bp["relation_types"][0].update({"from_type": "a", "to_type": "a"})
+ck("② 自关系字段按 source 侧持有",
+   validate_world_blueprint(normalize_world_blueprint(self_relation_bp)) == [])
+
+source_signature_bp = deepcopy(same_field_bp)
+source_relation_shape = structure_signature(source_signature_bp)[1][0]
+target_relation_shape = structure_signature(reverse_owner_bp)[1][0]
+ck("② 结构签名编码 relation owner_side 与实际 owner 字段形状",
+   source_relation_shape[3] == "from"
+   and source_relation_shape[4][1] is False
+   and target_relation_shape[3] == "to"
+   and target_relation_shape[4][1] is True
+   and structure_signature(source_signature_bp) != structure_signature(reverse_owner_bp))
+
 conflicting_field_bp = deepcopy(same_field_bp)
 conflicting_field_bp["entity_types"][1]["fields"][0]["kind"] = "numeric"
 _must_reject("② 跨类型同名字段约束冲突 fail-closed", conflicting_field_bp)
@@ -399,6 +520,20 @@ def _typed_table() -> dict:
 
 # 先直接锁住编译器；这样即使 build_world 的 prompt 路由变了，也不会把核心语义测成假绿。
 build_bp = normalize_world_blueprint(build_wp)
+causal_structure = {"events": [
+    {"id": "cause", "type": "defeat_boss", "session": 1},
+    {"id": "effect", "type": "acquire_loot", "session": 2},
+]}
+ck("③ 声明因果在已有事件满足时差时由代码补 caused_by",
+   _wire_declared_causality(causal_structure, build_bp) == 1
+   and causal_structure["events"][1].get("caused_by") == "cause")
+wrong_delay_structure = {"events": [
+    {"id": "cause", "type": "defeat_boss", "session": 0},
+    {"id": "effect", "type": "acquire_loot", "session": 3},
+]}
+ck("③ 因果编译不改 session、不凭空连接错误时差",
+   _wire_declared_causality(wrong_delay_structure, build_bp) == 0
+   and not wrong_delay_structure["events"][1].get("caused_by"))
 compiled, compile_issues = assemble_world(_typed_table(), blueprint=build_bp)
 ck("③ assemble 类型化实例零缺陷", compile_issues == [])
 ck("③ assemble 保存 entity type", compiled.entity_types == {
@@ -724,6 +859,42 @@ ck("⑦ 换皮反方的审议记录进入白皮书且获低风险批准",
    and world_first_wp["world_review"].get("attempts") == 1)
 
 
+class _SchemaRepairTracer(_WorldFirstTracer):
+    """首轮反方产出坏 schema；修理后必须再做一次语义反方评审。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.review_round = 0
+
+    def chat_json(self, tag, messages, **kwargs):
+        if tag == "council.world_review":
+            text = "\n".join(str(message.get("content", "")) for message in messages)
+            self.calls.append((tag, text))
+            self.review_round += 1
+            candidate = deepcopy(reviewed_blueprint)
+            if self.review_round == 1:
+                candidate["relation_types"][0]["field"] = "不存在字段"
+            return {
+                "review": {"reskin_risk": "low", "findings": ["语义审查"], "decisions": ["保留骨架"]},
+                "world_blueprint": candidate,
+            }
+        if tag == "council.world_repair":
+            text = "\n".join(str(message.get("content", "")) for message in messages)
+            self.calls.append((tag, text))
+            return {"world_blueprint": deepcopy(reviewed_blueprint)}
+        return super().chat_json(tag, messages, **kwargs)
+
+
+schema_repair_tracer = _SchemaRepairTracer()
+schema_repair_wp = central_office(
+    "测试 schema 修理后复审", [], schema_repair_tracer, log=lambda *_args: None)
+schema_repair_tags = [tag for tag, _text in schema_repair_tracer.calls]
+ck("⑦ schema 修理结果不能沿用修理前风险结论，必须重新反方评审",
+   schema_repair_tags.count("council.world_repair") == 1
+   and schema_repair_tags.count("council.world_review") == 2
+   and schema_repair_wp["world_review"].get("attempts") == 2)
+
+
 class _HighRiskTracer(_WorldFirstTracer):
     """反方连续判定仍可换皮；白皮书必须在 map 前停下。"""
 
@@ -749,8 +920,8 @@ try:
 except ValueError:
     high_risk_rejected = True
 high_risk_tags = [tag for tag, _text in high_risk_tracer.calls]
-ck("⑦ residual reskin risk 非 low 时三轮后 fail-closed",
-   high_risk_rejected and high_risk_tags.count("council.world_review") == 3)
+ck("⑦ residual reskin risk 非 low 时五轮后 fail-closed",
+   high_risk_rejected and high_risk_tags.count("council.world_review") == 5)
 ck("⑦ 换皮评审未批准时不得进入能力 map",
    "council.map" not in high_risk_tags and "council.critique" not in high_risk_tags)
 

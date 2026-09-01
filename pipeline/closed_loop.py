@@ -6,6 +6,7 @@ pipeline.closed_loop —— §S 闭环旋钮 driver(从 run_factory_v2 拆出,�
 from __future__ import annotations
 import dataclasses, math
 from pipeline.world_state import WorldState
+from pipeline.world_blueprint import relation_capacity, relation_owner_side
 from pipeline.lines import line_for
 from pipeline.run import Run, _run_stage
 from pipeline.targetspec import TargetSpec, invert_rate, WorldParams, DEFAULT_SLACK
@@ -29,9 +30,19 @@ def _render_delta_scope(ws: WorldState, previous_entities: set,
     new_entities = sorted(set(ws.entities) - previous_entities)
     new_set = set(new_entities)
     pairs: set[tuple[str, int]] = set()
+    blueprint = ws.world_blueprint or {}
+    relation_types = {r.get("id"): r for r in blueprint.get("relation_types", [])
+                      if isinstance(r, dict) and r.get("id")}
     for relation in ws.relations:
-        if _relation_key(relation) not in previous_relations and relation.get("from") not in new_set:
-            pairs.add((relation.get("from"), int(relation.get("session", 0))))
+        if _relation_key(relation) in previous_relations:
+            continue
+        owner = relation.get("from")
+        declaration = relation_types.get(relation.get("type")) or {}
+        if relation_owner_side(blueprint, declaration) == "to":
+            owner = relation.get("to")
+        # 历史世界、缺声明或字段归属不唯一时保持 source 回退。
+        if owner and owner not in new_set:
+            pairs.add((owner, int(relation.get("session", 0))))
     for event in ws.events:
         if _event_key(event) in previous_events:
             continue
@@ -56,11 +67,35 @@ def _scale_world_contract(wp: dict, n_entities: int, n_sessions: int) -> None:
     if isinstance(bp, dict) and bp.get("entity_types"):
         types = bp["entity_types"]
         old_total = sum(int(t.get("count", 0)) for t in types)
+        type_ids = [str(t.get("id") or "") for t in types]
+        baseline = sw.get("_typed_scale_baseline")
+        baseline_valid = (
+            isinstance(baseline, dict)
+            and isinstance(baseline.get("entity_counts"), dict)
+            and set(baseline["entity_counts"]) == set(type_ids)
+            and int(baseline.get("entity_total", 0)) > 0
+        )
+        if not baseline_valid:
+            baseline = {
+                "entity_total": old_total,
+                "entity_counts": {str(t.get("id") or ""): int(t.get("count", 0)) for t in types},
+                "relation_min_counts": {
+                    str(item.get("id") or ""): int(item.get("min_count", 0))
+                    for item in bp.get("relation_types") or []
+                },
+                "event_min_counts": {
+                    str(item.get("id") or ""): int(item.get("min_count", 0))
+                    for item in bp.get("event_types") or []
+                },
+            }
+            sw["_typed_scale_baseline"] = baseline
         desired = max(old_total, int(n_entities), len(types))
         if old_total > 0 and desired > old_total:
-            factor = desired / old_total
-            raw = [int(t["count"]) * factor for t in types]
-            counts = [max(1, math.floor(x)) for x in raw]
+            base_total = int(baseline["entity_total"])
+            factor = desired / base_total
+            raw = [int(baseline["entity_counts"][tid]) * factor for tid in type_ids]
+            # 以首次白皮书为比例锚，同时不缩小任何已经生成过的类型。
+            counts = [max(int(t["count"]), 1, math.floor(x)) for t, x in zip(types, raw)]
             remainder = desired - sum(counts)
             order = sorted(range(len(types)), key=lambda i: (raw[i] - math.floor(raw[i]),
                                                               bool(types[i].get("primary"))), reverse=True)
@@ -68,13 +103,24 @@ def _scale_world_contract(wp: dict, n_entities: int, n_sessions: int) -> None:
                 counts[i] += 1
             for t, count in zip(types, counts):
                 t["count"] = count
-            for decl in list(bp.get("relation_types") or []) + list(bp.get("event_types") or []):
-                old_min = int(decl.get("min_count", 0))
-                if old_min > 0:
-                    decl["min_count"] = max(old_min, math.ceil(old_min * factor))
         actual_entities = sum(int(t.get("count", 0)) for t in types)
         temporal = bp.setdefault("temporal_model", {})
         temporal["n_sessions"] = max(int(temporal.get("n_sessions", 0)), n_sessions)
+        density_factor = actual_entities / int(baseline["entity_total"])
+        for key, declarations in (("relation_min_counts", bp.get("relation_types") or []),
+                                  ("event_min_counts", bp.get("event_types") or [])):
+            base_mins = baseline.get(key) or {}
+            for declaration in declarations:
+                declaration_id = str(declaration.get("id") or "")
+                base_min = int(base_mins.get(declaration_id, declaration.get("min_count", 0)))
+                current_min = int(declaration.get("min_count", 0))
+                if base_min > 0:
+                    declaration["min_count"] = max(current_min, math.ceil(base_min * density_factor))
+        # relation 是标量 FK；人口比例取整后，owner 侧可能没长大，不能让同比 min_count 超过容量。
+        for relation in bp.get("relation_types") or []:
+            if relation_owner_side(bp, relation) is not None:
+                relation["min_count"] = min(int(relation.get("min_count", 0)),
+                                             relation_capacity(bp, relation))
         actual_sessions = temporal["n_sessions"]
     sw.setdefault("entities", {})["count"] = actual_entities
     sw.setdefault("timeline", {})["n_sessions"] = actual_sessions

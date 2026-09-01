@@ -105,6 +105,43 @@ ck("_scale_world_contract:较小目标不反向缩减 typed 类型/结构/sessio
    and {item["id"]: item["min_count"] for item in scaled_bp["event_types"]} == scaled_event_min
    and scaled_bp["temporal_model"]["n_sessions"] == 12)
 
+# target-owned static 标量 FK：比例取整后 owner 仍只有 1 个，min_count 不能从 1 膨胀到 2。
+reverse_owner_scale_wp = {
+    "shared_world_spec": {},
+    "world_blueprint": {
+        "entity_types": [
+            {"id": "source", "count": 9, "primary": True, "fields": [{"name": "标签", "kind": "text"}]},
+            {"id": "target", "count": 1, "fields": [{"name": "来源", "kind": "reference"}]},
+        ],
+        "relation_types": [{
+            "id": "points", "from_type": "source", "to_type": "target",
+            "field": "来源", "temporal": False, "min_count": 1,
+        }],
+        "event_types": [],
+        "temporal_model": {"n_sessions": 4},
+    },
+}
+_scale_world_contract(reverse_owner_scale_wp, n_entities=15, n_sessions=4)
+ck("_scale_world_contract:relation min_count 受真实 owner 标量容量约束",
+   reverse_owner_scale_wp["world_blueprint"]["entity_types"][1]["count"] == 1
+   and reverse_owner_scale_wp["world_blueprint"]["relation_types"][0]["min_count"] == 1)
+
+# 多轮小步扩容必须始终锚定白皮书初始密度，不能对已 ceil 的 min_count 再乘一次。
+incremental_scale_wp = {
+    "shared_world_spec": {},
+    "world_blueprint": {
+        "entity_types": [{"id": "x", "count": 10, "primary": True}],
+        "relation_types": [],
+        "event_types": [{"id": "tick", "min_count": 1}],
+        "temporal_model": {"n_sessions": 4},
+    },
+}
+for target_size in range(11, 16):
+    _scale_world_contract(incremental_scale_wp, n_entities=target_size, n_sessions=4)
+ck("_scale_world_contract:多轮增量缩放不累积 ceil 爆炸",
+   incremental_scale_wp["world_blueprint"]["entity_types"][0]["count"] == 15
+   and incremental_scale_wp["world_blueprint"]["event_types"][0]["min_count"] == 2)
+
 # ── _floor_status:达标/可行未达(growable)/不可行未达(permanent)/总数闸 ─────────
 spec = TargetSpec(min_questions=20, per_line_min={"L1_timeline": 8, "L2_relational": 6, "L3_process": 5})
 

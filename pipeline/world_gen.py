@@ -10,9 +10,42 @@ import config
 from pipeline.world_state import (assemble_world, validate, WorldState, _strip_disambig, name_collisions,
                                    Op, SET, UPDATE, EXPIRE, DELETE, INSUFFICIENT, INVALID,
                                    _to_num, _as_int)
+from pipeline.world_blueprint import relation_owner_side
 from pipeline.prompts import render
 
 _BARE_NUM = re.compile(r"^-?\d+(?:\.\d+)?$")
+
+
+def _wire_declared_causality(structure: dict, blueprint: dict) -> int:
+    """只在已有事件已满足类型与时差时补 caused_by，不创建事件或改写 session。"""
+    events = [event for event in structure.get("events", []) if isinstance(event, dict)]
+    rules = [rule for rule in blueprint.get("causal_rules", []) if isinstance(rule, dict)]
+    wired = 0
+    for rule in rules:
+        trigger_type = rule.get("trigger_event")
+        effect_type = rule.get("effect_event")
+        delay = _as_int(rule.get("delay_sessions"), -1)
+        parents = sorted((event for event in events
+                          if event.get("type") == trigger_type and event.get("id")),
+                         key=lambda event: (_as_int(event.get("session"), -1), str(event.get("id"))))
+        children = sorted((event for event in events
+                           if event.get("type") == effect_type and event.get("id")),
+                          key=lambda event: (_as_int(event.get("session"), -1), str(event.get("id"))))
+        if any(child.get("caused_by") == parent.get("id")
+               and child.get("id") != parent.get("id")
+               and _as_int(child.get("session"), -1) - _as_int(parent.get("session"), -1) == delay
+               for child in children for parent in parents):
+            continue
+        pair = next(((parent, child) for child in children if not child.get("caused_by")
+                     for parent in parents
+                     if child.get("id") != parent.get("id")
+                     and _as_int(child.get("session"), -1)
+                     - _as_int(parent.get("session"), -1) == delay), None)
+        if pair:
+            parent, child = pair
+            child["caused_by"] = parent["id"]
+            wired += 1
+    return wired
 
 
 def _affix_units(ws: WorldState, profile: dict | None, log=print) -> int:
@@ -242,7 +275,9 @@ def build_world(wp, tracer, log=print, existing=None) -> WorldState:
         return existing
     relation_fields = {}
     for rel in blueprint.get("relation_types", []):
-        relation_fields.setdefault(rel["from_type"], set()).add(rel["field"])
+        side = relation_owner_side(blueprint, rel)
+        owner = rel["from_type"] if side == "from" else rel["to_type"]
+        relation_fields.setdefault(owner, set()).add(rel["field"])
     event_fields = {}
     for event in blueprint.get("event_types", []):
         roles = event.get("roles") or {}
@@ -302,10 +337,13 @@ def build_world(wp, tracer, log=print, existing=None) -> WorldState:
             wants = [min(batch, max(0, need - i * batch)) for i in range((need + batch - 1) // batch)]
 
             def _world_batch(want):
+                used_names = json.dumps(sorted(seen), ensure_ascii=False)
                 return tracer.chat_json("world.batch",
                     [{"role": "system", "content": sysp},
                      {"role": "user", "content": render("world.user", want=want, noun=type_noun,
-                                                          type_id=tid, smax=n_sessions - 1, extra=type_extra)}],
+                                                          type_id=tid, smax=n_sessions - 1, extra=type_extra)
+                      + f"\n【全世界已占用专名，禁止复用或换类型冒用】{used_names}"
+                        "\n必须返回足量、与本类型 noun 相称的新专名。"}],
                     temperature=0.7, max_tokens=8192)
 
             for out in config.pmap(_world_batch, wants, workers=len(wants)):
@@ -375,7 +413,7 @@ def build_world(wp, tracer, log=print, existing=None) -> WorldState:
                      "initial_state": _initial_state(e.get("name"), e.get("type"), e.get("fields") or {})}
                     for e in merged["entities"]]
         hint = ""
-        for attempt in range(3):
+        for attempt in range(5):
             structure = tracer.chat_json("world.structure",
                 [{"role": "system", "content": render("world.structure", smax=n_sessions - 1)},
                  {"role": "user", "content": render(
@@ -384,6 +422,7 @@ def build_world(wp, tracer, log=print, existing=None) -> WorldState:
                      entities=json.dumps(catalog, ensure_ascii=False)) + hint}],
                 temperature=0.4, max_tokens=8192)
             if isinstance(structure, dict):
+                _wire_declared_causality(structure, blueprint)
                 merged["relations"] = [x for x in structure.get("relations", []) if isinstance(x, dict)]
                 merged["events"] = [x for x in structure.get("events", []) if isinstance(x, dict)]
             trial, trial_issues = assemble_world(merged, blueprint=blueprint, existing=existing)
@@ -391,7 +430,10 @@ def build_world(wp, tracer, log=print, existing=None) -> WorldState:
             if not structural_issues:
                 break
             log(f"  ⟳ 世界骨架实例修复轮{attempt+1}:{len(structural_issues)} 个契约违例")
-            hint = "\n【上轮机械校验失败，必须全部修正】\n- " + "\n- ".join(structural_issues)
+            hint = ("\n【上轮机械校验失败，必须基于上轮候选逐项修正】\n- "
+                    + "\n- ".join(structural_issues)
+                    + "\n【上轮候选 JSON】\n"
+                    + json.dumps(structure, ensure_ascii=False))
 
     ws, compile_issues = assemble_world(merged, blueprint=blueprint, existing=existing)
     structural_issues = [x for x in compile_issues if x.startswith(structural_markers)]

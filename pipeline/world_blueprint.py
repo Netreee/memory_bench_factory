@@ -123,6 +123,55 @@ def _canonical_blueprint(raw: dict) -> dict:
     }
 
 
+def relation_owner_side(blueprint: dict, relation: dict) -> str | None:
+    """按关系两个端点的局部字段声明返回 ``from``/``to`` owner；非法或歧义返回 None。"""
+    if not isinstance(blueprint, dict) or not isinstance(relation, dict):
+        return None
+    fields_by_type = {
+        entity_type.get("id"): {
+            field.get("name") for field in (entity_type.get("fields") or [])
+            if isinstance(field, dict) and isinstance(field.get("name"), str)
+        }
+        for entity_type in (blueprint.get("entity_types") or [])
+        if isinstance(entity_type, dict) and isinstance(entity_type.get("id"), str)
+    }
+    src, dst, field = relation.get("from_type"), relation.get("to_type"), relation.get("field")
+    if not all(isinstance(value, str) for value in (src, dst, field)):
+        return None
+    source_owns = field in fields_by_type.get(src, set())
+    if src == dst:
+        return "from" if source_owns else None
+    target_owns = field in fields_by_type.get(dst, set())
+    if source_owns == target_owns:
+        return None
+    return "from" if source_owns else "to"
+
+
+def relation_capacity(blueprint: dict, relation: dict) -> int:
+    """返回当前标量 FK 编译模型下，单一 relation type 可形成的最大有效实例数。"""
+    side = relation_owner_side(blueprint, relation)
+    if side is None:
+        return 0
+    type_counts = {
+        entity_type.get("id"): entity_type.get("count")
+        for entity_type in (blueprint.get("entity_types") or [])
+        if isinstance(entity_type, dict)
+        and isinstance(entity_type.get("count"), int)
+        and not isinstance(entity_type.get("count"), bool)
+    }
+    owner_type = relation.get("from_type") if side == "from" else relation.get("to_type")
+    referenced_type = relation.get("to_type") if side == "from" else relation.get("from_type")
+    owner_count = max(0, type_counts.get(owner_type, 0))
+    referenced_count = max(0, type_counts.get(referenced_type, 0))
+    if not relation.get("temporal") or referenced_count < 2:
+        return owner_count
+    temporal = blueprint.get("temporal_model") or {}
+    n_sessions = temporal.get("n_sessions")
+    if isinstance(n_sessions, bool) or not isinstance(n_sessions, int):
+        return 0
+    return owner_count * max(0, n_sessions)
+
+
 def normalize_world_blueprint(value: dict) -> dict:
     """返回规范蓝图。
 
@@ -190,6 +239,7 @@ def validate_world_blueprint(bp: dict) -> list[str]:
     # 否则同一个“状态/金额”会在全局投影里串型。
     global_fields: dict[str, tuple[str, tuple]] = {}
     fields_by_type: dict[str, set[str]] = {}
+    field_specs_by_type: dict[str, dict[str, dict]] = {}
     for t in entity_types:
         tid = t.get("id")
         if not isinstance(t.get("noun"), str) or not t.get("noun") or t.get("noun") != t.get("noun").strip():
@@ -211,6 +261,12 @@ def validate_world_blueprint(bp: dict) -> list[str]:
             kind = f.get("kind")
             if not isinstance(kind, str) or not kind or kind != kind.strip():
                 issues.append(f"entity type {tid or '?'} 字段 {name} 缺 kind")
+            foreign_keys = sorted(key for key in ("ref_type", "to_type", "target_type", "entity_type", "references")
+                                  if key in f and f.get(key) not in (None, "", []))
+            if foreign_keys:
+                issues.append(
+                    f"entity type {tid or '?'} 字段 {name} 含 schema 外目标键 {foreign_keys};"
+                    "reference 目标只能由 relation_types 表达")
             mono = f.get("monotonic")
             if mono not in (None, "", "up", "down"):
                 issues.append(f"entity type {tid or '?'} 字段 {name} monotonic 只能为 up/down")
@@ -242,6 +298,10 @@ def validate_world_blueprint(bp: dict) -> list[str]:
                 issues.append(f"entity type {tid or '?'} 字段重复:{dup}")
         if isinstance(tid, str):
             fields_by_type[tid] = set(names)
+            field_specs_by_type[tid] = {
+                field.get("name"): field for field in fields
+                if isinstance(field, dict) and isinstance(field.get("name"), str)
+            }
 
     def _objects(key: str) -> list[dict]:
         seq = bp.get(key) or []
@@ -260,16 +320,6 @@ def validate_world_blueprint(bp: dict) -> list[str]:
         issues.append("显式 world_blueprint 至少需要 1 种 relation type")
     if not bp.get("legacy_adapter") and not events:
         issues.append("显式 world_blueprint 至少需要 1 种 domain event type")
-    if (not bp.get("legacy_adapter") and relations
-            and not any(isinstance(r.get("min_count"), int)
-                        and not isinstance(r.get("min_count"), bool)
-                        and r.get("min_count") > 0 for r in relations)):
-        issues.append("显式 world_blueprint 至少一种 relation type 的 min_count 必须 >0")
-    if (not bp.get("legacy_adapter") and events
-            and not any(isinstance(e.get("min_count"), int)
-                        and not isinstance(e.get("min_count"), bool)
-                        and e.get("min_count") > 0 for e in events)):
-        issues.append("显式 world_blueprint 至少一种 event type 的 min_count 必须 >0")
     for key, seq in (("relation", relations), ("event", events), ("causal rule", rules)):
         ids = []
         for item in seq:
@@ -284,6 +334,7 @@ def validate_world_blueprint(bp: dict) -> list[str]:
             elif count > 1:
                 issues.append(f"{key} id 重复:{dup}")
 
+    relation_owned_fields: dict[tuple[str, str], str] = {}
     for rel in relations:
         rid, src, dst, fld = (rel.get("id"), rel.get("from_type"),
                               rel.get("to_type"), rel.get("field"))
@@ -291,13 +342,52 @@ def validate_world_blueprint(bp: dict) -> list[str]:
             issues.append(f"relation {rid or '?'} from_type/to_type/field 必须是规范字符串")
         if not isinstance(src, str) or not isinstance(dst, str) or src not in type_map or dst not in type_map:
             issues.append(f"relation {rid or '?'} 类型引用不存在:{src}->{dst}")
-        if not isinstance(src, str) or not isinstance(fld, str) or fld not in fields_by_type.get(src, set()):
-            issues.append(f"relation {rid or '?'} 字段 {fld!r} 不属于 from_type {src}")
+        if isinstance(src, str) and isinstance(dst, str) and isinstance(fld, str):
+            side = relation_owner_side(bp, rel)
+            if side is None:
+                source_owns = fld in fields_by_type.get(src, set())
+                target_owns = fld in fields_by_type.get(dst, set())
+                if src == dst:
+                    issues.append(
+                        f"relation {rid or '?'} 字段 {fld!r} 不属于自关系类型 {src}")
+                else:
+                    ownership = "同时属于两端" if source_owns and target_owns else "不属于任一端"
+                    issues.append(
+                        f"relation {rid or '?'} 字段 {fld!r} {ownership};"
+                        f"必须恰好属于 from_type {src} 或 to_type {dst} 之一")
+            else:
+                owner_type = src if side == "from" else dst
+                owner_spec = field_specs_by_type.get(owner_type, {}).get(fld) or {}
+                if owner_spec.get("kind") != "reference":
+                    issues.append(
+                        f"relation {rid or '?'} owner 字段 {owner_type}.{fld} kind 必须是 reference，"
+                        f"当前={owner_spec.get('kind')!r}")
+                owner_key = (owner_type, fld)
+                prior_relation = relation_owned_fields.get(owner_key)
+                if prior_relation is not None:
+                    issues.append(
+                        f"relation {rid or '?'} 与 {prior_relation} 复用 owner 字段 "
+                        f"{owner_type}.{fld};v1 每个 reference 字段只能承载一种关系")
+                else:
+                    relation_owned_fields[owner_key] = rid or "?"
         if not isinstance(rel.get("temporal"), bool):
             issues.append(f"relation {rid or '?'} temporal 必须是 JSON boolean")
+        minimum = 0 if bp.get("legacy_adapter") else 1
         if (isinstance(rel.get("min_count"), bool) or not isinstance(rel.get("min_count"), int)
-                or rel.get("min_count", -1) < 0):
-            issues.append(f"relation {rid or '?'} min_count 必须 >=0")
+                or rel.get("min_count", -1) < minimum):
+            issues.append(f"relation {rid or '?'} min_count 必须 >={minimum}")
+        elif relation_owner_side(bp, rel) is not None:
+            capacity = relation_capacity(bp, rel)
+            if rel["min_count"] > capacity:
+                issues.append(
+                    f"relation {rid or '?'} min_count={rel['min_count']} 超过标量 FK 最大容量 {capacity}")
+
+    for owner_type, specs in field_specs_by_type.items():
+        for field_name, spec in specs.items():
+            if spec.get("kind") == "reference" and (owner_type, field_name) not in relation_owned_fields:
+                issues.append(
+                    f"reference 字段 {owner_type}.{field_name} 未绑定 relation type;"
+                    "v1 不允许悬空引用")
 
     event_ids = {e.get("id") for e in events if isinstance(e.get("id"), str) and e.get("id")}
     for event in events:
@@ -326,9 +416,14 @@ def validate_world_blueprint(bp: dict) -> list[str]:
                 issues.append(f"event {eid or '?'} effect role 不存在:{role}")
             elif not isinstance(tid, str) or not isinstance(fld, str) or fld not in fields_by_type.get(tid, set()):
                 issues.append(f"event {eid or '?'} effect 字段 {fld!r} 不属于 role {role}({tid})")
+            elif (tid, fld) in relation_owned_fields:
+                issues.append(
+                    f"event {eid or '?'} effect 不得写 relation-owned 字段 {tid}.{fld} "
+                    f"(relation={relation_owned_fields[(tid, fld)]})")
+        minimum = 0 if bp.get("legacy_adapter") else 1
         if (isinstance(event.get("min_count"), bool) or not isinstance(event.get("min_count"), int)
-                or event.get("min_count", -1) < 0):
-            issues.append(f"event {eid or '?'} min_count 必须 >=0")
+                or event.get("min_count", -1) < minimum):
+            issues.append(f"event {eid or '?'} min_count 必须 >={minimum}")
 
     for rule in rules:
         rid = rule.get("id") or "?"
@@ -340,6 +435,13 @@ def validate_world_blueprint(bp: dict) -> list[str]:
                 or not isinstance(rule.get("delay_sessions"), int)
                 or rule.get("delay_sessions", -1) < 0):
             issues.append(f"causal rule {rid} delay_sessions 必须 >=0")
+        else:
+            n_sessions = (bp.get("temporal_model") or {}).get("n_sessions")
+            if isinstance(n_sessions, int) and not isinstance(n_sessions, bool) \
+                    and rule["delay_sessions"] >= n_sessions:
+                issues.append(
+                    f"causal rule {rid} delay_sessions={rule['delay_sessions']} "
+                    f"必须小于 n_sessions={n_sessions}")
 
     temporal = bp.get("temporal_model")
     if not isinstance(temporal, dict):
@@ -395,6 +497,15 @@ def structure_signature(value: dict) -> tuple:
         t["id"]: {f.get("name"): _field_shape(f) for f in (t.get("fields") or [])}
         for t in types
     }
+
+    def _relation_field_shape(relation: dict) -> tuple[str, tuple]:
+        """返回关系字段相对于有向边的持有侧与真实形状。"""
+        src, dst, field = relation["from_type"], relation["to_type"], relation.get("field")
+        side = relation_owner_side(bp, relation)
+        if side == "from":
+            return "from", fields.get(src, {}).get(field, ("unknown", False, "", False, 0))
+        return "to", fields.get(dst, {}).get(field, ("unknown", False, "", False, 0))
+
     base = {
         t["id"]: (bool(t.get("primary")), tuple(sorted(fields[t["id"]].values())))
         for t in types
@@ -410,9 +521,11 @@ def structure_signature(value: dict) -> tuple:
         relation_context: dict[str, list[tuple]] = {tid: [] for tid in type_map}
         for rel in bp["relation_types"]:
             src, dst = rel["from_type"], rel["to_type"]
-            fshape = fields.get(src, {}).get(rel.get("field"), ("unknown", False, "", False, 0))
-            relation_context[src].append(("out", labels[dst], bool(rel.get("temporal")), fshape))
-            relation_context[dst].append(("in", labels[src], bool(rel.get("temporal")), fshape))
+            owner_side, fshape = _relation_field_shape(rel)
+            relation_context[src].append(
+                ("out", labels[dst], bool(rel.get("temporal")), owner_side, fshape))
+            relation_context[dst].append(
+                ("in", labels[src], bool(rel.get("temporal")), owner_side, fshape))
 
         event_context: dict[str, list[tuple]] = {tid: [] for tid in type_map}
         for event in bp["event_types"]:
@@ -443,7 +556,7 @@ def structure_signature(value: dict) -> tuple:
     type_shapes = tuple(sorted(labels.values()))
     relation_shapes = tuple(sorted(
         (labels[r["from_type"]], labels[r["to_type"]], bool(r.get("temporal")),
-         fields.get(r["from_type"], {}).get(r.get("field"), ("unknown", False, "", False, 0)))
+         *_relation_field_shape(r))
         for r in bp["relation_types"]
     ))
 

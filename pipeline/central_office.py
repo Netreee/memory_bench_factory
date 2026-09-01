@@ -57,6 +57,34 @@ def _g(d, *keys, default=None):
     return cur if cur not in ({}, None) else default
 
 
+_OBSERVE_UNSPECIFIED = {
+    "", "-", "[]", "无", "可省", "不适用", "未注明", "未提供", "未观测", "未知",
+    "null", "none", "nil", "n/a", "unknown",
+}
+
+
+def _observe_unspecified(value) -> bool:
+    """判断 observe 输出是否只是“未知/可省”占位，而非可冻结的字面事实。"""
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return value.strip().lower() in _OBSERVE_UNSPECIFIED
+    if isinstance(value, (list, tuple)):
+        return not value or all(_observe_unspecified(item) for item in value)
+    if isinstance(value, dict):
+        return not value or all(_observe_unspecified(item) for item in value.values())
+    return False
+
+
+def _observed_strings(value) -> list[str]:
+    """清洗 observe 的字符串数组，丢弃空值/占位符/畸形元素并保持顺序去重。"""
+    if not isinstance(value, list):
+        return []
+    clean = [item.strip() for item in value
+             if isinstance(item, str) and not _observe_unspecified(item)]
+    return list(dict.fromkeys(clean))
+
+
 def _observed_blueprint_issues(blueprint: dict, observed: dict) -> list[str]:
     """检查蓝图是否完整且原样承接 few-shot 的字面字段硬事实。"""
     fields_by_name = {}
@@ -64,17 +92,31 @@ def _observed_blueprint_issues(blueprint: dict, observed: dict) -> list[str]:
         for field in entity_type.get("fields") or []:
             fields_by_name.setdefault(field.get("name"), field)
     issues = []
-    for field in observed.get("observed_fields") or []:
-        name = field.get("name")
-        declared = fields_by_name.get(name)
-        if name and declared is None:
-            issues.append(f"未覆盖 few-shot 已观测字段:{name}")
+    raw_fields = observed.get("observed_fields") if isinstance(observed, dict) else None
+    if _observe_unspecified(raw_fields):
+        raw_fields = []
+    elif not isinstance(raw_fields, list):
+        return ["observe.observed_fields 必须是 array"]
+    for index, field in enumerate(raw_fields):
+        if _observe_unspecified(field):
             continue
+        if not isinstance(field, dict):
+            issues.append(f"observe.observed_fields[{index}] 必须是 object")
+            continue
+        name = field.get("name")
+        if _observe_unspecified(name):
+            continue
+        if not isinstance(name, str):
+            issues.append(f"observe.observed_fields[{index}].name 必须是字符串")
+            continue
+        declared = fields_by_name.get(name)
         if declared is None:
+            issues.append(f"未覆盖 few-shot 已观测字段:{name}")
             continue
         for attr in ("kind", "unit", "monotonic", "range"):
             value = field.get(attr)
-            if value is not None and value != declared.get(attr):
+            # observe 模型常把可选值输出成占位符；未知不是硬约束，半空值仍须 fail-closed。
+            if not _observe_unspecified(value) and value != declared.get(attr):
                 issues.append(
                     f"改写 few-shot 硬事实:{name}.{attr} observed={value!r},blueprint={declared.get(attr)!r}")
     return issues
@@ -95,7 +137,8 @@ def _assemble_whitepaper(views: dict, desc: str) -> dict:
     type_specs = blueprint["entity_types"]
     primary = next(t for t in type_specs if t.get("primary"))
 
-    obs_ents = obs.get("observed_entities") or []
+    obs_ents = _observed_strings(obs.get("observed_entities"))
+    observed_media = _observed_strings(obs.get("observed_media"))
     # blueprint 是字段/主体单一真源；observe 仅留 provenance，不再决定世界拓扑。
     entity_noun = primary["noun"]
     fields_by_name = {}
@@ -122,11 +165,14 @@ def _assemble_whitepaper(views: dict, desc: str) -> dict:
             preference_axis["entity_type"] = owner
     blueprint["evidence_channels"] = list(dict.fromkeys(
         [x for x in blueprint.get("evidence_channels", []) if isinstance(x, str)]
-        + [x for x in (obs.get("observed_media") or []) if isinstance(x, str)]))
+        + observed_media))
     evidence = [x for x in blueprint.get("evidence_channels", []) if isinstance(x, str)]
-    genres = list(dict.fromkeys((obs.get("observed_media") or []) +
+    genres = list(dict.fromkeys(observed_media +
                                 (med.get("recommended_mix") or []) + evidence)) or ["记录"]
-    stopped = obs.get("stopped_phrase_seen") or "停止/失效"
+    observed_stopped = obs.get("stopped_phrase_seen")
+    stopped = (observed_stopped.strip()
+               if isinstance(observed_stopped, str) and not _observe_unspecified(observed_stopped)
+               else "停止/失效")
 
     # 旧 schema 的关系镜像从可执行蓝图派生，不能再由 skeptic 的 prose 充当死元数据。
     relations = [{"type": r["id"], "from": r["from_type"], "to": r["to_type"],
@@ -268,16 +314,22 @@ def central_office(desc, few_shot, tracer, log=print) -> dict:
     world_ask = ("综合下面的议会前置材料，先设计领域世界骨架。observe 是 few-shot 硬事实，不得改写；"
                  "skeptic 只作带置信度的候选，需自行裁决；medium 用来校准证据生态。\n"
                  + json.dumps({k: views.get(k) for k in ("observe", "skeptic", "medium")}, ensure_ascii=False))
-    # 架构师输出先过机械硬门；只把明确错误逐条回喂，最多三轮，不由代码猜测字段归属或偷偷降级。
+    # 架构师输出先过机械硬门；把明确错误与完整 observe 冻结清单共同回喂，避免修一处忘一处。
     world_out: dict = {}
     world_error = ""
-    for world_attempt in range(1, 5):
+    observed_contract = json.dumps(
+        {"observed_fields": (views.get("observe") or {}).get("observed_fields") or [],
+         "observed_media": (views.get("observe") or {}).get("observed_media") or []},
+        ensure_ascii=False,
+    )
+    for world_attempt in range(1, 7):
         first_pass = world_attempt == 1
         system = WORLD_SYS if first_pass else WORLD_REPAIR_SYS
         user = (render("council.view_user", desc=desc, fs=fs, ask=world_ask)
                 if first_pass else render(
                     "council.world_repair_user", errors=world_error,
-                    candidate=json.dumps(world_out, ensure_ascii=False)))
+                    candidate=json.dumps(world_out, ensure_ascii=False))
+                    + f"\n【每轮都必须完整保留的 observe 冻结清单】\n{observed_contract}")
         candidate = tracer.chat_json("council.world" if first_pass else "council.world_repair",
             [{"role": "system", "content": system}, {"role": "user", "content": user}],
             temperature=0.5 if world_attempt == 1 else 0.2, max_tokens=8192)
@@ -296,14 +348,14 @@ def central_office(desc, few_shot, tracer, log=print) -> dict:
         log(f"    议会·world ✓(综合前置材料;第{world_attempt}轮)")
         break
     else:
-        raise WorldBlueprintError("world 架构师四轮后仍未通过机械/观察校验:" + world_error)
+        raise WorldBlueprintError("world 架构师六轮后仍未通过机械/观察校验:" + world_error)
     # world 是能力映射的前置条件：先机械验骨架，再让 map 只判断哪些能力天然可读。
     views["world"] = {"world_blueprint": deepcopy(blueprint)}
     world_draft = deepcopy(views["world"])
     review_record: dict = {}
     review_candidate = blueprint
     review_error = "反方未返回结果"
-    for review_attempt in range(1, 4):
+    for review_attempt in range(1, 6):
         review = tracer.chat_json("council.world_review",
             [{"role": "system", "content": WORLD_REVIEW_SYS},
              {"role": "user", "content": render(
@@ -315,6 +367,7 @@ def central_office(desc, few_shot, tracer, log=print) -> dict:
         review_record = (deepcopy(review.get("review"))
                          if isinstance(review, dict) and isinstance(review.get("review"), dict) else {})
         review_problems: list[str] = []
+        schema_repaired = False
         try:
             reviewed_blueprint = normalize_world_blueprint(review if isinstance(review, dict) else {})
         except WorldBlueprintError as error:
@@ -333,9 +386,13 @@ def central_office(desc, few_shot, tracer, log=print) -> dict:
                 review_problems.append(f"blueprint 修理后仍未通过机械校验:{repair_error}")
             else:
                 review_record["schema_repaired"] = True
+                schema_repaired = True
         if reviewed_blueprint is not None:
             review_problems.extend(
                 _observed_blueprint_issues(reviewed_blueprint, views.get("observe") or {}))
+        if schema_repaired:
+            # 修理员只保证 JSON 契约；其输出必须在下一轮重新接受领域/换皮评审。
+            review_problems.append("schema 修理后的 blueprint 必须重新经过反方评审")
         risk = str(review_record.get("reskin_risk") or "").strip().lower()
         if risk != "low":
             review_problems.append(f"修订后 residual reskin_risk 必须为 low，当前={risk or 'missing'}")
@@ -354,7 +411,7 @@ def central_office(desc, few_shot, tracer, log=print) -> dict:
         review_error = "; ".join(review_problems)
         log(f"    议会·world_review 第{review_attempt}轮未批准:{review_error}")
     else:
-        raise WorldBlueprintError("world_review 三轮后仍未批准，停止能力映射:" + review_error)
+        raise WorldBlueprintError("world_review 五轮后仍未批准，停止能力映射:" + review_error)
     views["world_review"] = review_record
     views["world_draft"] = world_draft
     map_ask = ("基于下面这份【已经冻结并通过机械校验的 world_blueprint】做能力映射。"

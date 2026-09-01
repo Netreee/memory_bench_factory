@@ -2,7 +2,7 @@
 增量重渲(closed_loop §10.1)离线自检 —— 锁住 build_world augment + render_corpus delta 的【无 LLM 路径】。
 有 LLM 的部分(augment 真生成新实体 / delta 真渲新实体)靠端到端跑 + 盲审验(no-mock,不在此造假 tracer)。
 这里只证:① 不需新实体时 augment 零 LLM 调用 + 旧世界不动;② delta 遇无事实实体早退、旧 docs 原样;
-③ 全量路径未被破坏;④ 新关系/事件触及的旧实体只补精确 session。
+③ 全量路径未被破坏;④ 新关系/事件按字段 owner 触及的旧实体只补精确 session。
 
 跑:./venv/bin/python tests/incremental_render_selftest.py
 """
@@ -69,13 +69,29 @@ ck("delta:done 全满仍遍历所有周(有事实实体确被尝试渲染,证明
 
 # ── ④ typed 结构增量范围:新实体全程，旧实体只补关系/事件实际改变的 session ──
 ws3 = _ws(4, 6)
+ws3.entity_types = {"E0部": "source", "E1部": "source", "E2部": "target", "E3部": "source"}
+ws3.world_blueprint = {
+    "entity_types": [
+        {"id": "source", "fields": [{"name": "source_ref"}]},
+        {"id": "target", "fields": [{"name": "target_ref"}]},
+        # 与关系无关的第三类型故意同名；owner 必须只在 relation 两端局部推断。
+        {"id": "observer", "fields": [{"name": "target_ref"}]},
+    ],
+    "relation_types": [
+        {"id": "source_owned", "from_type": "source", "to_type": "target", "field": "source_ref"},
+        {"id": "target_owned", "from_type": "source", "to_type": "target", "field": "target_ref"},
+        {"id": "self_owned", "from_type": "source", "to_type": "source", "field": "source_ref"},
+    ],
+}
 ws3.relations = [
     # 已渲过的旧关系不能再次进入 delta。
-    {"id": "rel-old", "type": "equips", "from": "E0部", "to": "E2部", "session": 1},
+    {"id": "rel-old", "type": "source_owned", "from": "E0部", "to": "E2部", "session": 1},
     # 新关系改变旧 source 的 FK，只需补 E1部@4。
-    {"id": "rel-new-old-source", "type": "equips", "from": "E1部", "to": "E3部", "session": 4},
-    # 新 source E3部本就全程重渲，不应再产生冗余的精准 pair。
-    {"id": "rel-new-new-source", "type": "equips", "from": "E3部", "to": "E0部", "session": 2},
+    {"id": "rel-new-old-source", "type": "source_owned", "from": "E1部", "to": "E2部", "session": 4},
+    # 字段唯一归属 target：即使 source E3部是新实体，也必须补真正被写 Timeline 的旧 E2部@2。
+    {"id": "rel-new-new-source", "type": "target_owned", "from": "E3部", "to": "E2部", "session": 2},
+    # self-relation 两端同型时固定由 source 持有字段，只补 E1部@2，不能误补 E0部@2。
+    {"id": "rel-new-self", "type": "self_owned", "from": "E1部", "to": "E0部", "session": 2},
 ]
 ws3.events = [
     # 已渲过的旧事件不能再次进入 delta。
@@ -100,7 +116,11 @@ new_entities, touched_pairs = _render_delta_scope(
 )
 ck("delta scope:只识别真正新增实体并保持确定排序", new_entities == ["E3部"])
 ck("delta scope:关系/事件触及的旧实体精确到 session、去重且不带旧结构",
-   touched_pairs == [["E0部", 3], ["E1部", 4], ["E2部", 5]])
+   touched_pairs == [["E0部", 3], ["E1部", 2], ["E1部", 4], ["E2部", 2], ["E2部", 5]])
+ck("delta scope:异型关系按字段唯一归属补 target owner", ["E2部", 2] in touched_pairs)
+ck("delta scope:无关第三类型同名字段不干扰 relation owner", ["E2部", 2] in touched_pairs)
+ck("delta scope:self-relation 固定补 source owner",
+   ["E1部", 2] in touched_pairs and ["E0部", 2] not in touched_pairs)
 ck("delta scope:新实体不重复进入 old-entity 精准 pair",
    all(pair[0] != "E3部" for pair in touched_pairs))
 
