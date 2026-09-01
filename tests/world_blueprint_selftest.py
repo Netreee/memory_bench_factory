@@ -1,0 +1,763 @@
+"""WorldBlueprint v1 离线自检。
+
+锁住四件事：
+1. Game / Office 的白皮书在结构签名上确实不同，而不只是换名词；
+2. 旧白皮书可以规范化为单类型 blueprint；显式但非法的 blueprint 必须 fail-closed；
+3. world_gen 真正消费实体类型、关系、事件与时间节律，并把关系/事件编译进真值世界；
+4. 类型与事件元数据可以随 WorldState 落盘、回读。
+
+运行：./venv/bin/python tests/world_blueprint_selftest.py
+"""
+from __future__ import annotations
+
+import json
+import sys
+from copy import deepcopy
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from pipeline.world_blueprint import (
+    normalize_world_blueprint,
+    structure_signature,
+    validate_world_blueprint,
+)
+from pipeline.central_office import _assemble_whitepaper, central_office
+from pipeline.lines import prepare_lines
+from pipeline.lines.L2_relational import RelationalLine
+from pipeline.lines.L4_preference import PreferenceLine
+from pipeline.prompts import render as render_prompt
+from pipeline.render import _corpus_system, _missing_event_narratives, _session_facts
+from pipeline.world_gen import build_world
+from pipeline.world_state import WorldState, assemble_world, _date_of
+
+
+checks: list[tuple[bool, str]] = []
+
+
+def ck(name: str, cond) -> None:
+    checks.append((bool(cond), name))
+
+
+def _game_whitepaper() -> dict:
+    return {
+        "domain_profile": {"entity_noun": "游戏对象", "field_schema": []},
+        "shared_world_spec": {"entities": {"count": 10}, "timeline": {"n_sessions": 8}},
+        "world_blueprint": {
+            "entity_types": [
+                {"id": "player", "noun": "玩家", "count": 1, "primary": True,
+                 "fields": [{"name": "level", "kind": "numeric", "monotonic": "up"},
+                            {"name": "equipped_item", "kind": "reference"},
+                            {"name": "active_quest", "kind": "reference"}]},
+                {"id": "boss", "noun": "Boss", "count": 2,
+                 "fields": [{"name": "defeat_status", "kind": "status"},
+                            {"name": "drop_item", "kind": "reference"}]},
+                {"id": "equipment", "noun": "装备", "count": 4,
+                 "fields": [{"name": "enhance_level", "kind": "numeric"}]},
+                {"id": "quest", "noun": "任务", "count": 3,
+                 "fields": [{"name": "quest_status", "kind": "status"},
+                            {"name": "target_boss", "kind": "reference"}]},
+            ],
+            "relation_types": [
+                {"id": "equips", "from_type": "player", "to_type": "equipment",
+                 "field": "equipped_item", "temporal": True, "min_count": 1},
+                {"id": "attempts", "from_type": "player", "to_type": "quest",
+                 "field": "active_quest", "temporal": True, "min_count": 1},
+                {"id": "targets", "from_type": "quest", "to_type": "boss",
+                 "field": "target_boss", "temporal": False, "min_count": 1},
+                {"id": "drops", "from_type": "boss", "to_type": "equipment",
+                 "field": "drop_item", "temporal": False, "min_count": 1},
+            ],
+            "event_types": [
+                {"id": "defeat_boss", "label": "击败首领", "roles": {"actor": "player", "target": "boss"},
+                 "effect_fields": [{"role": "target", "field": "defeat_status"}], "min_count": 1},
+                {"id": "acquire_item", "label": "获得装备", "roles": {"owner": "player", "item": "equipment"},
+                 "effect_fields": [{"role": "owner", "field": "equipped_item"}], "min_count": 1},
+                {"id": "complete_quest", "label": "完成任务", "roles": {"actor": "player", "quest": "quest"},
+                 "effect_fields": [{"role": "quest", "field": "quest_status"}], "min_count": 1},
+            ],
+            "causal_rules": [
+                {"id": "loot_after_defeat", "trigger_event": "defeat_boss",
+                 "effect_event": "acquire_item", "delay_sessions": 0},
+                {"id": "quest_after_loot", "trigger_event": "acquire_item",
+                 "effect_event": "complete_quest", "delay_sessions": 1},
+            ],
+            "temporal_model": {"unit": "chapter", "n_sessions": 8, "cadence": "per_chapter", "step_days": 7},
+            "evidence_channels": ["任务日志", "战利品记录"],
+        },
+    }
+
+
+def _office_whitepaper() -> dict:
+    return {
+        "domain_profile": {"entity_noun": "办公对象", "field_schema": []},
+        "shared_world_spec": {"entities": {"count": 15}, "timeline": {"n_sessions": 12}},
+        "world_blueprint": {
+            "entity_types": [
+                {"id": "employee", "noun": "员工", "count": 5, "primary": True,
+                 "fields": [{"name": "employment_status", "kind": "status"},
+                            {"name": "employee_department", "kind": "reference"},
+                            {"name": "owned_project", "kind": "reference"}]},
+                {"id": "department", "noun": "部门", "count": 2,
+                 "fields": [{"name": "budget_owner", "kind": "person"},
+                            {"name": "budget", "kind": "reference"}]},
+                {"id": "project", "noun": "项目", "count": 3,
+                 "fields": [{"name": "project_status", "kind": "status"},
+                            {"name": "owner", "kind": "reference"},
+                            {"name": "milestone", "kind": "reference"},
+                            {"name": "project_department", "kind": "reference"}]},
+                {"id": "milestone", "noun": "里程碑", "count": 3,
+                 "fields": [{"name": "milestone_status", "kind": "status"}]},
+                {"id": "budget", "noun": "预算", "count": 2,
+                 "fields": [{"name": "approved_amount", "kind": "numeric", "unit": "万元"}]},
+            ],
+            "relation_types": [
+                {"id": "member_of", "from_type": "employee", "to_type": "department",
+                 "field": "employee_department", "temporal": True, "min_count": 1},
+                {"id": "owns", "from_type": "employee", "to_type": "project",
+                 "field": "owned_project", "temporal": True, "min_count": 1},
+                {"id": "has_milestone", "from_type": "project", "to_type": "milestone",
+                 "field": "milestone", "temporal": False, "min_count": 1},
+                {"id": "controls_budget", "from_type": "department", "to_type": "budget",
+                 "field": "budget", "temporal": True, "min_count": 1},
+                {"id": "belongs_to", "from_type": "project", "to_type": "department",
+                 "field": "project_department", "temporal": True, "min_count": 1},
+            ],
+            "event_types": [
+                {"id": "employee_transfer", "label": "员工调动", "roles": {"employee": "employee", "to": "department"},
+                 "effect_fields": [{"role": "employee", "field": "employee_department"}], "min_count": 1},
+                {"id": "budget_revision", "label": "预算修订", "roles": {"budget": "budget"},
+                 "effect_fields": [{"role": "budget", "field": "approved_amount"}], "min_count": 1},
+                {"id": "milestone_complete", "label": "里程碑完成", "roles": {"milestone": "milestone"},
+                 "effect_fields": [{"role": "milestone", "field": "milestone_status"}], "min_count": 1},
+                {"id": "project_delay", "label": "项目延期", "roles": {"project": "project"},
+                 "effect_fields": [{"role": "project", "field": "project_status"}], "min_count": 1},
+            ],
+            "causal_rules": [
+                {"id": "budget_causes_delay", "trigger_event": "budget_revision",
+                 "effect_event": "project_delay", "delay_sessions": 1},
+            ],
+            "temporal_model": {"unit": "business_day", "n_sessions": 12, "cadence": "event_driven", "step_days": 1},
+            "evidence_channels": ["人事通知", "预算审批单", "项目周报"],
+        },
+    }
+
+
+def _rename_vocabulary(wp: dict) -> dict:
+    """一致改名所有领域词；结构签名必须保持不变。"""
+    out = deepcopy(wp)
+    bp = out["world_blueprint"]
+    type_ids = {t["id"]: f"type_{i}" for i, t in enumerate(bp["entity_types"])}
+    event_ids = {e["id"]: f"event_{i}" for i, e in enumerate(bp["event_types"])}
+    field_ids: dict[tuple[str, str], str] = {}
+    for i, t in enumerate(bp["entity_types"]):
+        old_type = t["id"]
+        t["id"], t["noun"] = type_ids[old_type], f"noun_{i}"
+        for j, field in enumerate(t["fields"]):
+            old_field = field["name"]
+            field["name"] = f"field_{i}_{j}"
+            field_ids[(old_type, old_field)] = field["name"]
+    for i, rel in enumerate(bp["relation_types"]):
+        old_source = rel["from_type"]
+        rel["id"] = f"relation_{i}"
+        rel["from_type"], rel["to_type"] = type_ids[old_source], type_ids[rel["to_type"]]
+        rel["field"] = field_ids[(old_source, rel["field"])]
+    for event in bp["event_types"]:
+        old_event = event["id"]
+        old_roles = dict(event["roles"])
+        event["id"] = event_ids[old_event]
+        event["roles"] = {role: type_ids[tid] for role, tid in old_roles.items()}
+        for effect in event["effect_fields"]:
+            owner = old_roles[effect["role"]]
+            effect["field"] = field_ids[(owner, effect["field"])]
+    for i, rule in enumerate(bp["causal_rules"]):
+        rule["id"] = f"causal_{i}"
+        rule["trigger_event"] = event_ids[rule["trigger_event"]]
+        rule["effect_event"] = event_ids[rule["effect_event"]]
+    return out
+
+
+def _views_with_blueprint(wp: dict) -> dict:
+    """给代码综合器一个最小但完整的七视角结果；不调用网络。"""
+    return {
+        "observe": {"main_entity_noun": "不应成为真源", "observed_media": ["样例记录"],
+                    "observed_entities": ["扁平旧主体"], "observed_fields": []},
+        "skeptic": {},
+        "map": {"per_line": [{"line": "L1_timeline", "applicable": True,
+                                "instantiation": "按蓝图时间演化", "weight_hint": 0.5}]},
+        "medium": {"recommended_mix": ["领域记录"]},
+        "style": {"style_spec": {"tone": "客观"}},
+        "traps": {"traps": []},
+        "world": {"world_blueprint": deepcopy(wp["world_blueprint"])},
+    }
+
+
+# ════════ ① 白皮书结构差异：不是名词换皮 ════════
+game = normalize_world_blueprint(_game_whitepaper())
+office = normalize_world_blueprint(_office_whitepaper())
+ck("① Game blueprint 合法", validate_world_blueprint(game) == [])
+ck("① Office blueprint 合法", validate_world_blueprint(office) == [])
+ck("① 一致改名所有领域词不改变结构签名",
+   structure_signature(game) == structure_signature(_rename_vocabulary(_game_whitepaper())))
+reordered_game = _game_whitepaper()
+for key in ("entity_types", "relation_types", "event_types", "causal_rules"):
+    reordered_game["world_blueprint"][key] = list(reversed(reordered_game["world_blueprint"][key]))
+ck("① 声明数组顺序不改变结构签名",
+   structure_signature(game) == structure_signature(reordered_game))
+scaled_game = _game_whitepaper()
+for index, entity_type in enumerate(scaled_game["world_blueprint"]["entity_types"]):
+    entity_type["count"] += 10 + index
+scaled_game["world_blueprint"]["temporal_model"]["n_sessions"] = 80
+for declaration in (scaled_game["world_blueprint"]["relation_types"]
+                    + scaled_game["world_blueprint"]["event_types"]):
+    declaration["min_count"] += 7
+ck("① 规模旋钮不改变世界骨架签名",
+   structure_signature(game) == structure_signature(scaled_game))
+ck("① Game / Office 核心本体·拓扑·动力学签名不同",
+   structure_signature(game)[:4] != structure_signature(office)[:4])
+ck("① 实体类型集合不同", {x["id"] for x in game["entity_types"]}.isdisjoint(
+    {x["id"] for x in office["entity_types"]}))
+ck("① 事件类型集合不同", {x["id"] for x in game["event_types"]}.isdisjoint(
+    {x["id"] for x in office["event_types"]}))
+ck("① 时间骨架不同", game["temporal_model"]["unit"] != office["temporal_model"]["unit"]
+   and game["temporal_model"]["cadence"] != office["temporal_model"]["cadence"])
+
+game_draft = _assemble_whitepaper(_views_with_blueprint(_game_whitepaper()), "游戏")
+office_draft = _assemble_whitepaper(_views_with_blueprint(_office_whitepaper()), "办公")
+ck("① 白皮书综合器保留 Game / Office 结构差异",
+   structure_signature(game_draft) != structure_signature(office_draft))
+ck("① blueprint primary 决定主体，不再由扁平 observe 决定",
+   game_draft["domain_profile"]["entity_noun"] == "玩家"
+   and office_draft["domain_profile"]["entity_noun"] == "员工")
+ck("① blueprint 决定实体总数与时间制度",
+   game_draft["shared_world_spec"]["entities"]["count"] == 10
+   and game_draft["shared_world_spec"]["timeline"]["n_sessions"] == 8
+   and game_draft["medium"]["cadence"] == "per_chapter")
+missing_field_views = _views_with_blueprint(_game_whitepaper())
+missing_field_views["observe"]["observed_fields"] = [{"name": "few-shot明确字段", "kind": "status"}]
+try:
+    _assemble_whitepaper(missing_field_views, "游戏")
+    missing_field_rejected = False
+except ValueError:
+    missing_field_rejected = True
+ck("① blueprint 漏掉 few-shot 已观测字段时白皮书 fail-closed", missing_field_rejected)
+wrong_shape_views = _views_with_blueprint(_game_whitepaper())
+wrong_shape_views["observe"]["observed_fields"] = [{"name": "level", "kind": "numeric", "unit": "级"}]
+try:
+    _assemble_whitepaper(wrong_shape_views, "游戏")
+    wrong_shape_rejected = False
+except ValueError:
+    wrong_shape_rejected = True
+ck("① blueprint 不得只同名覆盖、却改写 few-shot 的 kind/unit/range", wrong_shape_rejected)
+
+
+# ════════ ② normalize + fail-closed ════════
+legacy_wp = {
+    "domain_profile": {"entity_noun": "案件", "field_schema": [{"name": "状态", "kind": "status"}]},
+    "shared_world_spec": {"entities": {"count": 7}, "timeline": {"n_sessions": 9}},
+    "medium": {"cadence": "weekly"},
+}
+legacy = normalize_world_blueprint(legacy_wp)
+ck("② 旧白皮书规范化为单一实体类型", len(legacy["entity_types"]) == 1)
+ck("② legacy 保留实体数和字段", legacy["entity_types"][0]["count"] == 7
+   and legacy["entity_types"][0]["fields"][0]["name"] == "状态")
+ck("② legacy 保留 session 与 cadence", legacy["temporal_model"]["n_sessions"] == 9
+   and legacy["temporal_model"]["cadence"] == "weekly")
+ck("② legacy 补齐可选结构", legacy["relation_types"] == [] and legacy["event_types"] == []
+   and legacy["causal_rules"] == [])
+
+
+def _must_reject(name: str, blueprint: dict) -> None:
+    rejected = False
+    try:
+        normalize_world_blueprint({"world_blueprint": blueprint})
+    except (TypeError, ValueError):
+        rejected = True
+    ck(name, rejected)
+
+
+_must_reject("② 显式空 blueprint 不准静默降级 legacy", {})
+_must_reject("② 重复 entity type id fail-closed", {
+    "entity_types": [
+        {"id": "x", "noun": "甲", "count": 1, "primary": True, "fields": []},
+        {"id": "x", "noun": "乙", "count": 1, "fields": []},
+    ],
+    "relation_types": [], "event_types": [], "causal_rules": [],
+    "temporal_model": {"unit": "week", "n_sessions": 4, "cadence": "weekly", "step_days": 7},
+})
+_must_reject("② 关系端点引用不存在类型 fail-closed", {
+    "entity_types": [{"id": "x", "noun": "甲", "count": 1, "primary": True, "fields": []}],
+    "relation_types": [{"id": "bad", "from_type": "x", "to_type": "ghost",
+                        "field": "link", "temporal": True, "min_count": 1}],
+    "event_types": [], "causal_rules": [],
+    "temporal_model": {"unit": "week", "n_sessions": 4, "cadence": "weekly"},
+})
+
+same_field_bp = {
+    "entity_types": [
+        {"id": "a", "noun": "甲", "count": 1, "primary": True,
+         "fields": [{"name": "状态", "kind": "status"}, {"name": "关联乙", "kind": "reference"}]},
+        {"id": "b", "noun": "乙", "count": 1,
+         "fields": [{"name": "状态", "kind": "status"}]},
+    ],
+    "relation_types": [{"id": "links", "from_type": "a", "to_type": "b",
+                         "field": "关联乙", "temporal": False, "min_count": 1}],
+    "event_types": [{"id": "changes", "label": "状态变更", "roles": {"subject": "b"},
+                     "effect_fields": [{"role": "subject", "field": "状态"}], "min_count": 1}],
+    "causal_rules": [], "evidence_channels": ["记录"],
+    "temporal_model": {"unit": "week", "n_sessions": 4, "cadence": "weekly", "step_days": 7},
+}
+ck("② 跨类型同名字段约束一致则允许", validate_world_blueprint(
+    normalize_world_blueprint(same_field_bp)) == [])
+conflicting_field_bp = deepcopy(same_field_bp)
+conflicting_field_bp["entity_types"][1]["fields"][0]["kind"] = "numeric"
+_must_reject("② 跨类型同名字段约束冲突 fail-closed", conflicting_field_bp)
+string_boolean_bp = deepcopy(same_field_bp)
+string_boolean_bp["entity_types"][0]["primary"] = "false"
+string_boolean_bp["relation_types"][0]["temporal"] = "false"
+_must_reject("② 显式 blueprint 不把字符串 false 强转为 true", string_boolean_bp)
+negative_count_bp = deepcopy(same_field_bp)
+negative_count_bp["relation_types"][0]["min_count"] = -3
+_must_reject("② 显式 blueprint 不把负 min_count 钳成合法值", negative_count_bp)
+decorative_structure_bp = deepcopy(same_field_bp)
+decorative_structure_bp["relation_types"][0]["min_count"] = 0
+decorative_structure_bp["event_types"][0]["min_count"] = 0
+_must_reject("② 关系与事件不能只声明类型却全部零实例", decorative_structure_bp)
+string_range_bp = deepcopy(same_field_bp)
+for entity_type in string_range_bp["entity_types"]:
+    entity_type["fields"][0] = {"name": "状态", "kind": "numeric", "range": ["0", "10"]}
+_must_reject("② range 端点必须是真 JSON 数字，不宽容修复数字字符串", string_range_bp)
+prose_invariant_bp = deepcopy(same_field_bp)
+prose_invariant_bp["invariants"] = ["状态变化必须合理"]
+_must_reject("② 不可执行 prose invariant 不得伪装成已执行契约", prose_invariant_bp)
+
+
+# ════════ ③ world_gen 真消费 typed entities / relations / events / cadence ════════
+build_wp = {
+    "domain_profile": {"entity_noun": "游戏对象", "field_schema": []},
+    "shared_world_spec": {"entities": {"count": 99}, "timeline": {"n_sessions": 99}},
+    "world_blueprint": {
+        "entity_types": [
+            {"id": "player", "noun": "玩家", "count": 1, "primary": True,
+             "fields": [{"name": "level", "kind": "numeric"},
+                        {"name": "equipped_item", "kind": "reference"},
+                        {"name": "loot_state", "kind": "status"}]},
+            {"id": "boss", "noun": "Boss", "count": 1,
+             "fields": [{"name": "defeat_status", "kind": "status"}]},
+            {"id": "equipment", "noun": "装备", "count": 1,
+             "fields": [{"name": "enhance_level", "kind": "numeric"}]},
+        ],
+        "relation_types": [
+            {"id": "equips", "from_type": "player", "to_type": "equipment",
+             "field": "equipped_item", "temporal": True, "min_count": 1},
+        ],
+        "event_types": [
+            {"id": "defeat_boss", "label": "击败首领", "roles": {"actor": "player", "target": "boss"},
+             "effect_fields": [{"role": "target", "field": "defeat_status"}], "min_count": 1},
+            {"id": "acquire_loot", "label": "获得战利品", "roles": {"owner": "player"},
+             "effect_fields": [{"role": "owner", "field": "loot_state"}], "min_count": 1},
+        ],
+        "causal_rules": [
+            {"id": "defeat_yields_loot", "trigger_event": "defeat_boss",
+             "effect_event": "acquire_loot", "delay_sessions": 1},
+        ],
+        "temporal_model": {"unit": "chapter", "n_sessions": 4, "cadence": "per_chapter", "step_days": 3},
+        "evidence_channels": ["战斗日志"],
+    },
+}
+
+
+def _typed_table() -> dict:
+    """给 assemble/build 两条路径共用的最小类型化实例表。"""
+    return {
+        "entities": [
+            {"name": "旅者", "type": "player", "fields": {
+                "level": {"type": "stable", "value": "9"},
+            }},
+            {"name": "熔岩巨兽", "type": "boss", "fields": {
+                "defeat_status": {"type": "stable", "value": "alive"},
+            }},
+            {"name": "星铁剑", "type": "equipment", "fields": {
+                "enhance_level": {"type": "stable", "value": "2"},
+            }},
+        ],
+        "relations": [
+            {"id": "rel-1", "type": "equips", "from": "旅者", "to": "星铁剑", "session": 1},
+        ],
+        "events": [
+            {"id": "evt-1", "type": "defeat_boss", "session": 2,
+             "participants": {"actor": "旅者", "target": "熔岩巨兽"},
+             "effects": [{"entity": "熔岩巨兽", "field": "defeat_status", "set": "defeated"}]},
+            {"id": "evt-2", "type": "acquire_loot", "session": 3, "caused_by": "evt-1",
+             "participants": {"owner": "旅者"},
+             "effects": [{"entity": "旅者", "field": "loot_state", "set": "acquired"}]},
+        ],
+        "cascades": [],
+        "absent_fields": [],
+    }
+
+
+# 先直接锁住编译器；这样即使 build_world 的 prompt 路由变了，也不会把核心语义测成假绿。
+build_bp = normalize_world_blueprint(build_wp)
+compiled, compile_issues = assemble_world(_typed_table(), blueprint=build_bp)
+ck("③ assemble 类型化实例零缺陷", compile_issues == [])
+ck("③ assemble 保存 entity type", compiled.entity_types == {
+    "旅者": "player", "熔岩巨兽": "boss", "星铁剑": "equipment"})
+ck("③ assemble 保存 relation / event 实例", len(compiled.relations) == 1 and len(compiled.events) == 2)
+ck("③ assemble relation 编译进 source timeline", compiled.timeline("旅者", "equipped_item") is not None
+   and compiled.timeline("旅者", "equipped_item").value_at_session(1) == "星铁剑")
+ck("③ assemble event effect 编译进 target timeline", compiled.timeline("熔岩巨兽", "defeat_status") is not None
+   and compiled.timeline("熔岩巨兽", "defeat_status").value_at_session(2) == "defeated")
+ck("③ caused_by 事件对编译为可追溯 cascade", any(
+    c.get("kind") == "domain_event_causality" and c.get("rule_id") == "defeat_yields_loot"
+    for c in compiled.cascades))
+ck("③ assemble 使用 blueprint n_sessions", compiled.n_sessions == 4)
+ck("③ 非 weekly 时间制度按 step_days 生成 canonical 日期",
+   compiled.timeline("熔岩巨兽", "defeat_status").ops[-1].date == _date_of(2, step_days=3))
+
+unwitnessed_table = _typed_table()
+unwitnessed_table["entities"][1]["fields"]["defeat_status"] = {
+    "type": "evolving", "trajectory": [
+        {"session": 0, "value": "alive"}, {"session": 1, "value": "wounded"},
+    ]}
+_unwitnessed_ws, unwitnessed_issues = assemble_world(unwitnessed_table, blueprint=build_bp)
+ck("③ event-owned 字段的独立变化必须有领域事件见证",
+   any("没有 relation/event 见证" in issue for issue in unwitnessed_issues))
+
+numeric_bp = deepcopy(build_bp)
+boss_field = next(t for t in numeric_bp["entity_types"] if t["id"] == "boss")["fields"][0]
+boss_field.update({"kind": "numeric", "range": [0, 10]})
+numeric_table = _typed_table()
+numeric_table["entities"][1]["fields"]["defeat_status"] = {"type": "stable", "value": "1"}
+numeric_table["events"][0]["effects"][0]["set"] = "banana"
+_numeric_ws, numeric_issues = assemble_world(numeric_table, blueprint=numeric_bp)
+ck("③ numeric event effect 不可解析时 fail-closed 而非绕过 range",
+   any("numeric 字段值不可解析" in issue for issue in numeric_issues))
+
+duplicate_session_table = _typed_table()
+duplicate_session_table["entities"][0]["fields"]["level"] = {
+    "type": "evolving", "trajectory": [
+        {"session": 0, "value": "8"}, {"session": 0, "value": "9"},
+    ]}
+_duplicate_ws, duplicate_issues = assemble_world(duplicate_session_table, blueprint=build_bp)
+ck("③ 同字段同 session 重复值明确拒绝",
+   any("trajectory 同 session 重复" in issue for issue in duplicate_issues))
+
+static_bp = deepcopy(build_bp)
+static_bp["relation_types"][0]["temporal"] = False
+static_table = _typed_table()
+static_table["relations"][0]["session"] = 2
+_static_ws, static_issues = assemble_world(static_table, blueprint=static_bp)
+ck("③ temporal=false 静态关系只能从 session 0 成立",
+   any("static(temporal=false)" in issue for issue in static_issues))
+
+
+class _BlueprintTracer:
+    """返回一个最小类型化游戏世界，并记录 world_gen 实际收到的 prompt。"""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str]] = []
+
+    def chat_json(self, tag, messages, **_kw):
+        text = "\n".join(str(m.get("content", "")) for m in messages)
+        self.calls.append((tag, text))
+        if tag.startswith("world.repair"):
+            return {"fields": {}}
+        return _typed_table()
+
+
+tracer = _BlueprintTracer()
+ws = build_world(build_wp, tracer, log=lambda *_a: None)
+prompt_text = "\n".join(text for tag, text in tracer.calls if tag.startswith("world."))
+ck("③ prompt 消费全部 entity type", all(x in prompt_text for x in ("player", "boss", "equipment")))
+ck("③ prompt 消费 relation type", "equips" in prompt_text)
+ck("③ prompt 消费 event type", "defeat_boss" in prompt_text and "acquire_loot" in prompt_text)
+ck("③ prompt 消费 temporal cadence", "per_chapter" in prompt_text and "chapter" in prompt_text)
+ck("③ blueprint 的 session 数覆盖旧 shared_world_spec", ws.n_sessions == 4)
+ck("③ 每种声明类型达到 count", getattr(ws, "entity_types", {}) == {
+    "旅者": "player", "熔岩巨兽": "boss", "星铁剑": "equipment"})
+ck("③ relation 编译进 source timeline", ws.timeline("旅者", "equipped_item") is not None
+   and ws.timeline("旅者", "equipped_item").value_at_session(1) == "星铁剑")
+ck("③ event effect 编译进 target timeline", ws.timeline("熔岩巨兽", "defeat_status") is not None
+   and ws.timeline("熔岩巨兽", "defeat_status").value_at_session(2) == "defeated")
+ck("③ event 实例留存在世界真源", any(e.get("id") == "evt-1" for e in getattr(ws, "events", [])))
+
+frozen_wp = deepcopy(build_wp)
+frozen_wp["active_lines"] = [
+    {"line": "L4_preference"}, {"line": "L9_induction"}, {"line": "L10_admission"},
+]
+frozen_wp["domain_profile"]["preference_axis"] = {
+    "entity_type": "player", "field": "loot_state", "options": ["acquired", "unclaimed"]}
+before_prepare = json.dumps(ws.to_dict(), ensure_ascii=False, sort_keys=True)
+prepare_lines(frozen_wp, ws, log=lambda *_args: None)
+PreferenceLine().prepare(ws, frozen_wp["domain_profile"])
+after_prepare = json.dumps(ws.to_dict(), ensure_ascii=False, sort_keys=True)
+ck("③ typed world 在能力 prepare 阶段 canonical core 完全冻结", before_prepare == after_prepare)
+ck("③ typed world 不自动注入固定工单/敏感/工位字段",
+   not ws.rule_instances and not ws.sensitive and all("工位编号" not in fields for fields in ws.entities.values()))
+
+typed_l2_orders = RelationalLine().enumerate(compiled, wp=build_wp)
+typed_l2_intents = [RelationalLine().intent(order)[0] for order in typed_l2_orders]
+ck("③ typed L2 题面使用领域时间单位且不把任意中间对象叫成人",
+   bool(typed_l2_intents) and all("章" in text and "那个人" not in text for text in typed_l2_intents))
+
+roundtrip = WorldState.from_dict(ws.to_dict())
+ck("④ entity_types 序列化往返", getattr(roundtrip, "entity_types", {}) == getattr(ws, "entity_types", {}))
+ck("④ events 序列化往返", getattr(roundtrip, "events", []) == getattr(ws, "events", []))
+ck("④ relations / blueprint / causal cascades 序列化往返",
+   roundtrip.relations == ws.relations and roundtrip.world_blueprint == ws.world_blueprint
+   and roundtrip.cascades == ws.cascades
+   and any(c.get("kind") == "domain_event_causality" for c in roundtrip.cascades))
+rt_rel = roundtrip.timeline("旅者", "equipped_item")
+rt_event = roundtrip.timeline("熔岩巨兽", "defeat_status")
+ck("④ 关系/事件编译后的 timeline 往返", rt_rel is not None and rt_event is not None
+   and rt_rel.value_at_session(1) == "星铁剑" and rt_event.value_at_session(2) == "defeated")
+
+
+# ═══════ ⑤ typed augment 合并新旧骨架实例 ═══════
+augment_base_table = {
+    "entities": [
+        {"name": "P1", "type": "player", "fields": {
+            "level": {"type": "stable", "value": "7"},
+        }},
+        {"name": "B1", "type": "boss", "fields": {
+            "defeat_status": {"type": "stable", "value": "alive"},
+        }},
+        {"name": "G1", "type": "equipment", "fields": {
+            "enhance_level": {"type": "stable", "value": "2"},
+        }},
+    ],
+    "relations": [
+        {"id": "rel-old", "type": "equips", "from": "P1", "to": "G1", "session": 1},
+    ],
+    "events": [
+        {"id": "evt-old-defeat", "type": "defeat_boss", "session": 1,
+         "participants": {"actor": "P1", "target": "B1"},
+         "effects": [{"entity": "B1", "field": "defeat_status", "set": "defeated-old"}]},
+        {"id": "evt-old-loot", "type": "acquire_loot", "session": 2,
+         "caused_by": "evt-old-defeat", "participants": {"owner": "P1"},
+         "effects": [{"entity": "P1", "field": "loot_state", "set": "acquired-old"}]},
+    ],
+    "cascades": [],
+    "absent_fields": [],
+}
+augment_existing, augment_base_issues = assemble_world(augment_base_table, blueprint=build_bp)
+
+augment_wp = deepcopy(build_wp)
+next(t for t in augment_wp["world_blueprint"]["entity_types"]
+     if t["id"] == "player")["count"] = 2
+
+
+class _AugmentTracer:
+    """只生成缺口 P2；新关系和新事件故意跨越 delta，引用旧世界 G1/B1。"""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str]] = []
+
+    def chat_json(self, tag, messages, **_kw):
+        text = "\n".join(str(message.get("content", "")) for message in messages)
+        self.calls.append((tag, text))
+        if tag == "world.batch":
+            return {"entities": [{
+                "name": "P2", "type": "player", "fields": {
+                    "level": {"type": "stable", "value": "11"},
+                    "loot_state": {"type": "stable", "value": "unclaimed"},
+                },
+            }]}
+        if tag == "world.structure":
+            return {
+                "relations": [
+                    {"id": "rel-new", "type": "equips", "from": "P2", "to": "G1", "session": 2},
+                ],
+                "events": [
+                    {"id": "evt-new-defeat", "type": "defeat_boss", "session": 2,
+                     "participants": {"actor": "P2", "target": "B1"},
+                     "effects": [{"entity": "B1", "field": "defeat_status", "set": "defeated-new"}]},
+                    {"id": "evt-new-loot", "type": "acquire_loot", "session": 3,
+                     "caused_by": "evt-new-defeat", "participants": {"owner": "P2"},
+                     "effects": [{"entity": "P2", "field": "loot_state", "set": "acquired-new"}]},
+                ],
+            }
+        if tag.startswith("world.repair"):
+            return {"fields": {}}
+        raise AssertionError(f"未预期的 tracer 调用:{tag}")
+
+
+augment_tracer = _AugmentTracer()
+augment_result = build_world(
+    augment_wp, augment_tracer, existing=augment_existing, log=lambda *_args: None)
+augment_relation_ids = {relation.get("id") for relation in augment_result.relations}
+augment_event_ids = {event.get("id") for event in augment_result.events}
+ck("⑤ typed augment 基础世界零缺陷", augment_base_issues == [])
+ck("⑤ typed augment 保持 existing 对象身份", augment_result is augment_existing)
+ck("⑤ typed augment 只补 primary count 缺口",
+   augment_result.entity_types == {"P1": "player", "P2": "player", "B1": "boss", "G1": "equipment"}
+   and [tag for tag, _text in augment_tracer.calls].count("world.batch") == 1)
+ck("⑤ typed augment 合并新旧 relation",
+   augment_relation_ids == {"rel-old", "rel-new"}
+   and augment_result.timeline("P1", "equipped_item").value_at_session(1) == "G1"
+   and augment_result.timeline("P2", "equipped_item").value_at_session(2) == "G1")
+ck("⑤ typed augment 合并新旧 event",
+   augment_event_ids == {"evt-old-defeat", "evt-old-loot", "evt-new-defeat", "evt-new-loot"}
+   and augment_result.timeline("B1", "defeat_status").value_at_session(1) == "defeated-old"
+   and augment_result.timeline("B1", "defeat_status").value_at_session(2) == "defeated-new"
+   and augment_result.timeline("P2", "loot_state").value_at_session(3) == "acquired-new")
+ck("⑤ typed augment 结构 prompt 可引用旧 G1/B1",
+   any('"name": "G1"' in text and '"name": "B1"' in text
+       for tag, text in augment_tracer.calls if tag == "world.structure"))
+
+
+# ═══════ ⑥ render signal 不丢类型图例与当期领域事件 ═══════
+render_system = _corpus_system(build_wp["domain_profile"], compiled.world_blueprint)
+render_facts = _session_facts(compiled, 2)
+render_events = [event for event in compiled.events if event.get("session") == 2]
+render_user = render_prompt(
+    "corpus.user",
+    s="3",
+    time_unit=compiled.world_blueprint["temporal_model"]["unit"],
+    date="2025-01-15",
+    facts=json.dumps(render_facts, ensure_ascii=False),
+    events=json.dumps(render_events, ensure_ascii=False),
+    hint="",
+)
+render_signal_prompt = f"{render_system}\n{render_user}"
+ck("⑥ signal system 携带全部 entity_type 图例", all(
+    legend in render_system for legend in ("player=玩家", "boss=Boss", "equipment=装备")))
+ck("⑥ signal fact 携带实体类型而非只有扁平字段",
+   any(fact.get("entity") == "熔岩巨兽" and fact.get("entity_type") == "boss"
+       for fact in render_facts)
+   and '"entity_type": "boss"' in render_signal_prompt)
+ck("⑥ signal user 只携带当期 domain event",
+   '"id": "evt-1"' in render_user and '"type": "defeat_boss"' in render_user
+   and '"id": "evt-2"' not in render_user)
+event_for_gate = [{**render_events[0], "label": "击败首领"}]
+ck("⑥ 只写 effect 字段值、漏掉参与者关系时事件忠实闸拒绝",
+   bool(_missing_event_narratives(event_for_gate, ["熔岩巨兽的 defeat_status 变成 defeated。"])))
+ck("⑥ event label 与全部 participants 同篇出现才通过事件忠实闸",
+   _missing_event_narratives(event_for_gate, ["旅者在交锋中完成击败首领，熔岩巨兽随即倒下。"] ) == [])
+
+
+# ═══════ ⑦ central_office 先冻结世界，再映射能力 ═══════
+architect_blueprint = deepcopy(_game_whitepaper()["world_blueprint"])
+architect_blueprint["evidence_channels"] = ["architect-draft-channel"]
+reviewed_blueprint = deepcopy(architect_blueprint)
+reviewed_blueprint["evidence_channels"] = ["reviewed-frozen-channel"]
+critic_rewrite = deepcopy(_office_whitepaper()["world_blueprint"])
+critic_rewrite["evidence_channels"] = ["critic-illegal-rewrite"]
+
+
+class _WorldFirstTracer:
+    """离线议会桩：评审改一次骨架，critic 再恶意改写，便于验证两道闸。"""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str]] = []
+
+    def chat_json(self, tag, messages, **_kw):
+        text = "\n".join(str(message.get("content", "")) for message in messages)
+        self.calls.append((tag, text))
+        if tag == "council.observe":
+            return {"observed_media": [], "observed_entities": [], "observed_fields": []}
+        if tag == "council.skeptic":
+            return {"latent_entities": []}
+        if tag == "council.medium":
+            return {"recommended_mix": [], "common_media": [], "unconventional_media": []}
+        if tag == "council.style":
+            return {"style_spec": {"tone": "客观"}}
+        if tag == "council.traps":
+            return {"traps": []}
+        if tag == "council.world":
+            return {"world_blueprint": deepcopy(architect_blueprint)}
+        if tag == "council.world_review":
+            return {
+                "review": {
+                    "reskin_risk": "low",
+                    "findings": ["候选事件链已有游戏专属动力学"],
+                    "decisions": ["保留击败首领到获得装备的因果链"],
+                },
+                "world_blueprint": deepcopy(reviewed_blueprint),
+            }
+        if tag == "council.map":
+            return {"per_line": [{
+                "line": "L1_timeline", "applicable": True,
+                "instantiation": "只读已冻结的事件时序", "weight_hint": 0.5,
+            }]}
+        if tag == "council.critique":
+            return {
+                "active_lines": [{"line": "L1_timeline", "weight": 0.9, "why": "critic"}],
+                "domain_profile": {"entity_noun": "篡改主体", "field_schema": []},
+                "world_blueprint": deepcopy(critic_rewrite),
+                "shared_world_spec": {"entities": {"count": 999}},
+            }
+        raise AssertionError(f"未预期的 council tracer 调用:{tag}")
+
+
+world_first_tracer = _WorldFirstTracer()
+world_first_wp = central_office(
+    "测试 world-first 议会", [], world_first_tracer, log=lambda *_args: None)
+world_first_tags = [tag for tag, _text in world_first_tracer.calls]
+world_review_prompt = next(text for tag, text in world_first_tracer.calls
+                           if tag == "council.world_review")
+world_map_prompt = next(text for tag, text in world_first_tracer.calls if tag == "council.map")
+expected_frozen_blueprint = normalize_world_blueprint(
+    {"world_blueprint": reviewed_blueprint})
+ck("⑦ world/world_review 严格先于 map",
+   world_first_tags.index("council.world")
+   < world_first_tags.index("council.world_review")
+   < world_first_tags.index("council.map"))
+ck("⑦ world_review 审的是架构师候选骨架",
+   "architect-draft-channel" in world_review_prompt
+   and "reviewed-frozen-channel" not in world_review_prompt)
+ck("⑦ map prompt 收到评审后的冻结 blueprint",
+   "reviewed-frozen-channel" in world_map_prompt
+   and "architect-draft-channel" not in world_map_prompt
+   and '"type": "defeat_boss"' not in world_map_prompt
+   and '"id": "defeat_boss"' in world_map_prompt)
+ck("⑦ critic 无法改写已冻结 blueprint",
+   structure_signature(world_first_wp["world_blueprint"])
+   == structure_signature(expected_frozen_blueprint)
+   and "reviewed-frozen-channel" in world_first_wp["world_blueprint"]["evidence_channels"]
+   and "critic-illegal-rewrite" not in world_first_wp["world_blueprint"]["evidence_channels"]
+   and world_first_wp["domain_profile"]["entity_noun"] == "玩家")
+ck("⑦ 换皮反方的审议记录进入白皮书且获低风险批准",
+   world_first_wp["world_review"].get("reskin_risk") == "low"
+   and world_first_wp["world_review"].get("mechanical_outcome") == "accepted"
+   and world_first_wp["world_review"].get("attempts") == 1)
+
+
+class _HighRiskTracer(_WorldFirstTracer):
+    """反方连续判定仍可换皮；白皮书必须在 map 前停下。"""
+
+    def chat_json(self, tag, messages, **kwargs):
+        if tag == "council.world_review":
+            text = "\n".join(str(message.get("content", "")) for message in messages)
+            self.calls.append((tag, text))
+            return {
+                "review": {
+                    "reskin_risk": "high",
+                    "findings": ["改名后仍可迁移到办公世界"],
+                    "decisions": ["尚未形成可批准的领域动力学"],
+                },
+                "world_blueprint": deepcopy(architect_blueprint),
+            }
+        return super().chat_json(tag, messages, **kwargs)
+
+
+high_risk_tracer = _HighRiskTracer()
+try:
+    central_office("测试换皮硬闸", [], high_risk_tracer, log=lambda *_args: None)
+    high_risk_rejected = False
+except ValueError:
+    high_risk_rejected = True
+high_risk_tags = [tag for tag, _text in high_risk_tracer.calls]
+ck("⑦ residual reskin risk 非 low 时三轮后 fail-closed",
+   high_risk_rejected and high_risk_tags.count("council.world_review") == 3)
+ck("⑦ 换皮评审未批准时不得进入能力 map",
+   "council.map" not in high_risk_tags and "council.critique" not in high_risk_tags)
+
+
+npass = sum(1 for ok, _ in checks if ok)
+for ok, name in checks:
+    if not ok:
+        print(f"  ✗ {name}")
+print(f"[world_blueprint self-test] {npass}/{len(checks)} PASS")
+sys.exit(0 if npass == len(checks) else 1)

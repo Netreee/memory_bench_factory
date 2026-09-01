@@ -83,29 +83,58 @@ class PreferenceLine(ProductionLine):
                 seen.add(b); opts.append(o)
         return field, opts
 
+    def _typed_owner(self, ws, profile: dict, field: str) -> str | None:
+        """返回显式蓝图中偏好字段的唯一 owner；legacy 世界返回 None。"""
+        blueprint = getattr(ws, "world_blueprint", None) or {}
+        if not blueprint or blueprint.get("legacy_adapter"):
+            return None
+        owners = [t.get("id") for t in blueprint.get("entity_types", [])
+                  if any(f.get("name") == field for f in (t.get("fields") or []))]
+        requested = ((profile or {}).get("preference_axis") or {}).get("entity_type")
+        if requested in owners:
+            return requested
+        return owners[0] if len(owners) == 1 else ""
+
     def feasible(self, ws, profile: dict) -> tuple[bool, str]:
         field, opts = self._axis(profile)
         if not field or len(opts) < 2:
             return False, "白皮书无 preference_axis(或选项<2),无偏好维度可考"
         if (ws.n_sessions or 0) < K_MIN:
             return False, f"周数 {ws.n_sessions} < K_MIN({K_MIN}),不够推稳定偏好"
+        owner = self._typed_owner(ws, profile, field)
+        if owner == "":
+            return False, f"typed blueprint 中偏好字段「{field}」无唯一 entity_type owner"
+        if owner:
+            candidates = [flds.get(field) for entity, flds in ws.entities.items()
+                          if ws.entity_types.get(entity) == owner and flds.get(field)]
+            if not any(len(tl.set_values()) >= K_MIN for tl in candidates):
+                return False, f"typed world 的 {owner}.{field} 没有足够自然选择记录，能力线不得事后注入"
         return True, f"偏好轴「{field}」{len(opts)} 选项 × {ws.n_sessions} 周"
 
     def prepare(self, ws, profile: dict):
         """注入【周度有偏选择流】到主体实体(非人员:有≥2 字段者),字段名=「{轴}{倾向}」。幂等。"""
+        blueprint = getattr(ws, "world_blueprint", None) or {}
+        if blueprint and not blueprint.get("legacy_adapter"):
+            return None                              # typed world 冻结；L4 只能读取自然存在的偏好轨迹
         field, opts = self._axis(profile)
         if not field or len(opts) < 2:
             return None
         n = ws.n_sessions or 0
         if n < K_MIN:
             return None
-        cf = self._choice_field(field)
+        # 若世界蓝图已把重复选择声明为真实字段，L4 直接骑这条字段并确定性整形；
+        # 只有 legacy/蓝图未声明时才创建带 TAG 的派生字段，避免同一偏好语义出现双流。
+        declared_in_world = ws.has_field(field)
+        cf = field if declared_in_world else self._choice_field(field)
         # ★老产物守卫(刀1审计):老 run 的世界可能带叠词字段「{cf}倾向」(旧 TAG 拼接产物)。新代码续跑老 run
         #   会静默换字段名 → L4 退化/双流并存。检测到即显式告警(不迁移,建议全新 run)。
         legacy = f"{cf}{self.CHOICE_FIELD_TAG}"
         if any(legacy in flds for flds in ws.entities.values()):
             return f"  ⚠L4 检测到老叠词字段「{legacy}」(旧版产物):新命名规则不兼容续跑,跳过注入——请用全新 run"
-        targets = [e for e, flds in ws.entities.items() if len(flds) >= 2 and cf not in flds]  # 主体实体(避开单字段人员)
+        if declared_in_world:
+            targets = [e for e, flds in ws.entities.items() if cf in flds]
+        else:
+            targets = [e for e, flds in ws.entities.items() if len(flds) >= 2 and cf not in flds]  # 主体实体(避开单字段人员)
         if not targets:
             return None
         for i, ent in enumerate(targets):
@@ -113,18 +142,25 @@ class PreferenceLine(ProductionLine):
             prev = None
             ops = []
             for s, v in enumerate(seq):              # 每期都表态(复选)→ 散落证据,逼聚合
-                ops.append(Op(s, _date_of(s), SET if prev is None else UPDATE, v, prev))
+                ops.append(Op(s, ws.date_of_session(s), SET if prev is None else UPDATE, v, prev))
                 prev = v
             ws.entities[ent][cf] = Timeline(ops)
-        return f"  ★偏好注入:+{len(targets)} 个「{cf}」有偏选择流(众数=偏好,末位≠众数·抗recency;{len(opts)}选项×{n}周)"
+        action = "整形" if declared_in_world else "注入"
+        return f"  ★偏好{action}:{len(targets)} 个「{cf}」有偏选择流(众数=偏好,末位≠众数·抗recency;{len(opts)}选项×{n}期)"
 
     def enumerate(self, ws, target: int = 200, wp=None) -> list[dict]:
-        field, opts = self._axis((wp or {}).get("domain_profile", {}))
+        profile = (wp or {}).get("domain_profile", {})
+        field, opts = self._axis(profile)
         if not field:
             return []
-        cf = self._choice_field(field)
+        owner = self._typed_owner(ws, profile, field)
+        if owner == "":
+            return []
+        cf = field if owner or ws.has_field(field) else self._choice_field(field)
         out = []
         for ent, flds in ws.entities.items():
+            if owner and ws.entity_types.get(ent) != owner:
+                continue
             tl = flds.get(cf)
             if not tl:
                 continue

@@ -1,7 +1,8 @@
 """
 增量重渲(closed_loop §10.1)离线自检 —— 锁住 build_world augment + render_corpus delta 的【无 LLM 路径】。
 有 LLM 的部分(augment 真生成新实体 / delta 真渲新实体)靠端到端跑 + 盲审验(no-mock,不在此造假 tracer)。
-这里只证:① 不需新实体时 augment 零 LLM 调用 + 旧世界不动;② delta 遇无事实实体早退、旧 docs 原样;③ 全量路径未被破坏。
+这里只证:① 不需新实体时 augment 零 LLM 调用 + 旧世界不动;② delta 遇无事实实体早退、旧 docs 原样;
+③ 全量路径未被破坏;④ 新关系/事件触及的旧实体只补精确 session。
 
 跑:./venv/bin/python tests/incremental_render_selftest.py
 """
@@ -12,6 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from pipeline.world_state import WorldState, Timeline, Op, SET, _date_of, name_collisions
 from pipeline.world_gen import build_world
 from pipeline.render import render_corpus
+from pipeline.closed_loop import _render_delta_scope
 
 checks: list[tuple[bool, str]] = []
 
@@ -64,6 +66,43 @@ try:
 except AssertionError:
     boomed = True
 ck("delta:done 全满仍遍历所有周(有事实实体确被尝试渲染,证明 weeks=all)", boomed)
+
+# ── ④ typed 结构增量范围:新实体全程，旧实体只补关系/事件实际改变的 session ──
+ws3 = _ws(4, 6)
+ws3.relations = [
+    # 已渲过的旧关系不能再次进入 delta。
+    {"id": "rel-old", "type": "equips", "from": "E0部", "to": "E2部", "session": 1},
+    # 新关系改变旧 source 的 FK，只需补 E1部@4。
+    {"id": "rel-new-old-source", "type": "equips", "from": "E1部", "to": "E3部", "session": 4},
+    # 新 source E3部本就全程重渲，不应再产生冗余的精准 pair。
+    {"id": "rel-new-new-source", "type": "equips", "from": "E3部", "to": "E0部", "session": 2},
+]
+ws3.events = [
+    # 已渲过的旧事件不能再次进入 delta。
+    {"id": "evt-old", "type": "upgrade", "session": 1,
+     "effects": [{"entity": "E2部", "field": "f", "set": "old"}]},
+    # 同一新事件同时改变旧 E0部和新 E3部；只需为旧实体补 E0部@3。
+    {"id": "evt-new-mixed", "type": "upgrade", "session": 3,
+     "effects": [{"entity": "E0部", "field": "f", "set": "new-old"},
+                 {"entity": "E3部", "field": "f", "set": "new-entity"}]},
+    # 另一个旧实体只在 session 5 被事件改变。
+    {"id": "evt-new-old", "type": "upgrade", "session": 5,
+     "effects": [{"entity": "E2部", "field": "f", "set": "later"}]},
+    # 与关系重复触及同一个 entity·session，输出必须去重。
+    {"id": "evt-new-dedup", "type": "upgrade", "session": 4,
+     "effects": [{"entity": "E1部", "field": "f", "set": "same-session"}]},
+]
+new_entities, touched_pairs = _render_delta_scope(
+    ws3,
+    previous_entities={"E0部", "E1部", "E2部"},
+    previous_relations={("id", "rel-old")},
+    previous_events={("id", "evt-old")},
+)
+ck("delta scope:只识别真正新增实体并保持确定排序", new_entities == ["E3部"])
+ck("delta scope:关系/事件触及的旧实体精确到 session、去重且不带旧结构",
+   touched_pairs == [["E0部", 3], ["E1部", 4], ["E2部", 5]])
+ck("delta scope:新实体不重复进入 old-entity 精准 pair",
+   all(pair[0] != "E3部" for pair in touched_pairs))
 
 npass = sum(1 for ok, _ in checks if ok)
 for ok, name in checks:

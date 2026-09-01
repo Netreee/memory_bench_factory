@@ -120,6 +120,8 @@ class RefusalLine(ProductionLine):
                         out.append(pools[k][idx[k]]); idx[k] += 1; progressed = True
             if not progressed:
                 break                                          # 三池耗尽 = 世界供给上限
+        for order in out:
+            (order.get("aux") or {})["time_unit"] = ws.period_unit()
         return out
 
     def _order(self, ent, fld, rtype, ans_kind, lure, evidence, reason, probe=None):
@@ -259,9 +261,10 @@ class RefusalLine(ProductionLine):
         aux = order.get("aux") or {}
         t, ent, fld = aux.get("refusal_type"), order.get("entity", ""), order.get("field", "")
         q = interrogative(aux.get("ans_kind"))
+        unit = aux.get("time_unit") or "周"
         if t == "T2_window":
             at_week = (aux.get("probe") or {}).get("at_week")
-            s = f"第 {at_week} 周,{ent} 的「{fld}」{q}"               # ★at_week 已是 1-based week
+            s = f"第 {at_week} {unit},{ent} 的「{fld}」{q}"           # at_week 已是 1-based 序号
         elif t == "T3_premise":
             s = f"{ent} 现在的「{fld}」{q}"                          # ★现在时强预设(诱去答停前值)
         else:  # T1_adjacent(邻字段,也是兜底)

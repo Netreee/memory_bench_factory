@@ -131,7 +131,8 @@ class ConflictLine(ProductionLine):
                                 "authoritative_value": c.get("authoritative_value"),
                                 "authoritative_source": c.get("authoritative_source"),
                                 "rumor_value": c.get("rumor_value"),
-                                "rumor_source": c.get("rumor_source")}})
+                                "rumor_source": c.get("rumor_source"),
+                                "time_unit": ws.period_unit()}})
         return out
 
     def gt(self, ws, o: dict):
@@ -227,9 +228,10 @@ class ConflictLine(ProductionLine):
         # ★FixD:锁周——官方值会跨周漂移,题面必须锚到【矛盾发生那一周】,否则"官方值"= 哪周不唯一,
         #   合理系统答"最新官方值"会被误判(D 首点:Q117/136 等)。gold = 该周官方值,与此锚一致。
         sess = aux.get("session")
-        wk = f"截至第{week_label(sess)}周(以那一周的官方记录为准)," if sess is not None else ""
+        unit = aux.get("time_unit") or "周"
+        wk = f"截至第{week_label(sess)}{unit}(以该时点的官方记录为准)," if sess is not None else ""
         s = (f"{wk}关于【{ent}】的「{fld}」,记忆里有两份说法对不上:一份出自【{aux.get('authoritative_source', '正式记录')}】,"
-             f"另一份出自【{aux.get('rumor_source', '小道消息')}】。问那一周到底应认定为哪一个——"
+             f"另一份出自【{aux.get('rumor_source', '小道消息')}】。问该时点到底应认定为哪一个——"
              f"★按【来源可靠度】裁决(正式记录 > 小道消息),只回最终认定的那个值。")
         hide = [str(aux.get("authoritative_value")), str(aux.get("rumor_value"))]   # 两值都在语料,题面不剧透
         return s, hide

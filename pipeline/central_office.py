@@ -1,7 +1,7 @@
 """
 pipeline.central_office —— 中央办公室【并行议会】版:场景+few-shot → 白皮书。
 
-redesign_factory_v2.md §3 的升级:从"单轮提案+批判"→ 6 个【议会视角】并行 → 综合 → 批判。
+redesign_factory_v2.md §3 的升级:从"单轮提案+批判"→ 7 个【议会视角】并行 → 综合 → 批判。
 视角(都不叫 L、不叫宪法,避免与产线 L1–L7 / 元架构宪法撞名):
   观测  observe  : few-shot 字面给了啥(只抽取、不推断)
   怀疑  skeptic  : 假定 few-shot 系统性缺失,阐发缺了啥(带合理性缰绳 + observed/inferred 标注)
@@ -9,25 +9,31 @@ redesign_factory_v2.md §3 的升级:从"单轮提案+批判"→ 6 个【议会�
   媒介  medium   : 本场景还能是什么形式(先穷尽常见、再补反常但合理 —— 大而全,非猎奇)
   文风  style    : 抽 few-shot 风格 DNA + 原文当渲染范例
   陷阱  traps    : 本场景天然在哪坑记忆系统(接 M1–M6,设计区分度)
+  世界  world    : 先冻结类型/关系/事件/时间制度,定义场景不可换皮的“骨架”
 → 综合成白皮书草案 → 批判(覆盖/自洽/gt可行/区分度)→ 定稿。
 
-白皮书 schema 与下游(build_world/run_lines/render)兼容:必出 domain_profile / medium /
+白皮书 schema 与下游(build_world/run_lines/render)兼容:必出 world_blueprint / domain_profile / medium /
 active_lines / shared_world_spec / capability_targets;另附 style_spec / traps / line_mapping /
 observed_vs_inferred(留痕,后续渲染/诊断用)。
 """
 from __future__ import annotations
+from copy import deepcopy
 import json
 import config
 from pipeline.lines import taxonomy_prose
 from pipeline.prompts import render          # ★议会 prompts 收编进注册表(council.*)
+from pipeline.world_blueprint import normalize_world_blueprint, WorldBlueprintError
 
-# ── 6 个议会视角的 system prompt ──────────────────────────────────────────
+# ── 7 个议会视角的 system prompt ──────────────────────────────────────────
 OBSERVE_SYS = render("council.observe")
 SKEPTIC_SYS = render("council.skeptic")
 MAP_SYS = render("council.map", taxonomy=taxonomy_prose())   # ★map 内联宪法 taxonomy(调用侧算好传入)
 MEDIUM_SYS = render("council.medium")
 STYLE_SYS = render("council.style")
 TRAPS_SYS = render("council.traps")
+WORLD_SYS = render("council.world")
+WORLD_REVIEW_SYS = render("council.world_review")
+WORLD_REPAIR_SYS = render("council.world_repair")
 
 # ── 综合 + 批判 ──────────────────────────────────────────────────────────
 CRITIC_SYS = render("council.critic", taxonomy=taxonomy_prose())   # ★critic 也内联 canonical 菜单(014559:critic 重写丢 L7+自编名,根在它没拿到菜单)
@@ -40,6 +46,7 @@ _PERSPECTIVES = [
     ("medium", MEDIUM_SYS, "发散本场景所有可能形式(常见穷尽 + 反常但合理),大而全。"),
     ("style", STYLE_SYS, "抽 few-shot 风格 DNA。"),
     ("traps", TRAPS_SYS, "设计本场景坑记忆系统的陷阱(接区分度)。"),
+    ("world", WORLD_SYS, "定义本场景不可换皮的实体类型、关系、领域事件、因果与时间制度。"),
 ]
 
 
@@ -50,52 +57,89 @@ def _g(d, *keys, default=None):
     return cur if cur not in ({}, None) else default
 
 
-def _strip_axis_fields(fields: list, ax_field: str) -> list:
-    """★偏好轴字段单一真源归 L4(014559 Q30 根):从 field_schema 剔除轴字段及其 ±TAG 变体,
-    世界生成不再为它造竞争时间线 —— 选择流只有 L4.prepare 注入的一条,语料里不会双流混渲。
-    TAG 单一真源取自 PreferenceLine.CHOICE_FIELD_TAG(刀1审计:此前硬编码「倾向」+[:-2] 切片 = 两处真源)。
-    在 draft 装配与 critic 采纳后【各执行一次】(审计:critic 看着含轴字段的 few-shot,高概率把它'补'回 schema)。"""
-    if not ax_field:
-        return fields
-    from pipeline.lines.L4_preference import PreferenceLine
-    tag = PreferenceLine.CHOICE_FIELD_TAG
-    variants = {ax_field, ax_field + tag}
-    if ax_field.endswith(tag):
-        variants.add(ax_field[:-len(tag)])
-    variants.discard("")
-    return [f for f in fields if (f.get("name") or "").strip() not in variants]
+def _observed_blueprint_issues(blueprint: dict, observed: dict) -> list[str]:
+    """检查蓝图是否完整且原样承接 few-shot 的字面字段硬事实。"""
+    fields_by_name = {}
+    for entity_type in blueprint.get("entity_types", []):
+        for field in entity_type.get("fields") or []:
+            fields_by_name.setdefault(field.get("name"), field)
+    issues = []
+    for field in observed.get("observed_fields") or []:
+        name = field.get("name")
+        declared = fields_by_name.get(name)
+        if name and declared is None:
+            issues.append(f"未覆盖 few-shot 已观测字段:{name}")
+            continue
+        if declared is None:
+            continue
+        for attr in ("kind", "unit", "monotonic", "range"):
+            value = field.get(attr)
+            if value is not None and value != declared.get(attr):
+                issues.append(
+                    f"改写 few-shot 硬事实:{name}.{attr} observed={value!r},blueprint={declared.get(attr)!r}")
+    return issues
 
 
 def _assemble_whitepaper(views: dict, desc: str) -> dict:
-    """★综合 = 代码确定性装配(把 6 份结构化视角合成白皮书,治 LLM 大 prompt 吐空)。"""
+    """★综合 = 代码确定性装配；世界视角是必须通过机械校验的硬门。"""
     obs = views.get("observe") or {}
     skp = views.get("skeptic") or {}
     mp = views.get("map") or {}
     med = views.get("medium") or {}
     sty = views.get("style") or {}
     trp = views.get("traps") or {}
+    world_review = deepcopy(views.get("world_review") or {})
+    # 新白皮书不允许 world 视角失败后悄悄退化成 legacy 单类型；历史适配只在读取旧产物时启用。
+    world_view = views.get("world") or {}
+    blueprint = normalize_world_blueprint(world_view)
+    type_specs = blueprint["entity_types"]
+    primary = next(t for t in type_specs if t.get("primary"))
 
     obs_ents = obs.get("observed_entities") or []
-    fields0 = obs.get("observed_fields") or []
-    person_field_names = {f.get("name") for f in fields0 if f.get("kind") == "person"}
-    # ★主体 = 观测视角点名的 main_entity_noun;兜底:第一个【非 person 字段名】的观测实体(防把"负责人"当主体)
-    entity_noun = obs.get("main_entity_noun") or next(
-        (e for e in obs_ents if e not in person_field_names), None) or (obs_ents[0] if obs_ents else "实体")
-    fields = _strip_axis_fields(obs.get("observed_fields") or [],
-                                ((mp.get("preference_axis") or {}).get("field") or "").strip())
-    genres = list(dict.fromkeys((obs.get("observed_media") or []) + (med.get("recommended_mix") or []))) or ["记录"]
+    # blueprint 是字段/主体单一真源；observe 仅留 provenance，不再决定世界拓扑。
+    entity_noun = primary["noun"]
+    fields_by_name = {}
+    for t in type_specs:
+        for f in t.get("fields") or []:
+            fields_by_name.setdefault(f.get("name"), deepcopy(f))
+    observed_conflicts = _observed_blueprint_issues(blueprint, obs)
+    if observed_conflicts:
+        raise WorldBlueprintError(
+            "world_blueprint 未承接 few-shot 硬事实:\n- " + "\n- ".join(observed_conflicts))
+    fields = list(fields_by_name.values())
+
+    # L4 只能映射到世界本来就存在的字段，不能在蓝图之后另造一条“偏好时间线”。
+    preference_axis = deepcopy(mp.get("preference_axis")) if isinstance(mp.get("preference_axis"), dict) else None
+    if preference_axis:
+        axis_field = str(preference_axis.get("field") or "").strip()
+        owners = [t["id"] for t in type_specs
+                  if any(f.get("name") == axis_field for f in (t.get("fields") or []))]
+        requested_owner = preference_axis.get("entity_type")
+        owner = requested_owner if requested_owner in owners else (owners[0] if len(owners) == 1 else None)
+        if not owner:
+            preference_axis = None
+        else:
+            preference_axis["entity_type"] = owner
+    blueprint["evidence_channels"] = list(dict.fromkeys(
+        [x for x in blueprint.get("evidence_channels", []) if isinstance(x, str)]
+        + [x for x in (obs.get("observed_media") or []) if isinstance(x, str)]))
+    evidence = [x for x in blueprint.get("evidence_channels", []) if isinstance(x, str)]
+    genres = list(dict.fromkeys((obs.get("observed_media") or []) +
+                                (med.get("recommended_mix") or []) + evidence)) or ["记录"]
     stopped = obs.get("stopped_phrase_seen") or "停止/失效"
 
-    # 关系:怀疑视角 high/med 置信的(给 L2 多跳供料)
-    relations = [{"type": r.get("type"), "from": r.get("from"), "to": r.get("to")}
-                 for r in (skp.get("latent_relations") or [])
-                 if r.get("type") and r.get("confidence") in ("high", "med")]
+    # 旧 schema 的关系镜像从可执行蓝图派生，不能再由 skeptic 的 prose 充当死元数据。
+    relations = [{"type": r["id"], "from": r["from_type"], "to": r["to_type"],
+                  "field": r["field"], "temporal": r.get("temporal", False)}
+                 for r in blueprint.get("relation_types", [])]
 
     # 激活产线:映射 applicable + 陷阱 boost(按 L<n> 前缀匹配)
     boost = {(t.get("boost_line") or "")[:2] for t in (trp.get("traps") or [])}
     active = []
     for pl in (mp.get("per_line") or []):
         if pl.get("applicable") and pl.get("line"):
+            if str(pl.get("line")).lower().startswith("l4") and not preference_axis:
+                continue
             w = float(pl.get("weight_hint") or 0.3)
             if pl["line"][:2] in boost:
                 w = min(1.0, w + 0.1)
@@ -103,18 +147,30 @@ def _assemble_whitepaper(views: dict, desc: str) -> dict:
     if not active:
         active = [{"line": "L1_timeline", "weight": 0.5, "why": "兜底(映射视角未产出 applicable)"}]
 
-    n_ent = max(8, 2 * len(relations) + 6)
+    temporal = blueprint["temporal_model"]
+    n_ent = sum(t["count"] for t in type_specs)
+    derived_sms = [{"field": f["name"], "states": f["states"]}
+                   for t in type_specs for f in t.get("fields", [])
+                   if f.get("name") and isinstance(f.get("states"), list) and f.get("states")]
+    state_machines = derived_sms                 # typed 生命周期只由 blueprint.fields[].states 决定
     return {
         "scenario_id": "auto",
         "domain_profile": {"entity_noun": entity_noun, "field_schema": fields,
                            "doc_genres": genres[:6], "stopped_phrase": stopped,
-                           "preference_axis": mp.get("preference_axis"),    # ★L4 偏好基质(议会出,域无关;无则 None→L4 infeasible)
-                           "state_machines": mp.get("state_machines")},     # ★C1③ 单向状态序声明(议会出;validate 据此查 illegal_transition,只查声明字段)
-        "medium": {"type": "documents", "genres": genres[:6], "cadence": "weekly",
+                           "preference_axis": preference_axis,       # L4 只引用 blueprint 中唯一归属的真实字段
+                           "state_machines": state_machines},     # ★C1③ 单向状态序声明(议会出;validate 据此查 illegal_transition,只查声明字段)
+        "world_blueprint": blueprint,
+        # 审议记录与可执行契约并列留在白皮书中，方便人工先审“世界骨子”，再看能力映射。
+        "world_review": world_review,
+        "medium": {"type": "documents", "genres": genres[:6], "cadence": temporal["cadence"],
+                   "time_unit": temporal["unit"],
                    "candidates": (med.get("common_media") or []) + [m.get("form") for m in (med.get("unconventional_media") or [])]},
         "active_lines": active,
         "shared_world_spec": {"entities": {"count": n_ent},
-                              "timeline": {"n_sessions": 10, "change_density": "每字段4-8次,铺满全程"},
+                              "timeline": {"n_sessions": temporal["n_sessions"],
+                                           "unit": temporal["unit"], "cadence": temporal["cadence"],
+                                           "step_days": temporal.get("step_days", 7),
+                                           "change_density": "按领域事件节律铺满全程"},
                               "relations": relations},
         "capability_targets": {"total_q": 200},
         "style_spec": sty.get("style_spec"),
@@ -155,13 +211,6 @@ def _canonicalize_lines(wp: dict, draft: dict, log=print):
     for k in ("preference_axis", "state_machines"):
         if not dp.get(k) and ddp.get(k):
             dp[k] = ddp[k]; backfilled.append(f"domain_profile.{k}")
-    # ★轴字段剔除对 critic 路径闭合(刀1审计·中):critic 全文重写可能把轴字段'补'回 field_schema
-    #   → 竞争时间线复活 + L4.prepare 误判已注入。采纳后再剔一次,与 draft 装配同一把刀。
-    ax_field = ((dp.get("preference_axis") or {}).get("field") or "").strip()
-    before = len(dp.get("field_schema") or [])
-    dp["field_schema"] = _strip_axis_fields(dp.get("field_schema") or [], ax_field)
-    if len(dp["field_schema"]) < before:
-        backfilled.append(f"重剔轴字段×{before - len(dp['field_schema'])}")
     # ★字段级约束【draft 为唯一真源·直接覆盖】(value_shape 两轮审计 HIGH):
     #   字段的 unit/monotonic/range 来自 observe 据实抽取(draft),critic prompt 铁律本就【不得删改】它们。
     #   旧版只在 final【缺失】时补缺 → 只治了 critic"删",没治"改":critic 把 monotonic up→down 原样放行,
@@ -185,14 +234,26 @@ def _canonicalize_lines(wp: dict, draft: dict, log=print):
     if ghost_attr:
         log(f"    ⚠议会·critic 改名致字段约束丢失(unit/mono/range 停查):{ghost_attr}——查议会命名一致性")
     wp["domain_profile"] = dp
+    if draft.get("world_blueprint"):
+        # ★世界骨架是独立议会已校验的契约，critic 只能评论，不能删除或重写；兼容镜像也锁回同一真源。
+        wp["world_blueprint"] = deepcopy(draft["world_blueprint"])
+        # domain_profile / medium / shared_world_spec 都只是 blueprint 的兼容投影；整块锁回草案，
+        # 防止最终能力 critic 绕过 blueprint，暗改主体、证据渠道、时间制度或偏好字段。
+        wp["domain_profile"] = deepcopy(draft.get("domain_profile") or {})
+        wp["medium"] = deepcopy(draft.get("medium") or {})
+        wp["shared_world_spec"] = deepcopy(draft.get("shared_world_spec") or {})
+        normalize_world_blueprint(wp)  # 最终再走一次硬校验，防未来 canonical 逻辑破坏引用闭包。
+    if "world_review" in draft:
+        # 最终能力/文风 critic 无权覆写或删除先于能力映射完成的世界审议记录。
+        wp["world_review"] = deepcopy(draft["world_review"])
     if renamed or dropped or backfilled:
         log(f"    议会·canonical 化:改名 {renamed or '无'} / 丢弃不可识别 {dropped or '无'} / 补漏 {backfilled or '无'}")
 
 
 def central_office(desc, few_shot, tracer, log=print) -> dict:
-    """并行议会(6 视角 LLM)→ 代码装配 → 可选 LLM 批判润色 → 白皮书。tracer 须有 .chat_json。"""
+    """先冻结世界骨架，再做能力映射，最后代码装配并批判白皮书。"""
     fs = json.dumps(few_shot, ensure_ascii=False)
-    def _view(p):                                         # 6 视角彼此独立 → 并发
+    def _view(p):                                         # 7 视角彼此独立 → 并发
         key, sysp, ask = p
         out = tracer.chat_json(f"council.{key}",
             [{"role": "system", "content": sysp},
@@ -201,12 +262,115 @@ def central_office(desc, few_shot, tracer, log=print) -> dict:
         ok = isinstance(out, dict) and "__error__" not in out
         log(f"    议会·{key} {'✓' if ok else '⚠失败'}")
         return key, (out if isinstance(out, dict) else {})
-    views = dict(config.pmap(_view, _PERSPECTIVES, workers=6))
+    foundations = [p for p in _PERSPECTIVES if p[0] not in ("map", "world")]
+    views = dict(config.pmap(_view, foundations, workers=len(foundations)))
+    # 架构师先读 observe 的硬事实与 skeptic/medium 的补全意见，再综合世界；不是并行独白。
+    world_ask = ("综合下面的议会前置材料，先设计领域世界骨架。observe 是 few-shot 硬事实，不得改写；"
+                 "skeptic 只作带置信度的候选，需自行裁决；medium 用来校准证据生态。\n"
+                 + json.dumps({k: views.get(k) for k in ("observe", "skeptic", "medium")}, ensure_ascii=False))
+    # 架构师输出先过机械硬门；只把明确错误逐条回喂，最多三轮，不由代码猜测字段归属或偷偷降级。
+    world_out: dict = {}
+    world_error = ""
+    for world_attempt in range(1, 5):
+        first_pass = world_attempt == 1
+        system = WORLD_SYS if first_pass else WORLD_REPAIR_SYS
+        user = (render("council.view_user", desc=desc, fs=fs, ask=world_ask)
+                if first_pass else render(
+                    "council.world_repair_user", errors=world_error,
+                    candidate=json.dumps(world_out, ensure_ascii=False)))
+        candidate = tracer.chat_json("council.world" if first_pass else "council.world_repair",
+            [{"role": "system", "content": system}, {"role": "user", "content": user}],
+            temperature=0.5 if world_attempt == 1 else 0.2, max_tokens=8192)
+        world_out = candidate if isinstance(candidate, dict) else {}
+        try:
+            blueprint = normalize_world_blueprint(world_out)
+        except WorldBlueprintError as error:
+            world_error = str(error)
+            log(f"    议会·world 第{world_attempt}轮未通过机械校验:{world_error}")
+            continue
+        observed_issues = _observed_blueprint_issues(blueprint, views.get("observe") or {})
+        if observed_issues:
+            world_error = "world_blueprint 未承接 few-shot 硬事实:\n- " + "\n- ".join(observed_issues)
+            log(f"    议会·world 第{world_attempt}轮未通过观察闭包:{world_error}")
+            continue
+        log(f"    议会·world ✓(综合前置材料;第{world_attempt}轮)")
+        break
+    else:
+        raise WorldBlueprintError("world 架构师四轮后仍未通过机械/观察校验:" + world_error)
+    # world 是能力映射的前置条件：先机械验骨架，再让 map 只判断哪些能力天然可读。
+    views["world"] = {"world_blueprint": deepcopy(blueprint)}
+    world_draft = deepcopy(views["world"])
+    review_record: dict = {}
+    review_candidate = blueprint
+    review_error = "反方未返回结果"
+    for review_attempt in range(1, 4):
+        review = tracer.chat_json("council.world_review",
+            [{"role": "system", "content": WORLD_REVIEW_SYS},
+             {"role": "user", "content": render(
+                 "council.world_review_user", desc=desc, fs=fs,
+                 candidate=json.dumps(review_candidate, ensure_ascii=False))
+                 + (f"\n【上轮未获批准】{review_error}\n请继续修订，勿降低为口头辩解。"
+                    if review_attempt > 1 else "")}],
+            temperature=0.3, max_tokens=8192)
+        review_record = (deepcopy(review.get("review"))
+                         if isinstance(review, dict) and isinstance(review.get("review"), dict) else {})
+        review_problems: list[str] = []
+        try:
+            reviewed_blueprint = normalize_world_blueprint(review if isinstance(review, dict) else {})
+        except WorldBlueprintError as error:
+            # 语义反方容易在重写 JSON 时制造纯 schema 错误；交给独立修理员修引用闭包，
+            # 不让反方一边讨论领域一边猜校验规则。
+            repair = tracer.chat_json("council.world_repair",
+                [{"role": "system", "content": WORLD_REPAIR_SYS},
+                 {"role": "user", "content": render(
+                     "council.world_repair_user", errors=str(error),
+                     candidate=json.dumps(review if isinstance(review, dict) else {}, ensure_ascii=False))}],
+                temperature=0.1, max_tokens=8192)
+            try:
+                reviewed_blueprint = normalize_world_blueprint(repair if isinstance(repair, dict) else {})
+            except WorldBlueprintError as repair_error:
+                reviewed_blueprint = None
+                review_problems.append(f"blueprint 修理后仍未通过机械校验:{repair_error}")
+            else:
+                review_record["schema_repaired"] = True
+        if reviewed_blueprint is not None:
+            review_problems.extend(
+                _observed_blueprint_issues(reviewed_blueprint, views.get("observe") or {}))
+        risk = str(review_record.get("reskin_risk") or "").strip().lower()
+        if risk != "low":
+            review_problems.append(f"修订后 residual reskin_risk 必须为 low，当前={risk or 'missing'}")
+        for key in ("findings", "decisions"):
+            values = review_record.get(key)
+            if not isinstance(values, list) or not any(isinstance(x, str) and x.strip() for x in values):
+                review_problems.append(f"review.{key} 必须保留至少一条非空审议记录")
+        if not review_problems and reviewed_blueprint is not None:
+            blueprint = reviewed_blueprint
+            views["world"] = {"world_blueprint": deepcopy(blueprint)}
+            review_record.update({"mechanical_outcome": "accepted", "attempts": review_attempt})
+            log("    议会·world_review ✓(换皮/本体/动力学/拓扑/时间/证据复核)")
+            break
+        if reviewed_blueprint is not None:
+            review_candidate = reviewed_blueprint
+        review_error = "; ".join(review_problems)
+        log(f"    议会·world_review 第{review_attempt}轮未批准:{review_error}")
+    else:
+        raise WorldBlueprintError("world_review 三轮后仍未批准，停止能力映射:" + review_error)
+    views["world_review"] = review_record
+    views["world_draft"] = world_draft
+    map_ask = ("基于下面这份【已经冻结并通过机械校验的 world_blueprint】做能力映射。"
+               "只能引用其中已有的实体类型、字段、关系和事件；不准为了激活某条产线要求世界补结构。\n"
+               + json.dumps(blueprint, ensure_ascii=False))
+    map_out = tracer.chat_json("council.map",
+        [{"role": "system", "content": MAP_SYS},
+         {"role": "user", "content": render("council.view_user", desc=desc, fs=fs, ask=map_ask)}],
+        temperature=0.6, max_tokens=4096)
+    views["map"] = map_out if isinstance(map_out, dict) else {}
+    log(f"    议会·map {'✓' if isinstance(map_out, dict) and '__error__' not in map_out else '⚠失败'}(world-first)")
 
-    draft = _assemble_whitepaper(views, desc)             # ★代码确定性装配,永远有效
+    draft = _assemble_whitepaper(views, desc)             # ★代码确定性装配；world 视角非法则在这里明确失败
     log(f"    议会·综合(代码装配)✓ active_lines={[l['line'] for l in draft['active_lines']]}")
 
-    # 可选 LLM 批判润色;失败/无效则用代码草案(白皮书永远有效)
+    # 可选 LLM 批判润色；失败/无效则用已通过 world blueprint 硬门的代码草案。
     crit = tracer.chat_json("council.critique",
         [{"role": "system", "content": CRITIC_SYS},
          {"role": "user", "content": render("council.critic_user", desc=desc, fs=fs,
@@ -218,6 +382,8 @@ def central_office(desc, few_shot, tracer, log=print) -> dict:
     else:
         log("    议会·批判润色 ✓")
         _canonicalize_lines(wp, draft, log)               # ★C4:critic 全文重写易丢线/自编名(014559 丢 L7)→ 锁回 canonical + 以 draft 闭包补漏
-    wp["_council_views"] = views        # 留痕:6 视角原始报告
+    # critic 失败走 draft 时同样确认骨架仍合法；任何失败都在白皮书阶段暴露。
+    normalize_world_blueprint(wp)
+    wp["_council_views"] = views        # 留痕:7 视角原始报告
     log(f"    议会·定稿;激活产线 {[l.get('line') for l in wp.get('active_lines', [])]}")
     return wp

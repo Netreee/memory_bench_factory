@@ -54,7 +54,7 @@ def enumerate_l2_orders(ws: WorldState, paths, at_weeks=None, max_per_path: int 
             seen.add(key)
             out.append(Order("L2_relational", start, "→".join(path), gt=mh["answer"],
                              evidence_sessions=sorted({e["set_session"] for e in ev}),
-                             question_date=_date_of(w),
+                             question_date=ws.date_of_session(w),
                              aux={"path": path, "at_week": w, "bridge": ev[0]["value"],
                                   "cross_week": cross, "hops": len(path)}))
             picked += 1
@@ -135,11 +135,15 @@ class RelationalLine(ProductionLine):
     memory = "跨实体 N 跳遍历与聚合(A→B→C)"
     gt_substrate = "软外键 + 时序图遍历(gt_multihop)"
     implemented = True
-    requires: list[str] = ["person_fields>=2"]   # 需 ≥2 个 person 字段(FK 链:首字段→人员→下一跳字段)
+    requires: list[str] = ["soft_fk_path"]       # blueprint 关系优先；legacy 才用 ≥2 person 字段合成 FK 链
 
     def feasible(self, ws, profile: dict) -> tuple[bool, str]:
-        """数 profile.field_schema 里 kind==person 的字段;<2 则 prepare 必 no-op、产 0 单。
-        判定口径与 prepare 完全一致(prepare 内同样要求 len(person_fields)>=2)。"""
+        """优先认蓝图已编译的真实软外键；历史扁平世界再检查 person 字段兜底。"""
+        paths = discover_fk_paths(ws, hops=2)
+        if paths:
+            return True, f"world blueprint 已编译 {len(paths)} 种 2 跳软外键路径"
+        if getattr(ws, "world_blueprint", None) and not ws.world_blueprint.get("legacy_adapter"):
+            return False, "typed world 没有可遍历软外键路径；禁止回退合成人员关系"
         pf = [f["name"] for f in (profile.get("field_schema") or []) if f.get("kind") == "person"]
         if len(pf) >= 2:
             return True, f"person 字段 {len(pf)} 个(「{pf[0]}」→人员→「{pf[1]}」可成链)"
@@ -155,6 +159,13 @@ class RelationalLine(ProductionLine):
           (pf[1]+'·直属上级')只赋给人员实体 → 起点(案件)根本没有该字段 → 词面短路无处可抄。
         ★上级池单射度:seniors 由 difficulty 控(profile.l2_senior_pool_frac,缺省近单射=全体人员)。
           近单射(池≈全体)→ 每人分到基本唯一的上级 → 桥/答案可消歧(治"张宇是所有人上级不可消歧")。"""
+        existing_paths = discover_fk_paths(ws, hops=2)
+        if existing_paths:
+            if getattr(ws, "relations", None):
+                return f"  ★关系基质:直接使用 world blueprint 编译的软外键路径×{len(existing_paths)}(不再合成人员关系)"
+            return None                              # legacy 世界已有人为/历史 FK，幂等 no-op
+        if getattr(ws, "world_blueprint", None) and not ws.world_blueprint.get("legacy_adapter"):
+            return None                              # typed world 的关系只能来自 blueprint compiler
         pf = [f["name"] for f in (profile.get("field_schema") or []) if f.get("kind") == "person"]
         if len(pf) < 2:
             return None
@@ -195,9 +206,9 @@ class RelationalLine(ProductionLine):
         for i, p in enumerate(persons):
             cands = [s for s in seniors if s != p] or [x for x in persons if x != p]
             m1, m2 = cands[i % len(cands)], cands[(i + 1) % len(cands)]
-            ops = [Op(0, _date_of(0), SET, m1, None)]
+            ops = [Op(0, ws.date_of_session(0), SET, m1, None)]
             if m2 != m1:                               # 中段换上级 → 2跳证据落不同周(cross_week)
-                ops.append(Op(ch, _date_of(ch), UPDATE, m2, m1))
+                ops.append(Op(ch, ws.date_of_session(ch), UPDATE, m2, m1))
             ws.entities[p] = {next_field: Timeline(ops)}
         note = f"  ★关系增强:+{len(persons)} 人员实体(「{next_field}」=真实人员名·时变),软外键链 「{fk_field}」→人员→「{next_field}」打通"
         if next_field != pf[1]:
@@ -241,6 +252,7 @@ class RelationalLine(ProductionLine):
             aux["bridge_hidden"] = aux["difficulty"] != "T1"    # ★T2/T3 桥须隐藏(渲染侧钩子:桥事实不与起点同现)
             aux["distractor_n"] = self._answer_siblings(ws, o, path)
             aux.setdefault("ans_kind", field_kind(last, o.gt, profile))
+            aux["time_unit"] = ws.period_unit()
             tagged.append({"line": self.id, "capability": "L2_multihop", "entity": o.entity,
                            "field": o.field, "gt": o.gt, "evidence_sessions": o.evidence_sessions, "aux": aux})
         return _apportion_by_tier(tagged, self._TIER_RATIO, target)
@@ -255,17 +267,18 @@ class RelationalLine(ProductionLine):
         path = list(aux.get("path") or [fld])
         hops = len(path)
         aw = aux.get("at_week")
-        # ★§V-A 良定义:时变关系链,题面必须带【周锚】——否则"向谁汇报"逐周多值、gold 不唯一(run0604 实证)。
-        #   并明确"那个人本人"(消"部门汇报 vs 负责人汇报"二义)。★2/3 跳统一:逐跳描述全链,末跳才是答案。
+        # ★§V-A 良定义:时变关系链题面必须带时间锚；中间节点统一称“所指对象”，不假定它是人。
         q = interrogative(aux.get("ans_kind"))     # ★Fix2:末跳疑问词由 path[-1] 的 kind 派生(治"管理跨度是谁")
-        wk = f"截至第{week_label(aw)}周(以那一周的状态为准)," if aw is not None else ""
-        chain = f"从【{ent}】出发,先找它的「{path[0]}」**所指的那个人**"
-        for f in path[1:-1]:                            # 3 跳(及以上)的中间跳:继续"所指的那个人"
-            chain += f",再找【那个人本人】的「{f}」**所指的那个人**"
-        chain += f",最后问【那个人本人】的「{path[-1]}」{q}。"
+        unit = aux.get("time_unit") or "周"
+        anchor = f"第{week_label(aw)}{unit}" if aw is not None else ""
+        wk = f"截至{anchor}(以该时点的状态为准)," if anchor else ""
+        chain = f"从【{ent}】出发,先找它的「{path[0]}」**所指对象**"
+        for f in path[1:-1]:
+            chain += f",再找【该对象】的「{f}」**所指对象**"
+        chain += f",最后问【该对象】的「{path[-1]}」{q}。"
         s = (f"{wk}沿一条{hops}步关系链提问:{chain}"
-             f"★必须点明'第{week_label(aw)}周'这个时点(时变关系,不带周次答案不唯一);"
-             f"只给起点【{ent}】和「{'→'.join(path)}」这条关系链;【绝不点名链上任何中间人】;答案也不能出现。")
+             f"★必须点明'{anchor}'这个时点(时变关系,不带时间锚答案不唯一);"
+             f"只给起点【{ent}】和「{'→'.join(path)}」这条关系链;【绝不点名链上任何中间对象】;答案也不能出现。")
         hide = [str(gt)]
         if aux.get("bridge"):
             hide.append(str(aux["bridge"]))            # L2 桥实体必须隐藏

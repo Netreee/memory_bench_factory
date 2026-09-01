@@ -50,6 +50,9 @@ def inject_sensitive(ws: WorldState, profile: dict = None, max_n: int = 3, seed:
       · X 进 ws.sensitive 侧信道(确定性模板另渲,canonical timeline 不动);
       · Y 作为良性字段落进【共享世界 timeline】(走正常信号渲染 + 可出普通 value 题)。
     幂等:已注入(ws.sensitive 非空)则不重注(--force 重跑不叠加)。"""
+    blueprint = getattr(ws, "world_blueprint", None) or {}
+    if blueprint and not blueprint.get("legacy_adapter"):
+        return []                                      # 隐私写入基质未进 blueprint 前，不得污染任意领域实体
     from pipeline.world_state import Timeline, Op, SET
     if getattr(ws, "sensitive", None):
         return ws.sensitive
@@ -71,10 +74,10 @@ def inject_sensitive(ws: WorldState, profile: dict = None, max_n: int = 3, seed:
         y = f"{chr(ord('A') + i % 26)}{write_s}-{1000 + ydig}"
         wf = _WITNESS_FIELD
         if wf not in ws.entities[ent]:
-            ws.entities[ent][wf] = Timeline([Op(write_s, _date_of(write_s), SET, y, None)])
+            ws.entities[ent][wf] = Timeline([Op(write_s, ws.date_of_session(write_s), SET, y, None)])
         out.append({
             "entity": ent, "field": _SENS_FIELD_LABEL[stype], "value": x, "stype": stype,
-            "session": write_s, "date": _date_of(write_s),
+            "session": write_s, "date": ws.date_of_session(write_s),
             "probe_session": (write_s + 1) % n_sess if n_sess > 1 else write_s,   # held-out 另一 session
             "witness_field": wf, "witness_value": y,
         })

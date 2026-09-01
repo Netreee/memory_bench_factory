@@ -47,7 +47,7 @@ def _candidates(ws: WorldState, cap: str) -> list[Order]:
                 for (N, cs, v) in stable_query_weeks(ws, ent, fld):
                     if _norm(v) != _norm(latest):
                         out.append(Order("IE", ent, fld, gt={"value": v, "at_week": N},
-                                         question_date=_date_of(N),
+                                         question_date=ws.date_of_session(N),
                                          evidence_sessions=list(range(cs, N + 1)),
                                          aux={"at_week": N, "value": v, "framing": "decision_time"}))
 
@@ -79,7 +79,7 @@ def _candidates(ws: WorldState, cap: str) -> list[Order]:
                           if _norm(v) == _norm(latest)]
                     if sq:
                         N, cs = sq[-1]                  # 最后一个稳定周 = 真·最新参照点
-                        out.append(Order("KU", ent, fld, gt=latest, question_date=_date_of(N),
+                        out.append(Order("KU", ent, fld, gt=latest, question_date=ws.date_of_session(N),
                                          evidence_sessions=list(range(cs, N + 1)), aux={"at_week": N}))
 
             elif cap == "FORGET":
@@ -161,6 +161,7 @@ class TimelineLine(ProductionLine):
         for o in picked[:target]:
             aux = dict(o.aux)
             aux.setdefault("ans_kind", field_kind(o.field, sample_field_value(ws, o.entity, o.field), profile))
+            aux["time_unit"] = ws.period_unit()
             out.append({"line": self.id, "capability": o.capability, "entity": o.entity, "field": o.field,
                         "gt": o.gt, "evidence_sessions": o.evidence_sessions, "aux": aux})
         return out
@@ -198,15 +199,16 @@ class TimelineLine(ProductionLine):
                                   o.get("aux", {}) or {}, o.get("gt"))
         hide = [str(gt)]
         q = interrogative(aux.get("ans_kind"))     # ★Fix2:疑问词由字段 kind 派生(person→是谁/number→是多少/其它→是什么)
+        unit = aux.get("time_unit") or "周"
         if cap == "IE":
-            s = (f"复盘第 {week_label(aux.get('at_week'))} 周那次——问【当时】{ent} 的「{fld}」{q}"
+            s = (f"复盘第 {week_label(aux.get('at_week'))} {unit}那次——问【当时】{ent} 的「{fld}」{q}"
                  f"(制造'当时 vs 现在'对照;答案不进题面)。")
         elif cap == "KU":
             s = f"问截至最新一期,{ent} 的「{fld}」{q}(不要暗示是第几周)。"
         elif cap == "TR":
-            s = f"问 {ent} 的「{fld}」是在哪一周【首次】发生变化的(只问哪一周,不写变化前后的值)。"
+            s = f"问 {ent} 的「{fld}」是在哪一{unit}【首次】发生变化的(只问时间序号,不写变化前后的值)。"
         elif cap == "MR":
-            s = f"问在全部记录周里,{ent} 的「{fld}」{'最高/最大' if aux.get('agg') == 'max' else '最低/最小'}是多少。"
+            s = f"问在全部记录{unit}里,{ent} 的「{fld}」{'最高/最大' if aux.get('agg') == 'max' else '最低/最小'}是多少。"
         elif cap == "PREEXPIRE":
             s = f"问那个【已停止统计】的「{fld}」,{ent} 在停掉【前】最后一次{q}(题面不写该值)。"
         elif cap == "FORGET":

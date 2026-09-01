@@ -11,6 +11,75 @@ from pipeline.run import Run, _run_stage
 from pipeline.targetspec import TargetSpec, invert_rate, WorldParams, DEFAULT_SLACK
 
 
+def _relation_key(relation: dict) -> tuple:
+    """关系实例的稳定增量键；新契约要求 id 唯一，旧产物则退回结构键。"""
+    return ("id", relation.get("id")) if relation.get("id") else (
+        "edge", relation.get("type"), relation.get("from"), relation.get("to"), relation.get("session", 0))
+
+
+def _event_key(event: dict) -> tuple:
+    """领域事件实例的稳定增量键。"""
+    return ("id", event.get("id")) if event.get("id") else (
+        "event", event.get("type"), event.get("session"), repr(event.get("participants")))
+
+
+def _render_delta_scope(ws: WorldState, previous_entities: set,
+                        previous_relations: set, previous_events: set) -> tuple[list[str], list[list]]:
+    """计算增量语料范围：新实体全程，结构事件触碰的旧实体只补对应 session。"""
+    new_entities = sorted(set(ws.entities) - previous_entities)
+    new_set = set(new_entities)
+    pairs: set[tuple[str, int]] = set()
+    for relation in ws.relations:
+        if _relation_key(relation) not in previous_relations and relation.get("from") not in new_set:
+            pairs.add((relation.get("from"), int(relation.get("session", 0))))
+    for event in ws.events:
+        if _event_key(event) in previous_events:
+            continue
+        session = int(event.get("session", 0))
+        for effect in event.get("effects") or []:
+            entity = effect.get("entity")
+            if entity and entity not in new_set:
+                pairs.add((entity, session))
+    return new_entities, [[entity, session] for entity, session in sorted(pairs)]
+
+
+def _scale_world_contract(wp: dict, n_entities: int, n_sessions: int) -> None:
+    """同步闭环规模旋钮到 legacy 镜像与显式 world_blueprint。
+
+    多类型世界按白皮书原有人口比例整体放大，并同比放大 relation/event 最小实例数，
+    防止大世界退化成“大量孤立 primary + 一条装饰边/事件”。没有 blueprint 的历史白皮书
+    仍只改旧字段。
+    """
+    sw = wp.setdefault("shared_world_spec", {})
+    bp = wp.get("world_blueprint")
+    actual_entities, actual_sessions = n_entities, n_sessions
+    if isinstance(bp, dict) and bp.get("entity_types"):
+        types = bp["entity_types"]
+        old_total = sum(int(t.get("count", 0)) for t in types)
+        desired = max(old_total, int(n_entities), len(types))
+        if old_total > 0 and desired > old_total:
+            factor = desired / old_total
+            raw = [int(t["count"]) * factor for t in types]
+            counts = [max(1, math.floor(x)) for x in raw]
+            remainder = desired - sum(counts)
+            order = sorted(range(len(types)), key=lambda i: (raw[i] - math.floor(raw[i]),
+                                                              bool(types[i].get("primary"))), reverse=True)
+            for i in order[:max(0, remainder)]:
+                counts[i] += 1
+            for t, count in zip(types, counts):
+                t["count"] = count
+            for decl in list(bp.get("relation_types") or []) + list(bp.get("event_types") or []):
+                old_min = int(decl.get("min_count", 0))
+                if old_min > 0:
+                    decl["min_count"] = max(old_min, math.ceil(old_min * factor))
+        actual_entities = sum(int(t.get("count", 0)) for t in types)
+        temporal = bp.setdefault("temporal_model", {})
+        temporal["n_sessions"] = max(int(temporal.get("n_sessions", 0)), n_sessions)
+        actual_sessions = temporal["n_sessions"]
+    sw.setdefault("entities", {})["count"] = actual_entities
+    sw.setdefault("timeline", {})["n_sessions"] = actual_sessions
+
+
 def _orders_by_line(orders) -> dict:
     """{line_id: 该线产了多少 order}。"""
     out: dict = {}
@@ -94,12 +163,13 @@ def build_to_target(run: Run, spec: TargetSpec, max_rounds: int = 2, order_subro
     last = {"kept": [], "report": {}, "growable": [], "permanent": []}
     met = False
     run_cfg = run.manifest["config"]
-    prev_entities = None                                                         # round1 世界实体集,作 ②环增量续渲的 delta 基线
+    prev_entities = None                                                         # round1 已渲世界快照，作 ②环 delta 基线
+    prev_relations: set = set()
+    prev_events: set = set()
     for rnd in range(1, max_rounds + 1):
         run.log(f"╠═ 第 {rnd}/{max_rounds} 轮 ══════════════════════════════")
-        sw = wp.setdefault("shared_world_spec", {})                              # patch 规模旋钮(域值仍只从白皮书/world 来)
-        sw.setdefault("entities", {})["count"] = params.n_entities
-        sw.setdefault("timeline", {})["n_sessions"] = params.n_sessions
+        _scale_world_contract(wp, params.n_entities, params.n_sessions)           # patch 规模旋钮；显式蓝图同步更新 primary/time
+        sw = wp["shared_world_spec"]
         wp.setdefault("domain_profile", {})["l5_max_conflicts"] = params.max_n_conflicts
         run.write(ART["whitepaper"], wp)
         run_cfg["quotas"] = dict(params.target_orders)                            # ★经 config 喂配额给 stage_orders(不内联 run_lines)
@@ -120,8 +190,7 @@ def build_to_target(run: Run, spec: TargetSpec, max_rounds: int = 2, order_subro
             if not deficit or sub == order_subrounds:
                 break
             params = _grow_for_supply(params, deficit)                           # 供不上 → 长世界重建
-            sw["entities"]["count"] = params.n_entities
-            sw["timeline"]["n_sessions"] = params.n_sessions
+            _scale_world_contract(wp, params.n_entities, params.n_sessions)
             run.write(ART["whitepaper"], wp)
             run.log(f"║  ↑供给不足 → 长世界 n_ent={params.n_entities} n_sess={params.n_sessions} 重建")
 
@@ -130,15 +199,22 @@ def build_to_target(run: Run, spec: TargetSpec, max_rounds: int = 2, order_subro
         ws = WorldState.from_dict(run.read(ART["world"]))
         if rnd == 1:
             prev_entities = set(ws.entities)
+            prev_relations = {_relation_key(r) for r in ws.relations}
+            prev_events = {_event_key(e) for e in ws.events}
             (run.dir / ART["corpus"]).unlink(missing_ok=True)                    # 全量:清残留 ckpt 从头
             _run_stage(run, "corpus", stage_corpus, ART["corpus"])
         else:
-            new_ents = sorted(set(ws.entities) - prev_entities)                  # ★只渲【新实体】,旧实体 docs 不重渲
+            new_ents, touched_pairs = _render_delta_scope(
+                ws, prev_entities, prev_relations, prev_events)
             run_cfg["render_only"] = new_ents
-            run.log(f"║  增量续渲:+{len(new_ents)} 新实体(旧 {len(prev_entities)} 实体 docs 不动,省整轮重渲)")
+            run_cfg["render_only_pairs"] = touched_pairs
+            run.log(f"║  增量续渲:+{len(new_ents)} 新实体全程 + {len(touched_pairs)} 个旧实体·结构变化期")
             _run_stage(run, "corpus", stage_corpus, ART["corpus"])
             run_cfg.pop("render_only", None)
+            run_cfg.pop("render_only_pairs", None)
             prev_entities = set(ws.entities)
+            prev_relations = {_relation_key(r) for r in ws.relations}
+            prev_events = {_event_key(e) for e in ws.events}
         _run_stage(run, "grounding", stage_grounding, ART["grounding"])
 
         # ── ② floor 校验(读回 stage 产物判定;driver 只做循环决策)──
@@ -170,7 +246,7 @@ def build_to_target(run: Run, spec: TargetSpec, max_rounds: int = 2, order_subro
         run.set_algo(met_status=f"UNMET: {unmet}")
         run.log(f"╚═ ✗ 旋钮未达标(UNMET,已尽 {max_rounds} 轮):{unmet}。题库仍写出(fail-open,留痕 met_status)。")
     run.manifest["current_stage"] = ""
-    run_cfg.pop("augment", None); run_cfg.pop("render_only", None)                 # ★清增量信号,免泄漏到后续 --only 重跑
+    run_cfg.pop("augment", None); run_cfg.pop("render_only", None)
+    run_cfg.pop("render_only_pairs", None)                                        # ★清增量信号,免泄漏到后续 --only 重跑
     run.set_status("done")
     return last["kept"], ("MET" if met else "UNMET")
-

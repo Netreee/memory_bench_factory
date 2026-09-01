@@ -1,6 +1,7 @@
 """
 闭环旋钮 driver 的【纯逻辑】离线自检(无 LLM):
-  · 4 个决策纯函数:_orders_by_line / _order_deficit / _grow_for_supply / _floor_status;
+  · 5 个决策纯函数:_orders_by_line / _order_deficit / _grow_for_supply / _floor_status /
+    _scale_world_contract;
   · 一个【控制流编排】仿真:用合成供给表跑 driver 的循环骨架,验证
       ①供不上 → 长世界 → 终能补齐;②floor 不达 → 纠偏;不可行线 → 永久 UNMET 不空转。
 driver 本体(build_to_target)调真 LLM stage 逻辑,端到端另用小规模真跑验证(no-mock)。
@@ -13,7 +14,8 @@ import sys, math, dataclasses
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from pipeline.closed_loop import _orders_by_line, _order_deficit, _grow_for_supply, _floor_status
+from pipeline.closed_loop import (_orders_by_line, _order_deficit, _grow_for_supply,
+                                  _floor_status, _scale_world_contract)
 from pipeline.targetspec import TargetSpec, WorldParams, invert_rate, N_ENT_CLAMP, N_SESS_CLAMP, DEFAULT_SLACK
 
 checks: list[tuple[bool, str]] = []
@@ -54,6 +56,54 @@ ck("_grow_for_supply:无赤字 → 原样返回", _grow_for_supply(p0, {}) is p0
 p_big = WorldParams(n_entities=N_ENT_CLAMP[1], n_sessions=N_SESS_CLAMP[1], quota_L1=1, max_n_conflicts=1, target_orders={})
 p_big2 = _grow_for_supply(p_big, {"L1_timeline": 99})
 ck("_grow_for_supply:已到 clamp 上限 → 不越界", p_big2.n_entities == N_ENT_CLAMP[1] and p_big2.n_sessions == N_SESS_CLAMP[1])
+
+# ── _scale_world_contract:typed 世界按类型比例扩容，结构密度同步增长 ────────────
+typed_wp = {
+    "shared_world_spec": {
+        "entities": {"count": 999},
+        "timeline": {"n_sessions": 999},
+    },
+    "world_blueprint": {
+        "entity_types": [
+            {"id": "player", "count": 2, "primary": True},
+            {"id": "boss", "count": 3},
+            {"id": "equipment", "count": 5},
+        ],
+        "relation_types": [
+            {"id": "equips", "min_count": 1},
+            {"id": "drops", "min_count": 2},
+            {"id": "optional_link", "min_count": 0},
+        ],
+        "event_types": [
+            {"id": "defeat_boss", "min_count": 2},
+            {"id": "acquire_item", "min_count": 3},
+        ],
+        "temporal_model": {"n_sessions": 8},
+    },
+}
+_scale_world_contract(typed_wp, n_entities=20, n_sessions=12)
+scaled_bp = typed_wp["world_blueprint"]
+scaled_counts = {item["id"]: item["count"] for item in scaled_bp["entity_types"]}
+scaled_rel_min = {item["id"]: item["min_count"] for item in scaled_bp["relation_types"]}
+scaled_event_min = {item["id"]: item["min_count"] for item in scaled_bp["event_types"]}
+ck("_scale_world_contract:typed 实体按原 2:3:5 比例扩到 20",
+   scaled_counts == {"player": 4, "boss": 6, "equipment": 10})
+ck("_scale_world_contract:relation min_count 随实体规模同比放大且 0 保持可选",
+   scaled_rel_min == {"equips": 2, "drops": 4, "optional_link": 0})
+ck("_scale_world_contract:event min_count 随实体规模同比放大",
+   scaled_event_min == {"defeat_boss": 4, "acquire_item": 6})
+ck("_scale_world_contract:typed blueprint 与 legacy 镜像使用实际实体/session 总量",
+   scaled_bp["temporal_model"]["n_sessions"] == 12
+   and typed_wp["shared_world_spec"]["entities"]["count"] == 20
+   and typed_wp["shared_world_spec"]["timeline"]["n_sessions"] == 12)
+
+# 缩放只允许增长：闭环后续小目标不得把既有 typed 世界及结构见证缩掉。
+_scale_world_contract(typed_wp, n_entities=7, n_sessions=6)
+ck("_scale_world_contract:较小目标不反向缩减 typed 类型/结构/session",
+   {item["id"]: item["count"] for item in scaled_bp["entity_types"]} == scaled_counts
+   and {item["id"]: item["min_count"] for item in scaled_bp["relation_types"]} == scaled_rel_min
+   and {item["id"]: item["min_count"] for item in scaled_bp["event_types"]} == scaled_event_min
+   and scaled_bp["temporal_model"]["n_sessions"] == 12)
 
 # ── _floor_status:达标/可行未达(growable)/不可行未达(permanent)/总数闸 ─────────
 spec = TargetSpec(min_questions=20, per_line_min={"L1_timeline": 8, "L2_relational": 6, "L3_process": 5})

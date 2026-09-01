@@ -1,6 +1,6 @@
 """刀1 离线自检 —— 锁住 014559 纵览后的六个修复(零 LLM;渲染回路用 scripted tracer)。
 
-覆盖:① render 禁词字段名豁免(「累计」∈「累计计费工时」不再杀 doc)② render 耗尽 fail-loud 模板兜底
+覆盖:① render 禁词字段名豁免(「累计」∈「累计计费工时」不再杀 doc)② render 耗尽 fail-loud 弃段
 ③ _affix_units 单位真源化(裸数补单位/幂等/prev同步/异型不动)④ imprint 后缀保真(万元/% 回贴,混后缀跳过)
 ⑤ validate illegal_transition(声明字段倒流/出界抓到,未声明往复不碰)⑥ _canonicalize_lines(自编名锁回+丢线补漏+axis回填)
 ⑦ L4 _choice_field 叠词去重。
@@ -34,6 +34,12 @@ class _ScriptedTracer:
     def __init__(self, script):
         self.script = list(script); self.calls = []
     def chat_json(self, tag, messages, **kw):
+        if tag == "render.discriminate":
+            text = messages[-1]["content"]
+            for value in ("86小时", "维持治疗"):
+                if value in text:
+                    return {"answer": value}
+            return {"answer": "不确定"}
         if tag != "render.signal":
             return {"docs": []}
         self.calls.append(messages[-1]["content"])
@@ -65,12 +71,12 @@ docs2 = _run_render(t2)
 ck("①b 真犯禁 → 第2轮重渲成功", len(t2.calls) == 2 and any("86小时" in d["content"] for d in docs2))
 ck("①b hint 如实报死因(含'全局口径词'与『目前』)", "全局口径词" in t2.calls[1] and "目前" in t2.calls[1])
 
-# ②:4 轮全失败 → fail-loud 模板兜底备忘(边B供给仍在,is_fallback 标记)
+# ②:4 轮全失败 → fail-loud 弃段，不再注入能绕过接地闸的 K=V 模板备忘
 t3 = _ScriptedTracer([{"docs": []}] * 4)
 docs3 = _run_render(t3)
 fb = [d for d in docs3 if d.get("is_fallback")]
-ck("②耗尽兜底:4 轮失败后补模板备忘", len(t3.calls) == 4 and len(fb) == 1)
-ck("②兜底备忘含事实(实体+值就近)", fb and "鼎晟案" in fb[0]["content"] and "86小时" in fb[0]["content"])
+ck("②耗尽 fail-loud:4 轮失败后弃段", len(t3.calls) == 4 and docs3 == [])
+ck("②弃段不注 K=V 兜底备忘", not fb)
 
 # ════════ ③ _affix_units ════════
 ws3 = WorldState({"星耀案": {"争议标的额": _tl((0, "200"), (2, "250")),
@@ -138,7 +144,8 @@ _canonicalize_lines(wp6, draft, log=lambda *a: None)
 ids6 = [l["line"] for l in wp6["active_lines"]]
 ck("⑥自编名锁回 canonical", "L1_timeline" in ids6 and "L4_preference" in ids6)
 ck("⑥丢线补漏(L7 回来)", "L7_consolidation" in ids6)
-ck("⑥不可识别丢弃 + 无重复", "L9_unknown" not in str(ids6) and len(ids6) == len(set(ids6)) == 3)
+ck("⑥L9 前缀锁回已注册产线 + 无重复", "L9_unknown" not in str(ids6)
+   and "L9_induction" in ids6 and len(ids6) == len(set(ids6)) == 4)
 ck("⑥axis/states 回填", wp6["domain_profile"].get("preference_axis") and wp6["domain_profile"].get("state_machines"))
 # ⑥c【value_shape 审计 HIGH】critic 删字段级约束 → _canonicalize_lines 从 draft 兜底恢复
 draft_vs = {"active_lines": [{"line": "L1_timeline", "weight": 0.5}],

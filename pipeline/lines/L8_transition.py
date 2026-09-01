@@ -8,7 +8,7 @@ pipeline.lines.L8_transition —— L8 状态机转移产线(单能力线:L8_nex
   gt   = 声明序里【当前态的后继】(代码从 states 索引算,过校验闸）;
   出题 = 不给当前态名、不列完整状态表 → 逼系统【先回忆 X 当前阶段 + 从语料归纳生命周期顺序】再推进一步;
   能力 = 结构化"流程推进"记忆。平铺检索答不了(它只会取当前值、不懂"下一步"是什么）——状态机原生考点,
-         且【只在有状态机的场景(cs/legal)激活】,office/game 无此线 = 不同场景【结构分叉】的来源。
+         且【只在世界蓝图自然声明了状态序的类型上激活】；不按场景名硬编码开关。
 
 v1 只做【下一合法状态】(值答案,套现有判分,零协议改动）;
 【非法转移声明】(判定答案"成立/不成立",牵动答案协议 + judge)留 v1.5。
@@ -55,7 +55,7 @@ class TransitionLine(ProductionLine):
 
     def feasible(self, ws, profile: dict) -> tuple[bool, str]:
         """有状态机字段、且至少一个实体当前处于【非终态】(有唯一后继)→ 可激活。
-        这条 feasible 正是【场景结构分叉】的开关:无 state_machines 的场景(office/game)直接 False、不出本线。"""
+        这条 feasible 正是【世界结构分叉】的开关：无状态序声明就直接 False，不为出题补造状态机。"""
         sm = _state_machines(profile)
         if not sm:
             return (False, "白皮书未声明 state_machines(无单向流程字段)→ 本线不激活")

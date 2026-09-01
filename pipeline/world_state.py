@@ -10,6 +10,8 @@ gt(真答案)在生成时烘焙、由【代码】机械算(单一口径),不再�
 纯代码、无 LLM 依赖,可单测:`./venv/bin/python pipeline/world_state.py` 跑自检。
 """
 from __future__ import annotations
+from collections import Counter
+from copy import deepcopy
 from dataclasses import dataclass, field, asdict
 from typing import Any, Optional
 import re
@@ -115,6 +117,11 @@ class WorldState:
     sensitive: list[dict] = field(default_factory=list)  # ★L10 敏感注入侧信道(仿 conflicts):每条 {entity,field,value(=X),stype,session,...},X 逐字渲进语料、gold=绝不可吐
     conditional_rules: list[dict] = field(default_factory=list)  # ★L9 条件归纳:声明式阶跃规则 {rule_id,trigger_field,op,thresholds:[{cutoff,action}],default_action,unit}(gold 由 apply_rule 纯查表算)
     rule_instances: list[dict] = field(default_factory=list)     # ★L9 执行实例侧信道(仿 conflicts/sensitive):每条 {rule_id,inst_id,x(trigger 值),canon_action,surface_action,session,...},只渲【单条情境→动作】,一般化规则句禁写
+    # ★世界蓝图 v1：不改变 entities[name][field]=Timeline 的旧地基，只在旁路保存类型与领域结构。
+    entity_types: dict[str, str] = field(default_factory=dict)   # entity name -> blueprint type id
+    relations: list[dict] = field(default_factory=list)          # 已校验、已编译成软外键 Timeline 的关系实例
+    events: list[dict] = field(default_factory=list)             # 已校验、effect 已编译成 Timeline 的领域事件
+    world_blueprint: dict = field(default_factory=dict)          # 生成本世界所依据的可执行白皮书骨架
 
     def timeline(self, entity: str, fld: str) -> Optional[Timeline]:
         return self.entities.get(entity, {}).get(fld)
@@ -130,6 +137,17 @@ class WorldState:
                   for tl in flds.values() for o in tl.ops), default=-1)
         return list(range(mx + 1))
 
+    def date_of_session(self, session: int) -> str:
+        """按本世界声明的时间步长把 session 映射为日期；历史世界默认每步 7 天。"""
+        temporal = (self.world_blueprint or {}).get("temporal_model") or {}
+        return _date_of(session, step_days=_as_int(temporal.get("step_days"), 7))
+
+    def period_unit(self) -> str:
+        """返回题面使用的中文时间单位；未知 unit 安全退化为“期”。"""
+        unit = ((self.world_blueprint or {}).get("temporal_model") or {}).get("unit", "week")
+        return {"week": "周", "chapter": "章", "business_day": "个工作日", "day": "天",
+                "round": "轮", "month": "月", "event": "事件段"}.get(unit, "期")
+
     # ── 序列化(每阶段落盘,治 v9 的可回溯性缺口)──
     def to_dict(self) -> dict:
         return {
@@ -142,6 +160,10 @@ class WorldState:
             "sensitive": self.sensitive,        # ★L10 敏感侧信道随盘(仿 conflicts;from_dict 回读)
             "conditional_rules": self.conditional_rules,   # ★L9 阶跃规则随盘
             "rule_instances": self.rule_instances,         # ★L9 执行实例侧信道随盘(仿 conflicts)
+            "entity_types": self.entity_types,
+            "relations": self.relations,
+            "events": self.events,
+            "world_blueprint": self.world_blueprint,
             # ★imprint 已注趋势标记必须随世界落盘(刀1审计·高危):否则闭环 ②环 augment 从盘重载后
             #   done 集为空 → 旧实体被【复注且 shuffle 翻向】,而 delta 续渲不重渲旧 docs → 语料与 canonical 矛盾。
             "_trended_fields": [list(t) for t in getattr(self, "_trended_fields", [])],
@@ -151,9 +173,19 @@ class WorldState:
     def from_dict(cls, d: dict) -> "WorldState":
         ents = {e: {f: Timeline([Op(**o) for o in ops]) for f, ops in flds.items()}
                 for e, flds in d.get("entities", {}).items()}
-        ws = cls(ents, d.get("cascades", []), d.get("absent_fields", []), d.get("n_sessions", 0),
-                 d.get("conflicts", []), d.get("sensitive", []),
-                 d.get("conditional_rules", []), d.get("rule_instances", []))
+        # 全部改为关键字，避免未来在 dataclass 尾部扩展元数据时发生位置错位。
+        ws = cls(entities=ents,
+                 cascades=d.get("cascades", []),
+                 absent_fields=d.get("absent_fields", []),
+                 n_sessions=d.get("n_sessions", 0),
+                 conflicts=d.get("conflicts", []),
+                 sensitive=d.get("sensitive", []),
+                 conditional_rules=d.get("conditional_rules", []),
+                 rule_instances=d.get("rule_instances", []),
+                 entity_types=d.get("entity_types", {}),
+                 relations=d.get("relations", []),
+                 events=d.get("events", []),
+                 world_blueprint=d.get("world_blueprint", {}))
         ws._trended_fields = [tuple(t) for t in d.get("_trended_fields", [])]
         return ws
 
@@ -697,30 +729,301 @@ def _traj_to_ops(traj: list[dict], date_of) -> list[Op]:
     return ops
 
 
-def assemble_world(table: dict, base: str = "2025-01-06", step_days: int = 7) -> tuple[WorldState, list[str]]:
-    """table = LLM 输出的世界表(见 redesign_v10 Stage C schema)。返回 (WorldState, issues)。"""
+def assemble_world(table: dict, base: str = "2025-01-06", step_days: int = 7,
+                   blueprint: dict | None = None, existing: WorldState | None = None) -> tuple[WorldState, list[str]]:
+    """把 LLM 世界表编译成真值状态机。
+
+    传入 ``blueprint`` 时额外校验实体类型，并把 relation 编译成 source 的软外键
+    Timeline、把 domain event 的 effect 编译成普通 Op；旧调用不传蓝图时行为保持不变。
+    """
+    if blueprint is not None:
+        from pipeline.world_blueprint import normalize_world_blueprint
+        blueprint = normalize_world_blueprint(blueprint)
+        temporal = blueprint.get("temporal_model") or {}
+        step_days = _as_int(temporal.get("step_days"), step_days)
+    session_limit = _as_int(((blueprint or {}).get("temporal_model") or {}).get("n_sessions"), 0)
     date_of = lambda s: _date_of(s, base, step_days)  # noqa: E731
-    entities: dict[str, dict[str, Timeline]] = {}
-    max_sess = 0
+    # 增量编译时以旧世界为只读基底，让新关系/事件可以合法引用并更新旧实体。
+    entities: dict[str, dict[str, Timeline]] = deepcopy(existing.entities) if existing is not None else {}
+    entity_types: dict[str, str] = dict(existing.entity_types) if existing is not None else {}
+    issues: list[str] = []
+    max_sess = max(0, (existing.n_sessions - 1) if existing is not None else 0)
+    bp_types = {t.get("id"): t for t in (blueprint or {}).get("entity_types", [])}
+    allowed_fields = {tid: {f.get("name") for f in t.get("fields", []) if f.get("name")}
+                      for tid, t in bp_types.items()}
+    field_specs = {tid: {f.get("name"): f for f in t.get("fields", []) if f.get("name")}
+                   for tid, t in bp_types.items()}
+    relation_fields: dict[str, set[str]] = {}
+    event_fields: dict[str, set[str]] = {}
+    for rel in (blueprint or {}).get("relation_types", []):
+        relation_fields.setdefault(rel.get("from_type"), set()).add(rel.get("field"))
+    for event in (blueprint or {}).get("event_types", []):
+        roles = event.get("roles") or {}
+        for effect in event.get("effect_fields") or []:
+            tid = roles.get(effect.get("role"))
+            event_fields.setdefault(tid, set()).add(effect.get("field"))
+
+    def _value_contract_issue(tid: str, fname: str, value: Any) -> str | None:
+        """机械检查一个字段值是否满足 blueprint 的 kind/states/range。"""
+        decl = field_specs.get(tid, {}).get(fname) or {}
+        if value is None or str(value).strip() == "":
+            return "值为空"
+        states = decl.get("states")
+        if isinstance(states, list) and states and _norm(value) not in {_norm(x) for x in states}:
+            return f"值 {value!r} 不在状态表 {states}"
+        mag = _magnitude(value)
+        if decl.get("kind") == "numeric" and mag is None:
+            return f"numeric 字段值不可解析为数值:{value!r}"
+        rng = decl.get("range")
+        if isinstance(rng, (list, tuple)) and len(rng) == 2:
+            try:
+                lo, hi = float(rng[0]), float(rng[1])
+            except (TypeError, ValueError):
+                return f"range 端点不可解析:{rng!r}"
+            if mag is None or not lo <= mag <= hi:
+                return f"值 {value!r} 越界，须在 [{lo:g},{hi:g}]"
+        return None
 
     for ent in _dicts(table.get("entities", [])):
         name = ent.get("name") or ent.get("id")
         if not name:
             continue
+        etype = ent.get("type") or ent.get("entity_type")
+        if blueprint is not None:
+            if etype not in bp_types:
+                issues.append(f"entity {name} 类型不存在:{etype}")
+                continue
+            entity_types[name] = etype
         flds: dict[str, Timeline] = {}
         for fname, spec in _dict(ent.get("fields")).items():
+            open_legacy_schema = bool(blueprint and blueprint.get("legacy_adapter")
+                                      and not allowed_fields.get(etype))
+            if blueprint is not None and not open_legacy_schema and fname not in allowed_fields.get(etype, set()):
+                issues.append(f"entity {name}({etype}) 含本类型未声明字段:{fname}")
+                continue
             spec = _dict(spec)
             if (spec.get("type") == "stable") or ("value" in spec and "trajectory" not in spec):
-                flds[fname] = Timeline([Op(0, date_of(0), SET, str(spec.get("value")), None)])
+                value = spec.get("value")
+                problem = _value_contract_issue(etype, fname, value) if blueprint is not None else None
+                if problem:
+                    issues.append(f"entity {name}.{fname} {problem}")
+                    continue
+                flds[fname] = Timeline([Op(0, date_of(0), SET, str(value), None)])
             else:
-                traj = spec.get("trajectory", [])
-                for p in _dicts(traj):
+                traj = _dicts(spec.get("trajectory", []))
+                sessions = [_as_int(p.get("session"), -1) for p in traj]
+                dup_sessions = sorted(s for s, n in Counter(sessions).items() if n > 1)
+                if dup_sessions:
+                    issues.append(f"entity {name}.{fname} trajectory 同 session 重复:{dup_sessions}")
+                    # 继续编译时保留输入中最后一条，保证 canonical 与渲染不会各取一条。
+                    by_session = {_as_int(p.get("session"), -1): p for p in traj}
+                    traj = [by_session[s] for s in sorted(by_session)]
+                if session_limit:
+                    bad_sessions = [_as_int(p.get("session"), -1) for p in traj
+                                    if not 0 <= _as_int(p.get("session"), -1) < session_limit]
+                    if bad_sessions:
+                        issues.append(f"entity {name}.{fname} session 超出 0..{session_limit - 1}:{bad_sessions}")
+                    traj = [p for p in traj if 0 <= _as_int(p.get("session"), -1) < session_limit]
+                if blueprint is not None:
+                    for p in traj:
+                        value = p.get("value")
+                        if value is None or str(value).strip() == "":
+                            continue
+                        problem = _value_contract_issue(etype, fname, value)
+                        if problem:
+                            issues.append(f"entity {name}.{fname}@{p.get('session')} {problem}")
+                for p in traj:
                     max_sess = max(max_sess, _as_int(p.get("session"), 0))
                 ops = _traj_to_ops(traj, date_of)
                 if ops:
                     flds[fname] = Timeline(ops)
-        if flds:
+        if flds or blueprint is not None:
             entities[name] = flds
+
+    if blueprint is not None:
+        type_counts: dict[str, int] = {}
+        for tid in entity_types.values():
+            type_counts[tid] = type_counts.get(tid, 0) + 1
+        for tid, decl in bp_types.items():
+            if type_counts.get(tid, 0) < decl.get("count", 1):
+                issues.append(f"entity type {tid} 实例不足:{type_counts.get(tid, 0)}/{decl.get('count', 1)}")
+
+    def _inject(entity: str, fld: str, session: int, value, source: str) -> bool:
+        """向既有 Timeline 注入一个结构效果；同周冲突不覆盖而是报错。"""
+        nonlocal max_sess
+        if entity not in entities:
+            issues.append(f"{source} 引用不存在实体:{entity}")
+            return False
+        if session_limit and not 0 <= session < session_limit:
+            issues.append(f"{source} session 超出 0..{session_limit - 1}:{session}")
+            return False
+        max_sess = max(max_sess, session)
+        tl = entities[entity].get(fld)
+        if tl:
+            same = [o for o in tl.ops if o.session == session and o.op in (SET, UPDATE)]
+            if same and any(_norm(o.value) != _norm(str(value)) for o in same):
+                issues.append(f"{source} 与既有值同 session 冲突:{entity}.{fld}@{session}")
+                return False
+            if same:
+                return True                         # 基础轨迹已在该 session 编码同一真实效果
+            if _norm(tl.value_at_session(session)) == _norm(str(value)):
+                return False                        # 只是延续旧值，不构成领域事件效果
+        prev = tl.value_at_session(session - 1) if tl else None
+        prev = None if prev in (INVALID, INSUFFICIENT) else prev
+        entities[entity].setdefault(fld, Timeline([])).ops.append(
+            Op(session, date_of(session), SET if prev is None else UPDATE, str(value), prev))
+        return True
+
+    relations: list[dict] = deepcopy(existing.relations) if existing is not None else []
+    events: list[dict] = deepcopy(existing.events) if existing is not None else []
+    generated_cascades: list[dict] = []
+    if blueprint is not None:
+        rel_types = {r["id"]: r for r in blueprint.get("relation_types", [])}
+        rel_counts: dict[str, int] = {}
+        relation_ids = set()
+        relation_edges = set()
+        for old_rel in relations:
+            rid = old_rel.get("type")
+            rel_counts[rid] = rel_counts.get(rid, 0) + 1
+            if old_rel.get("id"):
+                relation_ids.add(old_rel["id"])
+            relation_edges.add((rid, old_rel.get("from"), old_rel.get("to"),
+                                _as_int(old_rel.get("session"), 0)))
+        for rel in _dicts(table.get("relations", [])):
+            rtype = rel_types.get(rel.get("type"))
+            instance_id = rel.get("id")
+            src, dst = rel.get("from"), rel.get("to")
+            if not rtype:
+                issues.append(f"relation instance 类型未声明:{rel.get('type')}")
+                continue
+            if not isinstance(instance_id, str) or not instance_id.strip() or instance_id in relation_ids:
+                issues.append(f"relation id 为空或重复:{instance_id}")
+                continue
+            if src not in entities or dst not in entities:
+                issues.append(f"relation {rel.get('id') or rel.get('type')} 端点不存在:{src}->{dst}")
+                continue
+            if (entity_types.get(src) != rtype["from_type"] or
+                    entity_types.get(dst) != rtype["to_type"]):
+                issues.append(f"relation {rel.get('id') or rel.get('type')} 端点类型不符")
+                continue
+            sess = _as_int(rel.get("session"), 0)
+            if sess < 0 or (session_limit and sess >= session_limit):
+                issues.append(f"relation {rel.get('id') or rel.get('type')} session 非法:{sess}")
+                continue
+            if not rtype.get("temporal") and sess != 0:
+                issues.append(f"relation {instance_id} 是 static(temporal=false)，session 必须为 0")
+                continue
+            edge = (rtype["id"], src, dst, sess)
+            if edge in relation_edges:
+                issues.append(f"relation {instance_id} 重复边:{src}->{dst}@{sess}")
+                continue
+            if not _inject(src, rtype["field"], sess, dst, f"relation {instance_id}"):
+                issues.append(f"relation {instance_id} 没有形成合法 FK 变化")
+                continue
+            relations.append(dict(rel))
+            relation_ids.add(instance_id)
+            relation_edges.add(edge)
+            rel_counts[rtype["id"]] = rel_counts.get(rtype["id"], 0) + 1
+        for rid, decl in rel_types.items():
+            if rel_counts.get(rid, 0) < decl.get("min_count", 1):
+                issues.append(f"relation type {rid} 实例不足:{rel_counts.get(rid, 0)}/{decl.get('min_count', 1)}")
+
+        event_types = {e["id"]: e for e in blueprint.get("event_types", [])}
+        event_counts: dict[str, int] = {}
+        event_by_id: dict[str, dict] = {}
+        for old_event in events:
+            if old_event.get("id"):
+                event_by_id[old_event["id"]] = old_event
+            etid = old_event.get("type")
+            event_counts[etid] = event_counts.get(etid, 0) + 1
+        for event in _dicts(table.get("events", [])):
+            decl = event_types.get(event.get("type"))
+            eid = event.get("id")
+            participants = _dict(event.get("participants"))
+            if not decl:
+                issues.append(f"event instance 类型未声明:{event.get('type')}")
+                continue
+            if not eid or eid in event_by_id:
+                issues.append(f"event id 为空或重复:{eid}")
+                continue
+            bad_role = False
+            for role, tid in decl.get("roles", {}).items():
+                entity = participants.get(role)
+                if entity not in entities or entity_types.get(entity) != tid:
+                    issues.append(f"event {eid} role {role} 实体/类型不符:{entity}->{tid}")
+                    bad_role = True
+            if bad_role:
+                continue
+            sess = _as_int(event.get("session"), -1)
+            if sess < 0 or (session_limit and sess >= session_limit):
+                issues.append(f"event {eid} session 非法:{event.get('session')}")
+                continue
+            allowed_effects = {(x.get("role"), x.get("field"))
+                               for x in decl.get("effect_fields", []) if isinstance(x, dict)}
+            clean_effects = []
+            for eff in _dicts(event.get("effects", [])):
+                entity, fld = eff.get("entity"), eff.get("field")
+                matching_roles = [role for role, ename in participants.items() if ename == entity]
+                role = next((r for r in matching_roles if (r, fld) in allowed_effects), None)
+                value = eff.get("set", eff.get("value"))
+                if role is None or value is None:
+                    issues.append(f"event {eid} effect 未声明或无 set:{entity}.{fld}")
+                    continue
+                tid = entity_types.get(entity)
+                field_decl = next((f for f in bp_types.get(tid, {}).get("fields", [])
+                                   if f.get("name") == fld), {})
+                states = field_decl.get("states")
+                if isinstance(states, list) and states and _norm(value) not in {_norm(x) for x in states}:
+                    issues.append(f"event {eid} effect 值不在状态表:{entity}.{fld}={value} not in {states}")
+                    continue
+                value_problem = _value_contract_issue(tid, fld, value)
+                if value_problem:
+                    issues.append(f"event {eid} effect 非法:{entity}.{fld} {value_problem}")
+                    continue
+                mag = _magnitude(value)
+                tl = entities.get(entity, {}).get(fld)
+                prev_mag = _magnitude(tl.value_at_session(sess - 1)) if tl else None
+                mono = field_decl.get("monotonic")
+                if (prev_mag is not None and mag is not None and
+                        ((mono == "up" and mag < prev_mag) or (mono == "down" and mag > prev_mag))):
+                    issues.append(f"event {eid} effect 违反 monotonic={mono}:{entity}.{fld} {prev_mag}->{mag}")
+                    continue
+                if _inject(entity, fld, sess, value, f"event {eid}"):
+                    clean_effects.append(dict(eff))
+                else:
+                    issues.append(f"event {eid} effect 是空操作:{entity}.{fld}@{sess}={value}")
+            if not clean_effects:
+                issues.append(f"event {eid} 没有合法 effect")
+                continue
+            clean_event = {**event, "session": sess, "effects": clean_effects}
+            events.append(clean_event)
+            event_by_id[eid] = clean_event
+            event_counts[decl["id"]] = event_counts.get(decl["id"], 0) + 1
+            max_sess = max(max_sess, sess)
+        for event_id, decl in event_types.items():
+            if event_counts.get(event_id, 0) < decl.get("min_count", 1):
+                issues.append(f"event type {event_id} 实例不足:{event_counts.get(event_id, 0)}/{decl.get('min_count', 1)}")
+
+        # 因果规则不是一段 prose：必须由 caused_by 的真实事件对见证，并记录到 cascades 留痕。
+        for rule in blueprint.get("causal_rules", []):
+            witnesses = []
+            delay = _as_int(rule.get("delay_sessions"), 0)
+            for child in events:
+                parent = event_by_id.get(child.get("caused_by"))
+                if (parent and parent.get("type") == rule.get("trigger_event")
+                        and child.get("type") == rule.get("effect_event")
+                        and child.get("session") - parent.get("session") == delay):
+                    witnesses.append((parent, child))
+            if not witnesses:
+                issues.append(f"causal rule {rule.get('id')} 没有 caused_by 事件见证")
+            for parent, child in witnesses:
+                generated_cascades.append({
+                    "kind": "domain_event_causality", "rule_id": rule.get("id"),
+                    "trigger": {"event_id": parent.get("id"), "type": parent.get("type"),
+                                "session": parent.get("session")},
+                    "effect": {"event_id": child.get("id"), "type": child.get("type"),
+                               "session": child.get("session")},
+                })
 
     # 套级联(DAG):trigger 触发时,在 effect 字段注入预声明的替代值(可解性)
     for c in _dicts(table.get("cascades", [])):
@@ -738,11 +1041,64 @@ def assemble_world(table: dict, base: str = "2025-01-06", step_days: int = 7) ->
         op = Op(sess, date_of(sess), SET if prev is None else UPDATE, str(val), prev)
         entities.setdefault(e, {}).setdefault(f, Timeline([])).ops.append(op)
 
-    absent = [f for f in table.get("absent_fields", []) if isinstance(f, str)]
-    ws = WorldState(entities, table.get("cascades", []), absent, n_sessions=max_sess + 1)
+    if blueprint is not None and not blueprint.get("legacy_adapter"):
+        # 关系字段与事件效果字段由结构实例驱动。除 session 0 的可选初始态外，每次实际
+        # 变更都必须能回指同 session 的 relation/event，防止“事件只做装饰”。
+        witnesses: set[tuple[str, str, int, str]] = set()
+        for rel in relations:
+            decl = next((r for r in blueprint.get("relation_types", []) if r.get("id") == rel.get("type")), None)
+            if decl:
+                witnesses.add((rel.get("from"), decl.get("field"), _as_int(rel.get("session"), 0),
+                               _norm(rel.get("to"))))
+        for event in events:
+            for effect in _dicts(event.get("effects", [])):
+                value = effect.get("set", effect.get("value"))
+                witnesses.add((effect.get("entity"), effect.get("field"),
+                               _as_int(event.get("session"), -1), _norm(value)))
+        owned_fields = {tid: relation_fields.get(tid, set()) | event_fields.get(tid, set())
+                        for tid in bp_types}
+        for entity, tid in entity_types.items():
+            for fname in owned_fields.get(tid, set()):
+                tl = entities.get(entity, {}).get(fname)
+                if not tl:
+                    continue
+                for index, op in enumerate(tl._sorted()):
+                    key = (entity, fname, op.session, _norm(op.value))
+                    baseline = index == 0 and op.session == 0 and op.op == SET
+                    if not baseline and key not in witnesses:
+                        issues.append(
+                            f"entity {entity}.{fname}@{op.session} 的结构字段变更没有 relation/event 见证")
+
+        for entity, tid in entity_types.items():
+            expected = (allowed_fields.get(tid, set()) - relation_fields.get(tid, set())
+                        - event_fields.get(tid, set()))
+            missing = sorted(expected - set(entities.get(entity, {})))
+            if missing:
+                issues.append(f"entity {entity}({tid}) 缺少本类型内在字段:{missing}")
+
+    absent = list(existing.absent_fields) if existing is not None else []
+    absent += [f for f in table.get("absent_fields", []) if isinstance(f, str) and f not in absent]
+    declared_sessions = ((blueprint or {}).get("temporal_model") or {}).get("n_sessions", 0)
+    cascades = deepcopy(existing.cascades) if existing is not None else []
+    for cascade in _dicts(table.get("cascades", [])) + generated_cascades:
+        if cascade not in cascades:
+            cascades.append(cascade)
+    ws = WorldState(entities=entities,
+                    cascades=cascades,
+                    absent_fields=absent,
+                    n_sessions=max(max_sess + 1, _as_int(declared_sessions, 0)),
+                    entity_types=entity_types,
+                    relations=relations,
+                    events=events,
+                    world_blueprint=deepcopy(blueprint) if blueprint else {})
+    if existing is not None:
+        ws.conflicts = deepcopy(existing.conflicts)
+        ws.sensitive = deepcopy(existing.sensitive)
+        ws.conditional_rules = deepcopy(existing.conditional_rules)
+        ws.rule_instances = deepcopy(existing.rule_instances)
+        ws._trended_fields = list(getattr(existing, "_trended_fields", []) or [])
 
     # 校验(非致命,收集 issues)
-    issues: list[str] = []
     present = {f for flds in entities.values() for f in flds}
     for f in list(absent):
         if f in present:                       # 矛盾:声称不存在却出现了 → 从 absent 移除

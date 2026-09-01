@@ -79,11 +79,15 @@ def _discriminator_recovers(docs, entity, field, true_value, tracer):
     return (_strict_eq(ans, str(true_value)), ans)
 
 
-def _corpus_system(profile) -> str:
+def _corpus_system(profile, blueprint=None) -> str:
     genres = "/".join(profile.get("doc_genres", ["周报", "通报", "邮件"]))
     stopped = profile.get("stopped_phrase", "停止统计")
     noun = profile.get("entity_noun", "实体")
-    return render("corpus.system", noun=noun, genres=genres, stopped=stopped, genre0=genres.split("/")[0])
+    types = (blueprint or {}).get("entity_types") or []
+    legend = "、".join(f"{t.get('id')}={t.get('noun')}" for t in types if t.get("id")) or f"legacy={noun}"
+    time_unit = ((blueprint or {}).get("temporal_model") or {}).get("unit", "week")
+    return render("corpus.system", noun=noun, genres=genres, stopped=stopped,
+                  genre0=genres.split("/")[0], type_legend=legend, time_unit=time_unit)
 
 
 def _filler_system(profile) -> str:
@@ -96,12 +100,29 @@ def _session_facts(ws, s):
     facts = []
     for ent, flds in ws.entities.items():
         for fname, tl in flds.items():
-            op = next((o for o in tl.ops if o.session == s), None)
+            same_session = [o for o in tl._sorted() if o.session == s]
+            op = same_session[-1] if same_session else None
             if op is None:
                 continue
             stopped = op.op in (EXPIRE, DELETE)
-            facts.append({"entity": ent, "field": fname, "value": None if stopped else op.value, "stopped": stopped})
+            facts.append({"entity": ent, "entity_type": getattr(ws, "entity_types", {}).get(ent),
+                          "field": fname, "value": None if stopped else op.value, "stopped": stopped})
     return facts
+
+
+def _missing_event_narratives(events, contents) -> list[str]:
+    """机械检查每个领域事件是否以“事件 label + 全部参与者同篇”真正进入文档。"""
+    missing = []
+    for event in events:
+        label = str(event.get("label") or "").strip()
+        participants = sorted({str(x) for x in (event.get("participants") or {}).values() if x})
+        if not label or not participants:
+            missing.append(f"事件 {event.get('id') or event.get('type')} 缺 label/participants，无法验叙事")
+            continue
+        if not any(label in content and all(name in content for name in participants) for content in contents):
+            missing.append(
+                f"事件「{label}」必须与参与者 {participants} 在同一篇文档中形成明确叙事")
+    return missing
 
 
 def _tracked_blocklist(ws, profile=None):
@@ -129,7 +150,8 @@ def _render_conflict_docs(ws, s, date, tracer):
         o = tracer.chat_json("render.conflict",
             [{"role": "system", "content": render("conflict.system")},
              {"role": "user", "content": render("conflict.user", s=week_label(s), date=date, entity=c["entity"],
-                                                field=c["field"], value=c["rumor_value"], source=c.get("rumor_source", "小道消息"))}],
+                                                time_unit=ws.period_unit(), field=c["field"], value=c["rumor_value"],
+                                                source=c.get("rumor_source", "小道消息"))}],
             temperature=0.7, max_tokens=8192)
         # ★不套 LEAK_BANNED:矛盾文档天然是"据传【现在/目前】X 是 Y"的当期传闻,撞防剧透词表会被全滤。
         #   (LEAK_BANNED 是给【信号文档】防 KU 剧透的;小道文档是另一类——该说"现在"就说,正是冲突设定。)
@@ -177,26 +199,38 @@ def _chunk(lst, n):
         yield lst[i:i + n]
 
 
-def render_corpus(wp, ws, target_tokens, tracer, corpus, done_weeks, save_cb, log=print, only_entities=None):
+def render_corpus(wp, ws, target_tokens, tracer, corpus, done_weeks, save_cb, log=print,
+                  only_entities=None, only_entity_sessions=None):
     """only_entities=None:全量渲(每周全实体+filler)。
     only_entities=set:★增量 delta(§10.1)——【只渲这些新实体的 signal】并【追加】到已有周 docs,
-    不重渲旧实体、不重灌 filler;遍历所有周(新实体跨全程)。给闭环 ②环增量续渲用。"""
+    ``only_entity_sessions`` 精确补渲被新关系/事件改变的旧实体周；不重灌 filler。"""
     profile = wp.get("domain_profile", {})
-    sys_sig, sys_fil = _corpus_system(profile), _filler_system(profile)
+    blueprint = getattr(ws, "world_blueprint", None) or wp.get("world_blueprint") or {}
+    temporal = blueprint.get("temporal_model") or {}
+    time_unit = temporal.get("unit", "week")
+    step_days = int(temporal.get("step_days", 7) or 7)
+    sys_sig, sys_fil = _corpus_system(profile, blueprint), _filler_system(profile)
     blocked = _tracked_blocklist(ws, profile)
     # 估算 filler/周 以达目标 token(~1字≈1token)。周并行后不再 early-stop;filler_per_week 已按目标分摊。
     n_sessions = ws.n_sessions
     filler_per_week = max(8, round(target_tokens / max(1, n_sessions) / 800))   # 每篇≈800字
     by_id = {x["session_id"]: x for x in corpus["sessions"]}
-    weeks = list(ws.sessions()) if only_entities else [s for s in ws.sessions() if s not in done_weeks]
+    delta_mode = only_entities is not None or only_entity_sessions is not None
+    only_entities = set(only_entities or [])
+    only_entity_sessions = set(only_entity_sessions or [])
+    weeks = list(ws.sessions()) if delta_mode else [s for s in ws.sessions() if s not in done_weeks]
     lock = threading.Lock()
     fallback_count: list[int] = []                        # 耗尽兜底计数(list.append 线程安全;验收要求趋零)
 
     def _render_week(s):                                  # ★一周的全部渲染 = 一个并行单元
-        date = _date_of(s)
+        date = _date_of(s, step_days=step_days)
         facts = _session_facts(ws, s)
-        if only_entities is not None:                     # ★delta:本周只渲新实体的事实
-            facts = [f for f in facts if f["entity"] in only_entities]
+        event_decls = {e.get("id"): e for e in blueprint.get("event_types", [])}
+        session_events = [{**e, "label": (event_decls.get(e.get("type")) or {}).get("label", e.get("type", ""))}
+                          for e in (getattr(ws, "events", None) or []) if e.get("session") == s]
+        if delta_mode:                                    # ★delta:新实体全程 + 旧实体受结构变化的精确 session
+            facts = [f for f in facts if (f["entity"] in only_entities
+                                          or (f["entity"], s) in only_entity_sessions)]
             if not facts:
                 return s                                  # 新实体本周无事实 → 不加 doc
         bysku = {}
@@ -208,6 +242,9 @@ def render_corpus(wp, ws, target_tokens, tracer, corpus, done_weeks, save_cb, lo
         def _render_sig(grp):                             # ★信号块:渲全 + 渲对 —— 盲判别器据渲文能否唯一还原 (实体,字段) 才算渲到
             from pipeline.grounding import STOP_MARKERS    # ★只借停用标记(STOP_MARKERS);忠实检不再用 §G 的 attributed(死钉②不同尺)
             gf = [f for _e, fs in grp for f in fs]
+            group_entities = {f["entity"] for f in gf}
+            group_events = [e for e in session_events
+                            if group_entities.intersection((e.get("participants") or {}).values())]
             # 待渲事实:非停用 → 派盲判别器读 (实体,字段) 的值,代码量纲严格对账;停用 → 验 (实体,停用标记) 同篇
             want_val = [(f["entity"], f["field"], str(f["value"])) for f in gf if f.get("value") and not f.get("stopped")]
             want_stop = [(f["entity"], f["field"]) for f in gf if f.get("stopped")]
@@ -215,7 +252,7 @@ def render_corpus(wp, ws, target_tokens, tracer, corpus, done_weeks, save_cb, lo
             def _discriminate(contents):
                 """★盲判别器忠实检(死钉①③):对每个 want_val atom 派一个盲读者只读 contents 答值,
                 代码量纲严格对账;对每个 want_stop atom 验停用标记同篇。
-                返回 (miss_val: list[str], miss_stop: list[str]),供 missing/hint 管道复用。"""
+                返回 (miss_val, miss_stop, miss_event)，供 missing/hint 管道复用。"""
                 # value atom:判别器并发(各 atom 独立),true_value 只在代码对账侧用,绝不进 prompt
                 def _one(item):
                     e, fl, v = item
@@ -229,7 +266,8 @@ def render_corpus(wp, ws, target_tokens, tracer, corpus, done_weeks, save_cb, lo
                 miss_stop = [f"{e}的「{fl}」应让读者读出『自本期停止统计』,但文档未表达停用"
                              for (e, fl) in want_stop
                              if not any((e in c) and any(m in c for m in STOP_MARKERS) for c in contents)]
-                return miss_val, miss_stop
+                miss_event = _missing_event_narratives(group_events, contents)
+                return miss_val, miss_stop, miss_event
             # ★禁词豁免(014559 尸检:词表「累计」撞字段名「累计计费工时」→ 整篇核验前被静默丢,27/27 弃题同根)。
             #   豁免集 = 本组【所有被要求逐字出现的串】= 字段名+实体名+事实值(刀1审计:值含禁词如「维持治疗」
             #   时,'逐字照抄'与'禁全局口径词'否则构成不可满足约束 → 4 轮必废 → 兜底吸收症状)。
@@ -247,7 +285,10 @@ def render_corpus(wp, ws, target_tokens, tracer, corpus, done_weeks, save_cb, lo
             for _att in range(4):                         # 多给几次重渲机会,强制渲全(世界辛苦生成,必须全用上)
                 out = tracer.chat_json("render.signal",
                     [{"role": "system", "content": sys_sig},
-                     {"role": "user", "content": render("corpus.user", s=week_label(s), date=date, facts=json.dumps(gf, ensure_ascii=False), hint=hint)}],
+                     {"role": "user", "content": render(
+                         "corpus.user", s=week_label(s), time_unit=time_unit, date=date,
+                         facts=json.dumps(gf, ensure_ascii=False),
+                         events=json.dumps(group_events, ensure_ascii=False), hint=hint)}],
                     temperature=0.6, max_tokens=8192)
                 cand, leak_notes = [], []
                 for d in _dicts(out.get("docs") if isinstance(out, dict) else []):
@@ -259,8 +300,8 @@ def render_corpus(wp, ws, target_tokens, tracer, corpus, done_weeks, save_cb, lo
                     else:
                         cand.append(d)
                 contents = [d.get("content", "") for d in cand]
-                miss_val, miss_stop = _discriminate(contents)   # ★忠实检从机械 attributed 换成盲判别器对账
-                missing = miss_val + miss_stop
+                miss_val, miss_stop, miss_event = _discriminate(contents)
+                missing = miss_val + miss_stop + miss_event
                 grp_docs = cand or grp_docs
                 if not missing:
                     break
@@ -274,12 +315,12 @@ def render_corpus(wp, ws, target_tokens, tracer, corpus, done_weeks, save_cb, lo
             #   【不】再往 grp_docs 硬注 K=V 模板备忘(那是 fail-open、稳过 §G、把缺渲症状吸收掉),而是【弃段】:
             #   grp_docs 不追加任何东西,缺的 atom 让出厂 §G 接地闸自然弃题;只显式告警 + 计 fallback_count(语义=弃段计数)。
             contents = [d.get("content", "") for d in grp_docs]
-            miss_val, miss_stop = _discriminate(contents)
-            left = miss_val + miss_stop
+            miss_val, miss_stop, miss_event = _discriminate(contents)
+            left = miss_val + miss_stop + miss_event
             if left:
                 fallback_count.append(len(left))          # ★机械验收落点(语义改为"弃段计数"):汇总进末尾日志
                 ents = sorted({m.split("的「")[0] for m in left})
-                log(f"  ⚠fail-loud弃段[周{week_label(s)}]:{len(left)} 个 atom 多轮重渲后盲读者仍不可还原,弃段不入库({ents})")
+                log(f"  ⚠fail-loud弃段[{time_unit}{week_label(s)}]:{len(left)} 个 atom 多轮重渲后盲读者仍不可还原,弃段不入库({ents})")
             return grp_docs
 
         def _render_fil(ci):                              # 一个草堆批
@@ -288,14 +329,15 @@ def render_corpus(wp, ws, target_tokens, tracer, corpus, done_weeks, save_cb, lo
                 return []
             out = tracer.chat_json("render.filler",
                 [{"role": "system", "content": sys_fil},
-                 {"role": "user", "content": render("filler.user", s=week_label(s), date=date, want=want, blocked=sorted(blocked)[:30])}],
+                 {"role": "user", "content": render("filler.user", s=week_label(s), time_unit=time_unit,
+                                                      date=date, want=want, blocked=sorted(blocked)[:30])}],
                 temperature=0.9, max_tokens=8192)
             return [d for d in _dicts(out.get("docs") if isinstance(out, dict) else [])
                     if d.get("content") and not any(b in d.get("content", "") for b in blocked)]
 
         sig_lists = config.pmap(_render_sig, sig_groups, workers=8)              # 周内并发(全局信号量才是真上限)
         with lock:                                         # 周乱序完成 → 锁内更新+逐周存盘(断点续渲不丢)
-            if only_entities is not None:                  # ★delta:追加新实体 signal 到【已有周 docs】,接着编号;不灌 filler/conflict
+            if delta_mode:                                 # ★delta:追加结构变化 signal,接着编号;不灌 filler/conflict
                 docs = list(by_id.get(s, {}).get("docs", []))
                 base = len(docs)
                 for gl in sig_lists:
@@ -322,8 +364,8 @@ def render_corpus(wp, ws, target_tokens, tracer, corpus, done_weeks, save_cb, lo
             corpus["sessions"] = [by_id[k] for k in sorted(by_id)]
             save_cb()
             ch = sum(len(dd.get("content", "")) for x in corpus["sessions"] for dd in x["docs"])
-            tag = "delta+" if only_entities is not None else ""
-            log(f"  [周 {s} ✓{tag} {len(done_weeks)}/{n_sessions}] 累计 {sum(len(x['docs']) for x in corpus['sessions'])} 篇 / {ch/1e6:.2f}M 字")
+            tag = "delta+" if delta_mode else ""
+            log(f"  [{time_unit} {s} ✓{tag} {len(done_weeks)}/{n_sessions}] 累计 {sum(len(x['docs']) for x in corpus['sessions'])} 篇 / {ch/1e6:.2f}M 字")
         return s
 
     config.pmap(_render_week, weeks, workers=max(1, len(weeks)))   # ★周并行;在飞 API 由全局 LLM_CONCURRENCY 兜住
@@ -462,4 +504,3 @@ def _self_test() -> bool:
 if __name__ == "__main__":
     import sys as _sys
     _sys.exit(0 if _self_test() else 1)
-

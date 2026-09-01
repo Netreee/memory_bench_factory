@@ -8,7 +8,8 @@ import random
 import re
 import config
 from pipeline.world_state import (assemble_world, validate, WorldState, _strip_disambig, name_collisions,
-                                   Op, SET, UPDATE, EXPIRE, DELETE, _to_num)
+                                   Op, SET, UPDATE, EXPIRE, DELETE, INSUFFICIENT, INVALID,
+                                   _to_num, _as_int)
 from pipeline.prompts import render
 
 _BARE_NUM = re.compile(r"^-?\d+(?:\.\d+)?$")
@@ -162,80 +163,240 @@ def _field_desc(f: dict) -> str:
     return f"{f.get('name')}({'·'.join(str(a) for a in ann)})"
 
 
-def _world_system(profile: dict) -> str:
+def _world_system(profile: dict, type_id: str, time_unit: str, open_schema: bool = False) -> str:
     noun = profile.get("entity_noun", "实体")
     fields = profile.get("field_schema", [])
-    fdesc = "、".join(_field_desc(f) for f in fields) or "若干随时间演化字段"
+    fdesc = "、".join(_field_desc(f) for f in fields) or ("若干随时间演化字段" if open_schema else "无内在字段")
     stopped = profile.get("stopped_phrase", "停止/失效")
-    return render("world.system", noun=noun, fdesc=fdesc, stopped=stopped)
+    return render("world.system", noun=noun, type_id=type_id, time_unit=time_unit,
+                  fdesc=fdesc, stopped=stopped)
 
 
 def build_world(wp, tracer, log=print, existing=None) -> WorldState:
-    """existing=None:全量建。existing=WorldState:★增量 augment——只长【新实体】(名避开既有+主干)
-    并入既有世界,旧实体不动(给闭环 ②环增量续渲用,§10.1)。"""
-    profile = wp.get("domain_profile", {})
+    """按白皮书蓝图生成 typed world，并将关系/事件编译进既有 Timeline 地基。
+
+    历史白皮书会先适配成单类型蓝图；显式蓝图不合法、类型数量不足或声明结构没有
+    合法实例时 fail-loud，不允许静默退化回扁平世界。``existing`` 只增长缺口实体。
+    """
+    from pipeline.world_blueprint import normalize_world_blueprint, WorldBlueprintError
+
+    blueprint = normalize_world_blueprint(wp)
+    typed_contract = not blueprint.get("legacy_adapter", False)
+    temporal = blueprint["temporal_model"]
+    n_sessions = int(temporal["n_sessions"])
+    time_unit = temporal["unit"]
+    type_specs = blueprint["entity_types"]
+    primary = next(t for t in type_specs if t.get("primary"))
+
+    # 下游旧产线继续消费 domain_profile，但字段集合只能由 blueprint 投影，不能成为第二真源。
+    profile = dict(wp.get("domain_profile") or {})
+    projected_fields = {}
+    for t in type_specs:
+        for f in t.get("fields") or []:
+            projected_fields.setdefault(f.get("name"), dict(f))
+    profile["entity_noun"] = primary["noun"]
+    profile["field_schema"] = list(projected_fields.values())
+    derived_sms = [{"field": f["name"], "states": f["states"]}
+                   for t in type_specs for f in t.get("fields", [])
+                   if f.get("name") and isinstance(f.get("states"), list) and f.get("states")]
+    if typed_contract:
+        profile["state_machines"] = derived_sms
+    elif derived_sms:
+        old_sms = list(profile.get("state_machines") or [])
+        seen_sms = {m.get("field") for m in old_sms}
+        profile["state_machines"] = old_sms + [m for m in derived_sms if m["field"] not in seen_sms]
+
     spec = wp.get("shared_world_spec", {})
-    n_entities = int(spec.get("entities", {}).get("count", 10))
-    n_sessions = int(spec.get("timeline", {}).get("n_sessions", 16))
-    noun = profile.get("entity_noun", "实体")
-    sysp = _world_system(profile)
+    noun = primary["noun"]
     # ★W.3:让 build_world 真正消费白皮书的 change_density / traps(此前全程无视)
     cd = (spec.get("timeline", {}) or {}).get("change_density", "")
     # 近重名陷阱已在源头【议会菜单 council.traps】删除(不靠代码子串猜,审计★1);
     # 万一漏网,seen_base 在收集期按主干去重(出口拦截)= 真兜底,故此处不再用关键词黑名单过滤。
     traps = [t.get("trap") for t in (wp.get("traps") or []) if t.get("trap")][:3]
-    extra = (f"★变更密度:evolving 字段尽量按「{cd}」铺满全程。" if cd else "")
-    extra += (f"★陷阱布局:本场景需自然埋入这些坑——{traps}(如可矛盾的多源字段、易混字段)。" if traps else "")
-    sm_decl = [f"「{m['field']}」只能取 {m['states']} 且按此序单向推进(可跳级、不可回头)"
-               for m in (profile.get("state_machines") or []) if m.get("field") and m.get("states")]
-    extra += (f"★状态机字段(C1③ 源头约束,validate 还会机械校验):{';'.join(sm_decl)}。" if sm_decl else "")
-    merged = {"entities": [], "cascades": [], "absent_fields": []}
+    base_extra = (f"★变更密度:evolving 字段尽量按「{cd}」铺满全程。" if cd else "")
+    base_extra += (f"★陷阱布局:本场景需自然埋入这些坑——{traps}(如可矛盾的多源字段、易混字段)。" if traps else "")
+    merged = {"entities": [], "relations": [], "events": [], "cascades": [], "absent_fields": []}
     base_ents = existing.entities if existing is not None else {}    # ★增量:在既有世界上只长新实体
     seen = set(base_ents)                             # 新实体名避开既有
     seen_base = {_strip_disambig(e) for e in base_ents}  # ★Fix3:也避开既有主干(不近重名)
-    base_n = len(base_ents)
     batch = 8
 
-    def _world_batch(_i):                             # 一个批次:求 batch 个实体
-        return tracer.chat_json("world.batch",
-            [{"role": "system", "content": sysp},
-             {"role": "user", "content": render("world.user", want=batch, noun=noun, smax=n_sessions - 1, extra=extra)}],
-            temperature=0.7, max_tokens=8192)
+    existing_types = getattr(existing, "entity_types", {}) if existing is not None else {}
+    if typed_contract and base_ents and not existing_types:
+        raise WorldBlueprintError("typed blueprint 不能在缺少 entity_types 的旧世界上增量生成；请全量重建")
+    if existing is not None and blueprint.get("legacy_adapter") and not existing_types:
+        existing.entity_types.update({name: "legacy_entity" for name in base_ents})
+        existing_types = existing.entity_types
+    missing_total = sum(max(0, t["count"] - sum(1 for x in existing_types.values() if x == t["id"]))
+                        for t in type_specs)
+    if existing is not None and missing_total == 0:
+        # 闭环已有实体数已达目标时保持真正 no-op：不调用 LLM、不重建旧 timeline，只补元数据。
+        existing.n_sessions = max(existing.n_sessions or 0, n_sessions)
+        existing.world_blueprint = blueprint
+        coll = name_collisions(existing)
+        log(f"  ✓ 基础世界:{len(existing.entities)} 实体 / {existing.n_sessions} {time_unit} / 增量无需新增"
+            + (f" / ⚠表面塌缩近重名 {coll}" if coll else ""))
+        if not typed_contract:
+            _affix_units(existing, profile, log)
+            imprint_structure(existing, log, profile)
+        return existing
+    relation_fields = {}
+    for rel in blueprint.get("relation_types", []):
+        relation_fields.setdefault(rel["from_type"], set()).add(rel["field"])
+    event_fields = {}
+    for event in blueprint.get("event_types", []):
+        roles = event.get("roles") or {}
+        for effect in event.get("effect_fields", []):
+            tid = roles.get(effect.get("role"))
+            event_fields.setdefault(tid, set()).add(effect.get("field"))
 
-    for rnd in range(4):                              # 最多 4 轮;每轮把"还差几个"凑成的批次【并发】发(全局信号量限在飞 API)
-        if base_n + len(merged["entities"]) >= n_entities:
-            break
-        n_calls = (n_entities - base_n - len(merged["entities"]) + batch - 1) // batch
-        for out in config.pmap(_world_batch, range(n_calls), workers=n_calls):
-            for e in (out.get("entities", []) if isinstance(out, dict) else []):
-                nm = e.get("name")
-                if nm and nm not in seen and e.get("fields"):
-                    base = _strip_disambig(nm)
-                    if base in seen_base:             # ★Fix3:主干已存在(含既有世界)→ 表面塌缩近重名,丢弃
+    def _event_field_is_baseline_only(spec: dict) -> bool:
+        """事件驱动字段在 entity batch 中至多给 session 0 初态，后续变化归 event。"""
+        if not isinstance(spec, dict):
+            return False
+        if spec.get("type") == "stable" or ("value" in spec and "trajectory" not in spec):
+            return spec.get("value") not in (None, "")
+        points = sorted((p for p in spec.get("trajectory", []) if isinstance(p, dict)),
+                        key=lambda p: _as_int(p.get("session"), -1))
+        if not points or _as_int(points[0].get("session"), -1) != 0:
+            return False
+        last = None
+        material = 0
+        for point in points:
+            value = point.get("value")
+            if value in (None, ""):
+                if last is not None:
+                    material += 1
+                last = None
+            elif last is None or str(value).strip() != str(last).strip():
+                material += 1
+                last = value
+        return material <= 1
+
+    # 每个 entity type 独立生成，只给本类型字段；类型不是 prompt 装饰，而是字段白名单的索引。
+    for t in type_specs:
+        tid, type_noun = t["id"], t["noun"]
+        base_count = (sum(1 for x in existing_types.values() if x == tid)
+                      if existing_types else (len(base_ents) if blueprint.get("legacy_adapter") else 0))
+        want_total = t["count"]
+        produced: list[dict] = []
+        intrinsic = [f for f in t.get("fields", []) if f.get("name") not in relation_fields.get(tid, set())]
+        type_profile = {**profile, "entity_noun": type_noun, "field_schema": intrinsic}
+        type_field_names = {f.get("name") for f in t.get("fields", [])}
+        sm_decl = [f"「{m['field']}」只能取 {m['states']} 且按此序单向推进(可跳级、不可回头)"
+                   for m in (profile.get("state_machines") or [])
+                   if m.get("field") in type_field_names and m.get("states")]
+        type_extra = base_extra + (f"★状态机字段(C1③ 源头约束,validate 还会机械校验):{';'.join(sm_decl)}。"
+                                   if sm_decl else "")
+        owned = sorted(event_fields.get(tid, set()) - relation_fields.get(tid, set()))
+        if owned:
+            type_extra += (f"★这些字段由 domain event 驱动:{owned}。entity batch 可省略它们；若给初态，"
+                           "只能给 stable 或 session=0 的单一基线，严禁自行生成后续变化，后续只能由事件 effect 写入。")
+        open_schema = bool(blueprint.get("legacy_adapter") and not intrinsic)
+        sysp = _world_system(type_profile, tid, time_unit, open_schema=open_schema)
+
+        for rnd in range(4):
+            need = want_total - base_count - len(produced)
+            if need <= 0:
+                break
+            wants = [min(batch, max(0, need - i * batch)) for i in range((need + batch - 1) // batch)]
+
+            def _world_batch(want):
+                return tracer.chat_json("world.batch",
+                    [{"role": "system", "content": sysp},
+                     {"role": "user", "content": render("world.user", want=want, noun=type_noun,
+                                                          type_id=tid, smax=n_sessions - 1, extra=type_extra)}],
+                    temperature=0.7, max_tokens=8192)
+
+            for out in config.pmap(_world_batch, wants, workers=len(wants)):
+                for raw in (out.get("entities", []) if isinstance(out, dict) else []):
+                    if not isinstance(raw, dict):
                         continue
-                    seen.add(nm); seen_base.add(base); merged["entities"].append(e)
-        log(f"  世界 round{rnd+1}: 累计 {base_n + len(merged['entities'])}/{n_entities} {noun}"
-            f"{'(增量)' if existing is not None else ''}(并发 {n_calls} 批)")
-    # ★字段白名单(174925 双字段串周根治):字段集【单一真源】= field_schema ∪ state_machines.field
-    #   (审计 HIGH:state_machines 声明的『案件状态』不在 field_schema、却被 extra 指示 LLM 必造 → 漏进真源会被
-    #    误删、C1③ 空转。真源必须并上它)。world-gen LLM 擅自发明的字段(legal『处理策略』『争议解决策略』与 L4 轴
-    #   语义/取值池重叠 → gold 串)一律剔除。收自由度归 schema(同议会 canonical-id),非子串猜=非补丁。
-    #   ★preference_axis.field 故意【不】并入真源:它由 L4.prepare 在 build_world 之后独家注入,并入会让 LLM 发明的
-    #    轴字段存活 → 双流污染复活(正是要治的病)。L5 侧信道不占世界字段,不受此限。schema 空则不启用(防误删空世界)。
-    schema_fields = {f.get("name") for f in profile.get("field_schema", []) if f.get("name")}
-    schema_fields |= {m.get("field") for m in (profile.get("state_machines") or []) if m.get("field")}
-    if schema_fields:
-        dropped_f, emptied = {}, []
-        for e in merged["entities"]:
-            off_schema = [fn for fn in (e.get("fields") or {}) if fn not in schema_fields]
-            for fn in off_schema:
-                e["fields"].pop(fn, None); dropped_f[fn] = dropped_f.get(fn, 0) + 1
-            if not e.get("fields"):                       # 审计 LOW:白名单把某实体剔成空 → assemble 会静默丢该实体
-                emptied.append(e.get("name"))
-        if dropped_f:
-            log(f"  ★字段白名单:剔除 schema 外擅自发明字段 {dict(sorted(dropped_f.items(), key=lambda x:-x[1]))}"
-                + (f";⚠{len(emptied)} 个实体被剔空将被丢弃 {emptied}(议会字段命名与世界生成不符,查 schema)" if emptied else ""))
-    ws, _ = assemble_world(merged)
+                    e = dict(raw)
+                    if typed_contract and e.get("type") != tid:
+                        continue
+                    e["type"] = tid                 # legacy 输出常写 noun；入真源后一律用稳定 type id
+                    nm = e.get("name")
+                    if not nm or nm in seen or not isinstance(e.get("fields", {}), dict):
+                        continue
+                    base = _strip_disambig(nm)
+                    if base in seen_base:
+                        continue
+                    allowed = {f.get("name") for f in intrinsic if f.get("name")}
+                    required = allowed - event_fields.get(tid, set())
+                    fields = dict(e.get("fields") or {})
+                    off_schema = [] if open_schema else [fn for fn in fields if fn not in allowed]
+                    for fn in off_schema:
+                        fields.pop(fn, None)
+                    if typed_contract and not required.issubset(fields):
+                        continue                     # 缺本类型内在字段的实体不计数，交给下一生成轮补齐
+                    if typed_contract and any(
+                            fname in fields and not _event_field_is_baseline_only(fields[fname])
+                            for fname in event_fields.get(tid, set()) - relation_fields.get(tid, set())):
+                        continue                     # 事件拥有状态迁移；batch 只能提供可选初态
+                    e["fields"] = fields
+                    seen.add(nm); seen_base.add(base); produced.append(e)
+                    if base_count + len(produced) >= want_total:
+                        break
+            log(f"  世界·{tid} round{rnd+1}:累计 {base_count + len(produced)}/{want_total} {type_noun}"
+                f"{'(增量)' if existing is not None else ''}(并发 {len(wants)} 批)")
+        if base_count + len(produced) < want_total:
+            raise WorldBlueprintError(
+                f"entity type {tid} 实例不足:{base_count + len(produced)}/{want_total}；4 轮后仍未满足蓝图")
+        merged["entities"].extend(produced[:max(0, want_total - base_count)])
+
+    # 关系/事件在所有 typed entities 生成后统一实例化；提示中带完整契约与可引用实体目录。
+    structural_markers = ("entity ", "relation", "event", "causal rule")
+    if typed_contract and (blueprint.get("relation_types") or blueprint.get("event_types")):
+        def _initial_state(name, tid, raw_fields=None):
+            out = {}
+            if raw_fields is None and existing is not None:
+                for fname in event_fields.get(tid, set()):
+                    tl = existing.entities.get(name, {}).get(fname)
+                    if tl and tl.value_at_session(0) not in (None, INSUFFICIENT, INVALID):
+                        out[fname] = tl.value_at_session(0)
+                return out
+            for fname in event_fields.get(tid, set()):
+                spec = (raw_fields or {}).get(fname) or {}
+                if spec.get("type") == "stable" or ("value" in spec and "trajectory" not in spec):
+                    if spec.get("value") not in (None, ""):
+                        out[fname] = spec.get("value")
+                else:
+                    first = next((p for p in spec.get("trajectory", [])
+                                  if isinstance(p, dict) and _as_int(p.get("session"), -1) == 0
+                                  and p.get("value") not in (None, "")), None)
+                    if first:
+                        out[fname] = first.get("value")
+            return out
+
+        catalog = [{"name": e, "type": existing_types.get(e),
+                    "initial_state": _initial_state(e, existing_types.get(e))} for e in base_ents]
+        catalog += [{"name": e.get("name"), "type": e.get("type"),
+                     "initial_state": _initial_state(e.get("name"), e.get("type"), e.get("fields") or {})}
+                    for e in merged["entities"]]
+        hint = ""
+        for attempt in range(3):
+            structure = tracer.chat_json("world.structure",
+                [{"role": "system", "content": render("world.structure", smax=n_sessions - 1)},
+                 {"role": "user", "content": render(
+                     "world.structure_user", time_unit=time_unit, cadence=temporal["cadence"],
+                     smax=n_sessions - 1, blueprint=json.dumps(blueprint, ensure_ascii=False),
+                     entities=json.dumps(catalog, ensure_ascii=False)) + hint}],
+                temperature=0.4, max_tokens=8192)
+            if isinstance(structure, dict):
+                merged["relations"] = [x for x in structure.get("relations", []) if isinstance(x, dict)]
+                merged["events"] = [x for x in structure.get("events", []) if isinstance(x, dict)]
+            trial, trial_issues = assemble_world(merged, blueprint=blueprint, existing=existing)
+            structural_issues = [x for x in trial_issues if x.startswith(structural_markers)]
+            if not structural_issues:
+                break
+            log(f"  ⟳ 世界骨架实例修复轮{attempt+1}:{len(structural_issues)} 个契约违例")
+            hint = "\n【上轮机械校验失败，必须全部修正】\n- " + "\n- ".join(structural_issues)
+
+    ws, compile_issues = assemble_world(merged, blueprint=blueprint, existing=existing)
+    structural_issues = [x for x in compile_issues if x.startswith(structural_markers)]
+    if structural_issues:
+        raise WorldBlueprintError("世界实例未满足 blueprint:\n- " + "\n- ".join(structural_issues))
     # ★W.3 CRITIC 修复轮:assemble 算出的缺陷不再"只 log 就扔"——定向重生成坏字段(复用并行骨架:发散批次→收敛修复)
     ent_idx = {e.get("name"): e for e in merged["entities"]}
     for rep in range(3):
@@ -250,12 +411,14 @@ def build_world(wp, tracer, log=print, existing=None) -> WorldState:
         def _repair(item):
             ent, ds = item
             cur = (ent_idx.get(ent) or {}).get("fields", {})
+            tid = (ent_idx.get(ent) or {}).get("type") or getattr(ws, "entity_types", {}).get(ent)
+            repair_noun = next((t["noun"] for t in type_specs if t["id"] == tid), noun)
             lines = "\n".join(
                 f"  字段「{d['field']}」缺陷[{d['type']}]:{d['detail']};当前={json.dumps(cur.get(d['field'], {}), ensure_ascii=False)}"
                 for d in ds)
             return ent, tracer.chat_json("world.repair",
-                [{"role": "system", "content": render("world.repair", noun=noun, smax=n_sessions - 1)},
-                 {"role": "user", "content": render("world.repair_user", noun=noun, ent=ent, defects=lines, smax=n_sessions - 1)}],
+                [{"role": "system", "content": render("world.repair", noun=repair_noun, smax=n_sessions - 1)},
+                 {"role": "user", "content": render("world.repair_user", noun=repair_noun, ent=ent, defects=lines, smax=n_sessions - 1)}],
                 temperature=0.8, max_tokens=4096)
 
         for ent, out in config.pmap(_repair, list(by_ent.items()), workers=min(8, len(by_ent))):
@@ -263,15 +426,25 @@ def build_world(wp, tracer, log=print, existing=None) -> WorldState:
             newf = (out.get("fields") if isinstance(out, dict) else None) or {}
             if e and newf:                                # 只覆盖被点名的坏字段,不新增/不动其它字段
                 e["fields"].update({k: v for k, v in newf.items() if k in e.get("fields", {})})
-        ws, _ = assemble_world(merged)
+        ws, compile_issues = assemble_world(merged, blueprint=blueprint, existing=existing)
+        structural_issues = [x for x in compile_issues if x.startswith(structural_markers)]
+        if structural_issues:
+            raise WorldBlueprintError("修复后世界结构破坏 blueprint:\n- " + "\n- ".join(structural_issues))
     ws.n_sessions = max(ws.n_sessions or 0, n_sessions, (existing.n_sessions if existing is not None else 0))
     if existing is not None:                          # ★增量 augment:只把【新实体】并入既有世界,旧实体/旧 docs 全不动
-        existing.entities.update(ws.entities)
-        existing.n_sessions = max(existing.n_sessions or 0, ws.n_sessions)
+        # 保持调用方持有的对象身份不变，但用“旧世界 + delta 编译”的完整结果原子替换其状态。
+        for attr in ("entities", "cascades", "absent_fields", "n_sessions", "conflicts", "sensitive",
+                     "conditional_rules", "rule_instances", "entity_types", "relations", "events",
+                     "world_blueprint"):
+            setattr(existing, attr, getattr(ws, attr))
+        existing._trended_fields = list(getattr(ws, "_trended_fields", []) or [])
         ws = existing
     rem = validate(ws, merged, profile)               # ★validate 在【注趋势前】跑(对 merged 一致,不误报);imprint 产出本就良构,无需复验
+    if typed_contract and rem:
+        details = [f"{d.get('entity')}.{d.get('field')}[{d.get('type')}]:{d.get('detail')}" for d in rem]
+        raise WorldBlueprintError("typed world 修复轮耗尽后仍有真值缺陷:\n- " + "\n- ".join(details))
     coll = name_collisions(ws)                        # ★Fix3:表面塌缩兜底检测(收集期已按主干去重,这里抓漏网)
-    log(f"  ✓ 基础世界:{len(ws.entities)} 实体 / {ws.n_sessions} 周 / 修复后残留缺陷 {len(rem)}"
+    log(f"  ✓ 基础世界:{len(ws.entities)} 实体 / {ws.n_sessions} {time_unit} / 修复后残留缺陷 {len(rem)}"
         + (f" / ⚠表面塌缩近重名 {coll}" if coll else ""))  # 产线基质由 stage_world 的 line.prepare() 叠加
     # ★声明-世界对齐自检(刀1审计:声明字段在世界中无命中时静默 no-op,漂移不可观测)
     all_fields = {f for flds in ws.entities.values() for f in flds}
@@ -279,7 +452,9 @@ def build_world(wp, tracer, log=print, existing=None) -> WorldState:
     ghost += [f.get("name") for f in profile.get("field_schema", []) if f.get("unit") and f.get("name") not in all_fields]
     if ghost:
         log(f"  ⚠声明字段未在世界命中(states/unit 约束将空转,检查议会命名一致性):{sorted(set(ghost))}")
-    _affix_units(ws, profile, log)                    # ★C1②:单位真源化(在 imprint 前,imprint 会保后缀回贴)
-    imprint_structure(ws, log, profile)               # ★B:注入真趋势(世界属性,早于 orders/render → 不矛盾);L7-S1 据此有料
+    if typed_contract:
+        log("  ✓ typed world 冻结:跳过 legacy 单位补写/趋势整形，领域事件与 timeline 保持同一真源")
+    else:
+        _affix_units(ws, profile, log)                # legacy 保持历史单位真源化行为
+        imprint_structure(ws, log, profile)           # legacy 保持历史 L7 基质整形行为
     return ws
-

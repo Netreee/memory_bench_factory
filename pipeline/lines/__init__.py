@@ -23,8 +23,8 @@ from pipeline.lines.L9_induction import InductionLine
 from pipeline.lines.L10_admission import AdmissionLine
 
 # ── 已建成的产线(实例)──
-# ★L8_transition:结构原型【状态机】招牌线,feasible 只在【有 state_machines 声明】的场景(cs/legal)激活
-#   → office/game 无此线 = 不同场景【结构分叉】的来源(治盲审病根①"换皮不换芯")。
+# ★L8_transition:结构原型【状态机】招牌线,feasible 只读取世界蓝图自然声明的 state_machines；
+#   不按场景名决定，也不为激活能力事后补造生命周期。
 # ★L9_induction:条件归纳招牌线,auto_activate——prepare 声明阶跃规则 + 注入执行实例(ws.rule_instances)后即触发;
 #   从【单条情境→动作】实例归纳 IF-THEN 函数,并在【未见 trigger 值 x*】上外推(function-on-unseen)。
 #   gold=apply_rule 纯查表;闭选项 MC EM 避开 llm_judge;canon 层防检索捷径;唯一性闸保 gold 硬(与 L8 换皮无关)。
@@ -134,6 +134,12 @@ def run_lines(wp, ws, log=print, quotas=None) -> list[dict]:
 def prepare_lines(wp, ws, log=print):
     """各激活产线把所需基质叠进【共享世界】(命门1):L2=加人员实体、L5=注矛盾,其它默认 no-op。
     stage_world 与闭环 driver 共用,避免两处各写一遍 prepare 循环。"""
+    blueprint = getattr(ws, "world_blueprint", None) or {}
+    if blueprint and not blueprint.get("legacy_adapter"):
+        # 显式世界蓝图已经冻结领域本体与动力学。能力线只能在 orders 阶段读取、判断可行性，
+        # 不能再通过 prepare 注入字段、改轨迹或塞入与场景无关的工单/敏感侧世界。
+        log("  ✓ typed world 已冻结:能力线只读映射，不执行 prepare 注入")
+        return
     profile = wp.get("domain_profile", {})
     seen = set()
     for aid in [l.get("line") for l in wp.get("active_lines", [])]:
@@ -181,7 +187,7 @@ def _selftest() -> int:
     # ── 依赖图结构不变量 ──
     ck("依赖图覆盖所有 LINES", set(dg) == {l.id for l in LINES})
     ck("L1 无依赖(根)", dg.get("L1_timeline") == [])
-    ck("L2 依赖 person_fields>=2", dg.get("L2_relational") == ["person_fields>=2"])
+    ck("L2 依赖 soft_fk_path", dg.get("L2_relational") == ["soft_fk_path"])
     ck("L3 依赖 multi_event_timelines", dg.get("L3_process") == ["multi_event_timelines"])
     ck("L5 依赖 text_fields", dg.get("L5_conflict") == ["text_fields"])
 

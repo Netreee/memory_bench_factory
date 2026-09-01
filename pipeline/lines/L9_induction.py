@@ -103,6 +103,9 @@ def inject_rules(ws: WorldState, profile: dict = None, seed: int = _SEED) -> lis
     """声明一条确定性阶跃规则(→ ws.conditional_rules)+ 生成执行实例(→ ws.rule_instances 侧信道)。
     每实例 = 【单条情境→动作】,canon_action 由 apply_rule 产、surface_action 取【不同表面串】(canon 层)。
     幂等:已注入(ws.rule_instances 非空)则不重注。"""
+    blueprint = getattr(ws, "world_blueprint", None) or {}
+    if blueprint and not blueprint.get("legacy_adapter"):
+        return []                                      # typed blueprint 尚未声明规则基质，禁止跨域注入固定工单生态
     if getattr(ws, "rule_instances", None):
         return ws.rule_instances
     rule = {k: v for k, v in _RULE_TEMPLATE.items() if k != "subject_noun"}
@@ -123,7 +126,7 @@ def inject_rules(ws: WorldState, profile: dict = None, seed: int = _SEED) -> lis
                 "rule_id": rule["rule_id"], "inst_id": f"{subject}#{seed % 1000}-{idx:02d}",
                 "x": x, "canon_action": gold_action, "surface_action": surface,
                 "trigger_field": rule["trigger_field"], "unit": rule["unit"],
-                "session": sess, "date": _date_of(sess),
+                "session": sess, "date": ws.date_of_session(sess),
             })
             idx += 1
     ws.conditional_rules = [rule]
