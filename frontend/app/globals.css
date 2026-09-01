@@ -1,0 +1,186 @@
+@import 'tailwindcss';
+@import 'tw-animate-css';
+@import 'shadcn/tailwind.css';
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --radius-sm: calc(var(--radius) * .6);
+  --radius-md: calc(var(--radius) * .8);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.4);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+:root {
+  --background: #050710;
+  --foreground: #edf7ff;
+  --card: #0d1426;
+  --card-foreground: #edf7ff;
+  --popover: #0d1426;
+  --popover-foreground: #edf7ff;
+  --primary: #45e6ff;
+  --primary-foreground: #031015;
+  --secondary: #111c31;
+  --secondary-foreground: #d9effb;
+  --muted: #11192a;
+  --muted-foreground: #7890a6;
+  --accent: #182541;
+  --accent-foreground: #edf7ff;
+  --destructive: #ff6078;
+  --border: rgb(104 160 199 / 18%);
+  --input: rgb(104 160 199 / 22%);
+  --ring: #45e6ff;
+  --radius: .25rem;
+  --forge-cyan: #45e6ff;
+  --forge-violet: #9d72ff;
+  --forge-green: #75f3b0;
+  --forge-gold: #ffc867;
+  --forge-dim: #7890a6;
+}
+
+* { box-sizing: border-box; }
+html, body { min-height: 100%; background: var(--background); }
+body { margin: 0; color: var(--foreground); font-family: var(--font-geist-sans), "PingFang SC", "Microsoft YaHei", sans-serif; }
+button { font: inherit; }
+
+.forge-app {
+  position: relative;
+  display: grid;
+  grid-template-rows: 72px minmax(0, 1fr) 82px;
+  min-height: 100svh;
+  overflow: hidden;
+  background:
+    radial-gradient(circle at 52% 42%, rgb(50 103 181 / 17%), transparent 34%),
+    linear-gradient(135deg, #050710 0%, #08101e 48%, #050811 100%);
+}
+
+.forge-grid {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  opacity: .24;
+  background-image: linear-gradient(rgb(91 156 196 / 10%) 1px, transparent 1px), linear-gradient(90deg, rgb(91 156 196 / 10%) 1px, transparent 1px);
+  background-size: 48px 48px;
+  mask-image: linear-gradient(to bottom, transparent, black 18%, black 80%, transparent);
+}
+
+.forge-header, .forge-controls { position: relative; z-index: 20; background: rgb(5 8 18 / 78%); backdrop-filter: blur(18px); }
+.forge-header { display: flex; align-items: center; justify-content: space-between; padding: 0 28px; border-bottom: 1px solid var(--border); }
+.forge-brand { display: flex; align-items: center; gap: 12px; }
+.forge-logo { display: grid; place-items: center; width: 38px; height: 38px; color: var(--forge-cyan); font: 11px var(--font-geist-mono); background: rgb(69 230 255 / 10%); border: 1px solid rgb(69 230 255 / 36%); clip-path: polygon(22% 0, 78% 0, 100% 22%, 100% 78%, 78% 100%, 22% 100%, 0 78%, 0 22%); }
+.forge-brand-name { margin: 0; font-size: 13px; font-weight: 600; letter-spacing: .17em; }
+.forge-brand-subtitle { margin: 4px 0 0; color: var(--forge-dim); font: 9px var(--font-geist-mono); letter-spacing: .18em; }
+.forge-run-meta { display: flex; gap: 18px; color: var(--forge-dim); font: 10px var(--font-geist-mono); letter-spacing: .05em; }
+.forge-real-data { color: var(--forge-green); }
+
+.forge-layout { position: relative; z-index: 2; display: grid; grid-template-columns: 118px minmax(0, 1fr) 210px; min-height: 0; }
+.forge-stage-nav { display: flex; flex-direction: column; padding: 20px 12px; border-right: 1px solid var(--border); background: rgb(5 8 18 / 38%); }
+.forge-stage { position: relative; display: flex; flex-direction: column; align-items: flex-start; min-height: 82px; padding: 14px 10px; color: var(--forge-dim); text-align: left; background: transparent; border: 0; border-left: 1px solid rgb(104 160 199 / 18%); cursor: pointer; }
+.forge-stage::before { content: ''; position: absolute; left: -2px; top: 14px; width: 3px; height: 0; background: var(--forge-cyan); box-shadow: 0 0 18px var(--forge-cyan); transition: height .35s ease; }
+.forge-stage.is-active { color: var(--foreground); }
+.forge-stage.is-active::before { height: 48px; }
+.forge-stage span { color: var(--forge-cyan); font: 9px var(--font-geist-mono); }
+.forge-stage strong { margin-top: 8px; font-size: 12px; font-weight: 500; }
+
+.forge-main-stage { min-width: 0; padding: 24px 30px 12px; }
+.forge-scene-heading { display: flex; justify-content: space-between; align-items: flex-end; gap: 24px; }
+.forge-eyebrow { margin: 0 0 7px; color: var(--forge-cyan); font: 10px var(--font-geist-mono); letter-spacing: .16em; }
+.forge-scene-heading h1 { margin: 0; font-size: clamp(28px, 3vw, 52px); line-height: 1.05; font-weight: 500; letter-spacing: -.04em; }
+.forge-scene-index { flex: none; color: var(--forge-dim); font: 10px var(--font-geist-mono); }
+
+.council-stage { position: relative; height: calc(100% - 82px); min-height: 500px; margin-top: 16px; overflow: hidden; border-top: 1px solid rgb(104 160 199 / 15%); border-bottom: 1px solid rgb(104 160 199 / 12%); }
+.council-links { position: absolute; left: 50%; top: 50%; width: min(700px, 72vw); height: min(560px, 64vh); transform: translate(-50%, -50%); opacity: .55; }
+.council-links line { stroke: var(--forge-violet); stroke-width: 1; stroke-dasharray: 4 7; }
+.council-rings { position: absolute; left: 50%; top: 50%; width: min(410px, 38vw); aspect-ratio: 1; transform: translate(-50%, -50%); }
+.council-rings i { position: absolute; inset: 0; border: 1px solid rgb(69 230 255 / 18%); border-radius: 50%; }
+.council-rings i:nth-child(2) { inset: 17%; border-color: rgb(99 130 255 / 18%); }
+.council-rings i:nth-child(3) { inset: 36%; border-color: rgb(157 114 255 / 28%); }
+.agent-node { position: absolute; z-index: 4; display: grid; place-items: center; width: 82px; height: 68px; color: var(--forge-dim); text-align: center; background: rgb(10 18 34 / 92%); border: 1px solid rgb(99 130 255 / 36%); clip-path: polygon(16% 0, 84% 0, 100% 20%, 100% 80%, 84% 100%, 16% 100%, 0 80%, 0 20%); transform: translate(-50%, -50%); }
+.agent-node strong { color: var(--foreground); font: 10px var(--font-geist-mono); font-weight: 500; }
+.agent-node span { font-size: 9px; }
+.whitepaper-core { position: absolute; z-index: 5; left: 50%; top: 50%; width: 240px; min-height: 272px; padding: 20px; transform: translate(-50%, -50%) perspective(900px) rotateY(-5deg); background: linear-gradient(145deg, rgb(63 103 169 / 20%), rgb(8 15 30 / 96%)); border: 1px solid rgb(69 230 255 / 42%); box-shadow: 0 0 70px rgb(69 230 255 / 10%); overflow: hidden; }
+.whitepaper-topline { display: flex; justify-content: space-between; color: var(--forge-cyan); font: 9px var(--font-geist-mono); }
+.whitepaper-topline em { color: var(--forge-dim); font-style: normal; }
+.whitepaper-core h2 { margin: 24px 0; font-size: 18px; font-weight: 500; }
+.whitepaper-section { padding: 11px 0; border-top: 1px solid rgb(104 160 199 / 16%); }
+.whitepaper-section span { display: block; color: var(--forge-gold); font: 8px var(--font-geist-mono); }
+.whitepaper-section b { display: block; margin-top: 4px; color: #b9cedd; font: 10px var(--font-geist-mono); font-weight: 400; }
+.whitepaper-scan { position: absolute; left: 0; right: 0; top: 14%; height: 1px; background: var(--forge-cyan); box-shadow: 0 0 18px var(--forge-cyan); opacity: 0; }
+.council-caption { position: absolute; left: 50%; bottom: 20px; width: min(620px, 80%); margin: 0; transform: translateX(-50%); color: var(--forge-dim); text-align: center; font-size: 13px; }
+
+.council-stage.is-running .agent-node { animation: agent-activate .7s cubic-bezier(.2,.8,.2,1) both; }
+.council-stage.is-running .whitepaper-scan { animation: scan-paper 1.8s .8s ease-out both; }
+@keyframes agent-activate { from { opacity: .2; filter: blur(4px); transform: translate(-50%, -50%) scale(.65); } to { opacity: 1; filter: none; transform: translate(-50%, -50%) scale(1); } }
+@keyframes scan-paper { 0% { top: 14%; opacity: 0; } 15%, 78% { opacity: 1; } 100% { top: 92%; opacity: 0; } }
+
+.forge-telemetry { padding: 24px 18px; border-left: 1px solid var(--border); background: rgb(5 8 18 / 38%); }
+.forge-panel-label { margin: 0; color: var(--forge-dim); font: 9px var(--font-geist-mono); letter-spacing: .15em; }
+.forge-metric { padding: 24px 4px 20px; border-bottom: 1px solid rgb(104 160 199 / 15%); }
+.forge-metric span { display: block; color: var(--forge-dim); font: 9px var(--font-geist-mono); }
+.forge-metric strong { display: inline-block; margin-top: 8px; font: 30px var(--font-geist-mono); font-weight: 400; }
+.forge-metric em { margin-left: 7px; color: var(--forge-cyan); font: 9px var(--font-geist-mono); font-style: normal; }
+.forge-integrity { margin-top: 24px; color: var(--forge-dim); font: 9px/1.75 var(--font-geist-mono); }
+.forge-integrity span { color: var(--forge-gold); }
+
+.forge-controls { display: grid; grid-template-columns: auto minmax(220px, 1fr) auto auto; align-items: center; gap: 22px; padding: 0 28px; border-top: 1px solid var(--border); }
+.forge-primary-action { height: 44px; padding-inline: 18px; border-radius: 0; box-shadow: 0 0 24px rgb(69 230 255 / 16%); }
+.forge-timeline { display: grid; grid-template-columns: repeat(5, 1fr); align-items: center; }
+.forge-timeline span { position: relative; display: block; height: 1px; background: rgb(104 160 199 / 25%); }
+.forge-timeline span::after { content: ''; position: absolute; right: 50%; top: 50%; width: 7px; height: 7px; border-radius: 50%; background: #34475a; transform: translate(50%, -50%); }
+.forge-timeline span.is-current::after { background: var(--forge-cyan); box-shadow: 0 0 16px var(--forge-cyan); }
+.forge-status { margin: 0; color: var(--forge-dim); font: 9px var(--font-geist-mono); white-space: nowrap; }
+.forge-utility-actions { display: flex; gap: 4px; }
+
+@media (max-width: 980px) {
+  .forge-layout { grid-template-columns: 98px minmax(0, 1fr); }
+  .forge-telemetry { display: none; }
+  .forge-main-stage { padding-inline: 20px; }
+  .forge-run-meta span:first-child { display: none; }
+}
+
+@media (max-width: 700px) {
+  .forge-app { grid-template-rows: 68px minmax(0, 1fr) 116px; overflow: auto; }
+  .forge-header { padding-inline: 14px; }
+  .forge-brand-subtitle { display: none; }
+  .forge-layout { grid-template-columns: 1fr; }
+  .forge-stage-nav { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); padding: 4px 8px; border-right: 0; border-bottom: 1px solid var(--border); }
+  .forge-stage { min-height: 54px; padding: 9px 4px; border-left: 0; border-bottom: 1px solid rgb(104 160 199 / 18%); }
+  .forge-stage::before { left: 4px; right: 4px; top: auto; bottom: -1px; width: auto; height: 2px; transform: scaleX(0); }
+  .forge-stage.is-active::before { height: 2px; transform: scaleX(1); }
+  .forge-stage strong { margin-top: 3px; font-size: 9px; }
+  .forge-main-stage { padding: 16px 12px 8px; }
+  .forge-scene-heading h1 { font-size: 24px; }
+  .forge-scene-index { display: none; }
+  .council-stage { min-height: 540px; }
+  .council-links { width: 520px; }
+  .council-rings { width: 280px; }
+  .agent-node { width: 70px; height: 60px; }
+  .whitepaper-core { width: 190px; min-height: 244px; padding: 15px; }
+  .forge-controls { grid-template-columns: auto 1fr; gap: 10px; padding: 12px 14px; }
+  .forge-status { grid-column: 1 / -1; }
+  .forge-utility-actions { display: none; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; }
+}
