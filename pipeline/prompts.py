@@ -26,7 +26,7 @@ PROMPTS: dict[str, str] = {
   但若字段在清单里标了【累计只增】就逐周【不减】(可个别周持平、整体递增,此时不要非单调!)、标了【只减】就逐周【不增】,标了【值域 a-b】就全程不出界。
   ★所有数值【写纯阿拉伯数字、不加千分位逗号】(写 1050 不写 1,050),单位按字段清单。
 - person/status/category 字段:给 trajectory(随时间换),或 stable 给单一 value；但 user 若标为【domain event 驱动】，这里只能给可选初态，后续变化留给 event effect
-- ★至少 1 个字段末尾 null 结尾(= 该字段「$stopped」,考遗忘/停用前最后值)
+- 若本类型存在非结构驱动字段，至少 1 个字段末尾 null 结尾(= 该字段「$stopped」,考遗忘/停用前最后值)；若 user 明示全部字段均由 domain event 驱动，可直接输出空 fields，不适用此要求。
 
 【硬约束】1.全新虚构值(防泄漏);2.session 用 0..N-1 整数,不写日期;3.evolving≥2 个不同值,★字段就用给定清单里的全部【非结构驱动】字段(不另加、不少给；关系/event 驱动字段遵从 user 的单独说明);4.★所有专名(实体名 + 人名类字段值)**表面互不近似**:禁止"张三/张三(数据)/张三_数据"这类共享主干的近重名(下游机械校验表面塌缩,近重名整条作废)。
 
@@ -35,14 +35,14 @@ PROMPTS: dict[str, str] = {
 【严格 JSON,name 是专名而非字段,type 必须逐字为 type id】{"entities":[{"name":"<一个真实$noun的专名>","type":"$type_id","fields":{"<字段名>":{"type":"evolving","value_type":"...","trajectory":[{"session":0,"value":"..."}]},"<稳定字段>":{"type":"stable","value":"..."}}}]}""",
 
     # ── 世界生成 user($noun $want $smax $extra;smax = n_sessions-1;extra=白皮书 change_density/traps 钩子)──
-    "world.user": """设计 $want 个【$noun】(type id=$type_id,名字互不相同),session 用 0..$smax；字段允许时做非单调演化并让至少一个字段 null 结尾。严格 JSON。$extra""",
+    "world.user": """设计 $want 个【$noun】(type id=$type_id,名字互不相同),session 用 0..$smax；非结构驱动字段允许时做非单调演化并让至少一个字段 null 结尾。严格 JSON。$extra""",
 
     # ── 世界骨架实例化：只连已生成实体，不再发明实体/字段/关系/事件类型 ──
     "world.structure": """你是世界蓝图实例化器。给定【已经生成的 typed entities】和【机器契约 blueprint】，只实例化契约声明的关系与领域事件。
 【硬约束】
-1. 只能引用给定实体专名；relation 的 from/to 类型必须匹配声明，且每种至少达到 min_count；每个 relation id 唯一，禁止重复边；temporal=false 的静态关系 session 必须为 0。代码会根据 relation.field 在哪一端声明，将另一端专名写入该 owner 的 Timeline。对同一 owner.field，按 session 递增时必须是真实引用变化，禁止连续重复同一目标凑数量。
-2. event 的 participants 必须逐角色匹配声明类型；每种至少达到 min_count；session 为 0..$smax。event id 唯一，且同一 type/session/完整 participants 只能出现一次，禁止只换 id 重复计数。
-3. 每个 event effect 只能使用该事件 effect_fields 声明的 role/field；输出时 entity 必须等于 participants 中该 role 对应实体，并给 set 值。全局每个 (entity,field,session) effect slot 只能被一个事件使用；set 必须相对该字段此前值造成真实变化（status 换状态、numeric 遵守 monotonic 且数值不同），禁止冲突或空操作。
+1. 只能引用给定实体专名；relation 的 from/to 类型必须匹配声明，且每种【恰好生成 min_count 个】（不要为每个实体铺满、不要额外多造）；每个 relation id 唯一，禁止重复边；temporal=false 的静态关系 session 必须为 0。代码会根据 relation.field 在哪一端声明，将另一端专名写入该 owner 的 Timeline。对同一 owner.field，按 session 递增时必须是真实引用变化，禁止连续重复同一目标凑数量。
+2. event 的 participants 必须逐角色匹配声明类型；每种【恰好生成 min_count 个】（因果规则所需见证也包含在这个数量内，不额外扩张）；session 为 0..$smax。event id 唯一，且同一 type/session/完整 participants 只能出现一次，禁止只换 id 重复计数。
+3. 每个 event effect 只能使用该事件 effect_fields 声明的 role/field；输出时 entity 必须等于 participants 中该 role 对应实体，并给 set 值。全局每个 (entity,field,session) effect slot 只能被一个事件使用；set 必须相对 initial_state 与此前事件造成真实变化。多个事件写同一状态字段时，分配到递增 session，并沿 fields.states 合法推进；numeric 遵守 monotonic 且数值不同。禁止冲突、同 session 双写或空操作。
 4. causal_rules 声明 A→B 时，至少造一对真实 A/B 事件；B 写 caused_by=A 的事件 id，session 差严格等于 delay_sessions。
 5. typed entities 目录可能给出 event-owned 字段的 initial_state；effect 必须写成不同于其当时状态的真实变化，不能空操作。
 6. 严禁输出 cascades；代码会从验证过的事件因果机械编译。严禁新增类型、字段或实体。
@@ -95,8 +95,12 @@ $docs
 严格 JSON {"answer":"..."}。""",
 
     # ── §7 草堆渲染(system;$noun)─────────────────────────────────────────
-    "filler.system": """你生成【$noun】领域团队的杂项干扰文档,给记忆评测语料制造"草堆"。题材任选且每篇不同(培训/通知/公告/政策/会议/系统维护…)。
-【硬约束】1.★绝不碰任何被追踪的 $noun 名/人名/字段(连名字都不出现,不给数值/状态),只写完全无关的日常杂事;2.自然像真文档,每篇600-1000字,带本周日期。
+    "filler.system": """你为记忆评测生成【与目标场景同一领域、同一叙事世界】的背景干扰文档。草堆必须像这个世界自然产生的旁支记录,不能突然切换成另一个行业或时代。
+【领域画像】主体类别:$noun；优先体裁:$genres；冻结世界语境:$world_context
+【硬约束】
+1. ★绝不碰任何被追踪的 $noun 名/人名/字段(连名字都不出现,不给数值/状态),只使用全新虚构的外围专名与无关旁支事件,不得承载可用于回答 benchmark 问题的事实。
+2. 文体、术语、时间制度必须服从上述领域画像。例如 RPG 应写世界内告示、传闻、游记、货单等,不得出现公司员工、OA、办公区、食堂培训等现代办公内容；只有目标场景本来就是企业办公时才允许办公题材。
+3. 每批题材与体裁尽量不同,自然像真实文档；每篇600-1000字,带本期日期。
 【严格 JSON】{"docs":[{"type":"通知","content":"..."}]}""",
 
     # ── 草堆 user($s $date $want $blocked)──────────────────────────────────
@@ -177,6 +181,7 @@ observe.observed_fields 是字面硬事实：其中每个 name 必须逐字出�
 - entity_types：每类有稳定英文 id、中文 noun、count、唯一一个 primary=true、该类型【专属】fields。字段沿用 {name,kind,unit?,monotonic?,range?,states?}；关系字段也必须先声明，kind 用 reference。
 - relation_types：{id,from_type,to_type,field,temporal,min_count}。from→to 必须能按“from 谓词 to”读成领域自然语义，绝不能因 field 在另一端就反转或替换端点；field 必须逐字声明在两个端点类型中的【恰好一端】，该端就是软外键 owner，值指向另一端。自关系约定 from/source 持有字段。v1 每个 reference 字段必须且只能绑定一种 relation，不能悬空，也不能同时被 event effect 写入。每种 relation 的 min_count>=1。一对多通常把 field 放在“多”的一侧，多对多改用关联实体。
 - event_types：{id,label,roles:{角色:type_id},effect_fields:[{role,field}],min_count}。label 是文档可自然逐字使用的人类可读事件名（如“击败首领”“预算修订”）；每个事件至少一个真实状态效果且 min_count>=1。描述中分开的领域动作不得为了省 schema 被合并。
+- entity 的 name 已经是稳定专名；不要再造“XX名称/姓名/编号/ID”充当事件效果。event effect 必须落到会真实变化的状态、数值或类别字段；若一个核心动作尚无可写效果，应补领域自然的生命周期字段（例如物品流转状态：未掉落→已掉落→已拾取→已装备），不能用“名称 SET 成自身”伪造变化。
 - temporal_model：{unit,cadence,n_sessions,step_days}。unit 可为 week/chapter/business_day/round/event 等；n_sessions>=2，step_days>=1。
 - causal_rules：只有领域中无需额外主体选择、稳定必然成立的事件因果才写 {id,trigger_event,effect_event,delay_sessions}，没有就空数组；中间有人类/玩家选择时必须拆开，不能把“击败→掉落”偷换成“击败→拾取”。
 - evidence_channels：这个世界里真实留下痕迹、可观察核心事件的文档/记录渠道。
@@ -196,6 +201,7 @@ observe.observed_fields 是字面硬事实：其中每个 name 必须逐字出�
 6. 核心覆盖与换皮反证：先把场景描述中的核心名词、关系谓词、事件动词逐项对照 blueprint；任何一项被降成 category/text、偷换端点、合并事件或 min_count=0 都不得评 low。随后假设把所有 noun/field/id 换成另一个行业词，如果结构和动力学仍毫无违和，说明仍同质化，必须补领域独有结构；但不许靠无意义加类型凑差异。
 保留 v1 schema，至少 2 个 entity type、1 个 relation、1 个 event、1 个 evidence channel；所有引用闭合、恰一个 primary。所有可执行约束仍须落在 schema 中，不得输出 prose invariants。
 ★机械修订铁律：可选字段不适用就省略或置 null；range 只允许放在 numeric 字段且须为两个不同 JSON 数字，reference 绝不能用 range 表示目标类型或基数；monotonic 只写 up/down；所有 relation/event min_count>=1；跨类型 relation.field 必须真实属于 from/to 中恰好一个端点且 kind=reference；每个 reference 字段必须且只能绑定一种 relation；event effect 只能 SET 已声明且非 relation-owned 的字段，不能“创建实体”或引用另一字段作为值；不要添加 schema 外键。
+★实体 name 已经承载稳定身份。“XX名称/姓名/编号/ID”等身份字段不得作为 event effect；若事件缺少可变化效果，新增领域自然的状态/数值/类别字段并给出可执行状态序，禁止把实体专名 SET 给名称字段制造空操作。
 ★候选已经通过 few-shot 观察闭包。候选中承接字面观察的字段及其 kind/unit/monotonic/range 是冻结硬事实：不得删除、改名、翻译或改约束。你只能在保留它们的前提下修订世界骨架。
 ★person/category/text 等已观测显示字段不是 relation FK。需要结构化同一语义时，保留原字段并另加不同名的 reference 字段；relation.field 只能选 kind=reference 的字段，禁止把已观测字段改型。
 只输出 {"review":{"reskin_risk":"low|medium|high","findings":["..."],"decisions":["..."]},"world_blueprint":{...}}。reskin_risk 必须评价【你修订后的版本】；仍为 medium/high 就表示尚未批准。review 是白皮书审议记录，world_blueprint 是修订后的完整可执行契约。""",
@@ -212,6 +218,7 @@ observe.observed_fields 是字面硬事实：其中每个 name 必须逐字出�
 - relation.field 必须 kind=reference，且每个 reference 字段必须且只能绑定一种 relation（禁止悬空或复用）；event effect 不得再写 relation-owned 字段。静态关系每个 owner 最多承载一个实例；时变关系也必须产生真实引用变化，不能重复同值凑 min_count。
 - 显式 v1 的每种 relation/event 都必须 min_count>=1；不允许靠设为 0 逃避实例化。场景描述明确分开的核心对象、关系和事件必须保留，不得偷换端点或合并动作。
 - 每个 event role/effect 引用闭合；effect 只能写该 role 类型已经声明的字段。
+- “XX名称/姓名/编号/ID”等身份字段不得作为 event effect。若核心事件没有可变化字段，新增领域自然的状态/数值/类别字段；禁止用“名称 SET 成实体专名”伪造效果。
 - range 只放 numeric，且为两个不同 JSON 数字；reference/status/category/text 不写 range。monotonic 只写 up/down。
 - 跨类型同名字段约束若不同，改成领域清楚的不同字段名，并同步全部引用。
 - 错误若指出“未覆盖/改写 few-shot 字段”，必须把该字段名及明确的 kind/unit/monotonic/range 逐字恢复到合理类型；不得用英文翻译或近义词替代。
@@ -230,7 +237,7 @@ $candidate
 2. active_lines 是否真贴合本场景天然结构、是否制造了区分度(别什么场景都只配 L1)?gt 都可行吗?
 3. shared_world_spec 的实体/关系/周数撑得起激活的产线 + 目标题量吗?关系够 L2 用吗?
 4. medium 选得对吗?style_spec 能指导渲染吗?
-★【产线 id 铁律】active_lines/line_mapping 里每条的 "line" 必须【逐字照抄】下面这套 canonical id,严禁重命名、自造名、合并或删行(你只能调 weight/why,认为某线不该激活也保留该行并说明):
+★【产线 id 铁律】active_lines 只能保留草案中已经激活的条目，严禁新增、重命名、自造名或合并；不适用线只留在 line_mapping 的审议记录中，不能以 weight=0 塞回 active_lines。你只能修改既有 active_lines 的正权重与 why：
 $taxonomy
 ★【轴字段铁律】preference_axis 若存在，必须指向 world_blueprint 已声明且归属唯一 entity_type 的真实字段；能力线只读该自然轨迹，严禁另造/改写偏好时间线。
 ★【字段约束铁律】field_schema 各字段的【名字】及其上的 unit / monotonic / range 约束逐字保留,不得删、不得改、不得改名(它们是下游 gold 正确性的硬依赖;同名字段的 unit/mono/range 若被你改动代码会以草案为准还原,但改名无法自动还原、会丢约束,所以务必别改名)。

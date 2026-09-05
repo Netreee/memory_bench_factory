@@ -1,0 +1,78 @@
+{
+  "artifact_id": "office__20260717-064826",
+  "git_revision": "146b66fca9ae2918dfb35a30a5455c903fb9175a",
+  "counts": {
+    "documents": 104,
+    "questions": 181,
+    "sessions": 10
+  },
+  "reviewed_files": {
+    "disclosed_about.json": {
+      "bytes": 1593,
+      "sha256": "bfbc0bffaa7db53b9427a89d101b4cf07fe7bb339549fd37195ef415bb6e4aa2"
+    },
+    "reviewed_corpus.json": {
+      "bytes": 137281,
+      "sha256": "61e5110fdd71d516cb0abc713fc429a80f77e233d3a45a4e9247c913bc3a7551"
+    },
+    "reviewed_qa.json": {
+      "bytes": 49838,
+      "sha256": "c65e5a8b803928be9fb9ea616dfff705f0abce5daa69751611732a6e9b36e16e"
+    }
+  },
+  "review_process": {
+    "independent_blind_lanes": [
+      "answer_correctness",
+      "leakage_and_difficulty",
+      "realism_and_diversity",
+      "holistic_fairness"
+    ],
+    "cross_adjudication_after_blind_reports": true,
+    "overall_grade": "C-",
+    "release_decision": "blocked"
+  },
+  "review_files": {
+    "report_A.md": {
+      "bytes": 11861,
+      "sha256": "e134d62f5bda82bb270ec67ac0af11623d8f434871b8faa7b735797a2da43f08"
+    },
+    "report_B.md": {
+      "bytes": 13744,
+      "sha256": "aa69173b7988840818e544b7d92d04a303199ac012637199c268bf6af6fc63dd"
+    },
+    "report_C.md": {
+      "bytes": 9411,
+      "sha256": "ab75c22163eaa33bbb2455516dd4b15b72fa8c8c6609f4b98f4bad315bab1703"
+    },
+    "report_D.md": {
+      "bytes": 9806,
+      "sha256": "331ae8bb351ad5c6d7429403c62b3bed6a2e9717e2038ad0272b2eadacd42dec"
+    },
+    "adjudication_metrics.json": {
+      "bytes": 16807,
+      "sha256": "8ed4889065d8fc4a7301514a0455a74e5e23159ad20b06538b65ff386384c3ae"
+    },
+    "findings.json": {
+      "bytes": 4228,
+      "sha256": "abf1064c019e9a13d98e3eea59a34e0146213dcc71987a716c184d7f2bcbf0e4"
+    },
+    "../blind_review_office_20260717-064826.md": {
+      "bytes": 12485,
+      "sha256": "72c5c47fcac014d25a0563cd449558914e4820f733f36370512f46148e3c03ed"
+    }
+  },
+  "source_files": {
+    "00_about.json": {
+      "bytes": 1988,
+      "sha256": "af92191344a530293afd045505f6f076287cb11ad0ee348161444985c678a789"
+    },
+    "05_corpus.json": {
+      "bytes": 140951,
+      "sha256": "4c31f8add6681050a69ef6e3c439dfa6b51ef6fbb0fd5df1d137ac71085a7c62"
+    },
+    "06_grounded_questions.json": {
+      "bytes": 100911,
+      "sha256": "1a37bd960664f732a6978a2b46104359a2664b98f0303feaefcb5e7db6ab89bd"
+    }
+  }
+}

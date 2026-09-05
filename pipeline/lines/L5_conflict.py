@@ -103,6 +103,8 @@ class ConflictLine(ProductionLine):
     memory = "跨来源矛盾检测 + 按来源可靠度裁决"
     gt_substrate = "矛盾注入侧信道 ws.conflicts + 裁决规则(代码可算)"
     implemented = True
+    # conflicts 只保存“低可信说法 + 裁决规则”，不改 canonical 时间线。
+    typed_overlay_safe = True
     requires: list[str] = ["text_fields"]    # 需文本类字段(person/status/category)作矛盾着床点
 
     def feasible(self, ws, profile: dict) -> tuple[bool, str]:

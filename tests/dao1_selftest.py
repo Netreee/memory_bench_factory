@@ -16,6 +16,7 @@ from pipeline.world_gen import _affix_units, imprint_structure
 from pipeline.render import render_corpus
 from pipeline.central_office import _canonicalize_lines
 from pipeline.lines.L4_preference import PreferenceLine
+from pipeline.lines import prepare_lines
 
 checks: list[tuple[bool, str]] = []
 def ck(name, cond): checks.append((bool(cond), name))
@@ -63,6 +64,8 @@ t1 = _ScriptedTracer([{"docs": [good_doc]}])
 docs1 = _run_render(t1)
 ck("①豁免:字段名含禁词的合格 doc 一次过(不再静默杀)", len(t1.calls) == 1 and any("86小时" in d["content"] for d in docs1))
 ck("①无兜底备忘混入", not any(d.get("is_fallback") for d in docs1))
+ck("①信号文档漏 fact_refs 时按当期真值反推补齐",
+   docs1 and docs1[0].get("fact_refs") == ["鼎晟案.累计计费工时"])
 
 # ①b:doc 真犯禁(正文用「目前」)→ 重渲,且 hint 必须【如实】说"因全局口径词被废",不再谎报"没写"
 bad_doc = {"title": "周度纪要", "type": "纪要", "content": "鼎晟案本期累计计费工时为86小时,目前整体平稳。"}
@@ -138,14 +141,14 @@ draft = {"active_lines": [{"line": "L1_timeline", "weight": 0.5}, {"line": "L4_p
                             "state_machines": [{"field": "案件状态", "states": ["立案", "结案"]}]}}
 wp6 = {"active_lines": [{"line": "L1_temporal_state", "weight": 0.4},      # 自编名 → 锁回 L1
                         {"line": "L4_source_conflict", "weight": 0.9},     # 自编名 → 前缀锁回 L4
-                        {"line": "L9_unknown", "weight": 0.1}],            # 不可识别 → 丢
+                        {"line": "L9_unknown", "weight": 0.1}],            # 可规范但 draft 未激活 → 丢
        "domain_profile": {}}                                               # axis/states 被 critic 丢 → 回填
 _canonicalize_lines(wp6, draft, log=lambda *a: None)
 ids6 = [l["line"] for l in wp6["active_lines"]]
 ck("⑥自编名锁回 canonical", "L1_timeline" in ids6 and "L4_preference" in ids6)
 ck("⑥丢线补漏(L7 回来)", "L7_consolidation" in ids6)
-ck("⑥L9 前缀锁回已注册产线 + 无重复", "L9_unknown" not in str(ids6)
-   and "L9_induction" in ids6 and len(ids6) == len(set(ids6)) == 4)
+ck("⑥critic 不得新增 draft 未激活的 L9 + 无重复", "L9_unknown" not in str(ids6)
+   and "L9_induction" not in ids6 and len(ids6) == len(set(ids6)) == 3)
 ck("⑥axis/states 回填", wp6["domain_profile"].get("preference_axis") and wp6["domain_profile"].get("state_machines"))
 # ⑥c【value_shape 审计 HIGH】critic 删字段级约束 → _canonicalize_lines 从 draft 兜底恢复
 draft_vs = {"active_lines": [{"line": "L1_timeline", "weight": 0.5}],
@@ -323,6 +326,18 @@ ck("⑫c 协议 v4 + 属性归属声明", _AP["version"] == 4 and _AP.get("attri
    and any("不得经关系链折算" in r for r in _AP["rules"]))
 
 # ════════ ⑦ L4 _choice_field 叠词去重 ════════
+# typed world 冻结后仍需允许 L5 派生“只增证据”侧信道；不得改 canonical 轨迹。
+ws13 = WorldState({
+    "霜剑": {"装备类型": _tl((0, "武器"))},
+    "银甲": {"装备类型": _tl((0, "防具"))},
+}, n_sessions=2, world_blueprint={"version": 1, "entity_types": []})
+before13 = ws13.to_dict()["entities"]
+wp13 = {"active_lines": [{"line": "L5_conflict", "weight": 1.0}],
+        "domain_profile": {"l5_max_conflicts": 1}}
+prepare_lines(wp13, ws13, log=lambda *a: None)
+ck("typed world 允许 L5 侧信道派生", len(ws13.conflicts) == 1)
+ck("L5 overlay 不改 canonical 实体轨迹", ws13.to_dict()["entities"] == before13)
+
 l4 = PreferenceLine()
 ck("⑦轴名已带'倾向' → 不叠词", l4._choice_field("本期处理策略倾向") == "本期处理策略倾向")
 ck("⑦普通轴名 → 照常加 TAG", l4._choice_field("随访方式") == "随访方式倾向")

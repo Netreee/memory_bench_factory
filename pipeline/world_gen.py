@@ -14,6 +14,81 @@ from pipeline.world_blueprint import relation_owner_side
 from pipeline.prompts import render
 
 _BARE_NUM = re.compile(r"^-?\d+(?:\.\d+)?$")
+_FIELD_KIND_SUFFIX = re.compile(
+    r"\s*[\(\uff08]\s*(?:text|status|category|numeric|number|person|reference|string)\s*[\)\uff09]\s*$",
+    re.IGNORECASE,
+)
+
+
+def _canonicalize_generated_field_names(fields: dict, allowed: set[str]) -> dict:
+    """将模型偶发输出的“字段名(kind)”归一为蓝图字段名。
+
+    只在剥掉已知 kind 后与 allowed 中某一字段精确相等时生效；
+    未知字段仍留给 off-schema 门禁删除。
+    """
+    out = {}
+    for raw_name, spec in fields.items():
+        name = raw_name
+        if isinstance(raw_name, str) and raw_name not in allowed:
+            candidate = _FIELD_KIND_SUFFIX.sub("", raw_name)
+            if candidate in allowed:
+                name = candidate
+        # 模型同时给标准键和带注解键时，优先保留标准键。
+        if name not in out or raw_name in allowed:
+            out[name] = spec
+    return out
+
+
+def _filter_incremental_structure(structure: dict, existing: WorldState,
+                                  blueprint: dict) -> tuple[list[dict], list[dict]]:
+    """过滤增量骨架中与旧世界重复或同期冲突的候选。
+
+    保留引用旧实体的真新关系/事件，但不让模型重放 rel-1/evt-1，
+    也不让它在旧 canonical timeline 已有操作的同一 session 再写一次。
+    """
+    old_rel_ids = {item.get("id") for item in existing.relations if item.get("id")}
+    old_rel_edges = {(item.get("type"), item.get("from"), item.get("to"),
+                      _as_int(item.get("session"), 0)) for item in existing.relations}
+    rel_decls = {item.get("id"): item for item in blueprint.get("relation_types", [])}
+    relations = []
+    for item in (structure.get("relations") or []):
+        if not isinstance(item, dict) or item.get("id") in old_rel_ids:
+            continue
+        edge = (item.get("type"), item.get("from"), item.get("to"),
+                _as_int(item.get("session"), 0))
+        if edge in old_rel_edges:
+            continue
+        decl = rel_decls.get(item.get("type")) or {}
+        side = relation_owner_side(blueprint, decl) if decl else None
+        owner = item.get("from") if side != "to" else item.get("to")
+        timeline = existing.timeline(owner, decl.get("field")) if owner and decl.get("field") else None
+        if timeline and any(op.session == edge[3] for op in timeline.ops):
+            continue
+        relations.append(item)
+
+    old_event_ids = {item.get("id") for item in existing.events if item.get("id")}
+    old_event_keys = {(item.get("type"), _as_int(item.get("session"), -1),
+                       json.dumps(item.get("participants") or {}, ensure_ascii=False, sort_keys=True))
+                      for item in existing.events}
+    events = []
+    for item in (structure.get("events") or []):
+        if not isinstance(item, dict) or item.get("id") in old_event_ids:
+            continue
+        session = _as_int(item.get("session"), -1)
+        key = (item.get("type"), session,
+               json.dumps(item.get("participants") or {}, ensure_ascii=False, sort_keys=True))
+        if key in old_event_keys:
+            continue
+        clashes = False
+        for effect in item.get("effects") or []:
+            entity, field = effect.get("entity"), effect.get("field")
+            timeline = existing.timeline(entity, field) if entity and field else None
+            if timeline and any(op.session == session for op in timeline.ops):
+                clashes = True
+                break
+        if not clashes:
+            events.append(item)
+    return relations, events
 
 
 def _wire_declared_causality(structure: dict, blueprint: dict) -> int:
@@ -327,6 +402,9 @@ def build_world(wp, tracer, log=print, existing=None) -> WorldState:
         if owned:
             type_extra += (f"★这些字段由 domain event 驱动:{owned}。entity batch 可省略它们；若给初态，"
                            "只能给 stable 或 session=0 的单一基线，严禁自行生成后续变化，后续只能由事件 effect 写入。")
+            if set(owned) == {f.get("name") for f in intrinsic if f.get("name")}:
+                type_extra += ("★本类型全部字段都由 event 驱动：请直接输出 fields={}；"
+                               "不要为了满足末尾 null 要求擅自生成任何字段轨迹。")
         open_schema = bool(blueprint.get("legacy_adapter") and not intrinsic)
         sysp = _world_system(type_profile, tid, time_unit, open_schema=open_schema)
 
@@ -362,16 +440,19 @@ def build_world(wp, tracer, log=print, existing=None) -> WorldState:
                         continue
                     allowed = {f.get("name") for f in intrinsic if f.get("name")}
                     required = allowed - event_fields.get(tid, set())
-                    fields = dict(e.get("fields") or {})
+                    fields = _canonicalize_generated_field_names(
+                        dict(e.get("fields") or {}), allowed)
                     off_schema = [] if open_schema else [fn for fn in fields if fn not in allowed]
                     for fn in off_schema:
                         fields.pop(fn, None)
                     if typed_contract and not required.issubset(fields):
                         continue                     # 缺本类型内在字段的实体不计数，交给下一生成轮补齐
-                    if typed_contract and any(
-                            fname in fields and not _event_field_is_baseline_only(fields[fname])
-                            for fname in event_fields.get(tid, set()) - relation_fields.get(tid, set())):
-                        continue                     # 事件拥有状态迁移；batch 只能提供可选初态
+                    if typed_contract:
+                        # 事件字段的轨迹由 structure 单一真源生成。模型若无视提示给了多期轨迹，
+                        # 丢掉该字段即可；不能因此连合法实体专名也整条拒收，导致 0/N 振荡。
+                        for fname in event_fields.get(tid, set()) - relation_fields.get(tid, set()):
+                            if fname in fields and not _event_field_is_baseline_only(fields[fname]):
+                                fields.pop(fname, None)
                     e["fields"] = fields
                     seen.add(nm); seen_base.add(base); produced.append(e)
                     if base_count + len(produced) >= want_total:
@@ -423,8 +504,11 @@ def build_world(wp, tracer, log=print, existing=None) -> WorldState:
                 temperature=0.4, max_tokens=8192)
             if isinstance(structure, dict):
                 _wire_declared_causality(structure, blueprint)
-                merged["relations"] = [x for x in structure.get("relations", []) if isinstance(x, dict)]
-                merged["events"] = [x for x in structure.get("events", []) if isinstance(x, dict)]
+                relations = [x for x in structure.get("relations", []) if isinstance(x, dict)]
+                events = [x for x in structure.get("events", []) if isinstance(x, dict)]
+                if existing is not None:
+                    relations, events = _filter_incremental_structure(structure, existing, blueprint)
+                merged["relations"], merged["events"] = relations, events
             trial, trial_issues = assemble_world(merged, blueprint=blueprint, existing=existing)
             structural_issues = [x for x in trial_issues if x.startswith(structural_markers)]
             if not structural_issues:

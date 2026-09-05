@@ -1,0 +1,22 @@
+[Unit]
+Description=Memory Forge live demo over the private VPN
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=ziqian
+Group=ziqian
+WorkingDirectory=/home/ziqian/memory_bench_factory
+Environment=HOME=/home/ziqian
+Environment=PATH=/home/ziqian/memory_bench_factory/venv/bin:/usr/local/bin:/usr/bin:/usr/sbin
+ExecStart=/home/ziqian/memory_bench_factory/scripts/live-demo-vpn.sh
+Restart=on-failure
+RestartSec=5
+KillMode=control-group
+TimeoutStopSec=20
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

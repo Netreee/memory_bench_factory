@@ -51,6 +51,8 @@ p0 = WorldParams(n_entities=12, n_sessions=10, quota_L1=10, max_n_conflicts=3, t
 p1 = _grow_for_supply(p0, {"L3_process": 3})
 ck("_grow_for_supply:有赤字 → n_entities 增大", p1.n_entities > p0.n_entities)
 ck("_grow_for_supply:有赤字 → n_sessions 增大", p1.n_sessions > p0.n_sessions)
+ck("_grow_for_supply:增量轮可锁住时间轴",
+   _grow_for_supply(p0, {"L3_process": 3}, grow_sessions=False).n_sessions == p0.n_sessions)
 ck("_grow_for_supply:target_orders 不动(长的是供给侧,不是配额)", p1.target_orders == p0.target_orders)
 ck("_grow_for_supply:无赤字 → 原样返回", _grow_for_supply(p0, {}) is p0)
 p_big = WorldParams(n_entities=N_ENT_CLAMP[1], n_sessions=N_SESS_CLAMP[1], quota_L1=1, max_n_conflicts=1, target_orders={})
@@ -97,13 +99,16 @@ ck("_scale_world_contract:typed blueprint 与 legacy 镜像使用实际实体/se
    and typed_wp["shared_world_spec"]["entities"]["count"] == 20
    and typed_wp["shared_world_spec"]["timeline"]["n_sessions"] == 12)
 
-# 缩放只允许增长：闭环后续小目标不得把既有 typed 世界及结构见证缩掉。
+# 缩放目标来自闭环旋钮：小目标也必须能压回小世界；比例锚始终取首次白皮书。
 _scale_world_contract(typed_wp, n_entities=7, n_sessions=6)
-ck("_scale_world_contract:较小目标不反向缩减 typed 类型/结构/session",
-   {item["id"]: item["count"] for item in scaled_bp["entity_types"]} == scaled_counts
-   and {item["id"]: item["min_count"] for item in scaled_bp["relation_types"]} == scaled_rel_min
-   and {item["id"]: item["min_count"] for item in scaled_bp["event_types"]} == scaled_event_min
-   and scaled_bp["temporal_model"]["n_sessions"] == 12)
+ck("_scale_world_contract:较小目标按原比例缩小且每类至少一个",
+   sum(item["count"] for item in scaled_bp["entity_types"]) == 7
+   and all(item["count"] >= 1 for item in scaled_bp["entity_types"])
+   and {item["id"]: item["min_count"] for item in scaled_bp["relation_types"]}
+       == {"equips": 1, "drops": 2, "optional_link": 0}
+   and {item["id"]: item["min_count"] for item in scaled_bp["event_types"]}
+       == {"defeat_boss": 2, "acquire_item": 3}
+   and scaled_bp["temporal_model"]["n_sessions"] == 6)
 
 # target-owned static 标量 FK：比例取整后 owner 仍只有 1 个，min_count 不能从 1 膨胀到 2。
 reverse_owner_scale_wp = {

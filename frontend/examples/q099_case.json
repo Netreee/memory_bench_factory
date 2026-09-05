@@ -1,0 +1,34 @@
+{
+  "case_id": "Q099",
+  "presentation": "HISTORICAL INTERNAL RUN · AUDITED CASE RECONSTRUCTION",
+  "source_run": "office__20260717-064826",
+  "source_evaluation": "eval_20260717-074947",
+  "question": "在第6周，杨九的直属上级的工位编号是多少？",
+  "capability": "L2_multihop / 跨时间关系",
+  "baseline": {
+    "system": "A · SingleShotRAG",
+    "prediction": "信息不足",
+    "correct": false
+  },
+  "gold": "C2-5016",
+  "evidence": [
+    {
+      "session": "Week 6",
+      "public_doc_id": "s5_sig_4",
+      "excerpt": "杨九的汇报对象·直属上级为卫五。"
+    },
+    {
+      "session": "Week 3",
+      "public_doc_id": "s2_sig_2",
+      "excerpt": "卫五被分配至 C2-5016 号工位；本周起按本次分配长期使用。"
+    }
+  ],
+  "relation_chain": ["杨九", "卫五", "C2-5016"],
+  "review_note": "Q099 的证据链经盲审确认完整；整个 office run 仍为 C− / release blocked。",
+  "next_version_card": {
+    "label": "VERSION REVIEW INPUT · WORKFLOW ILLUSTRATION",
+    "priority": "优先验证：跨时间的关系连接",
+    "regression": "回归检查：当前通过项",
+    "retest": "复验方式：新历史中的同类问题"
+  }
+}

@@ -1,0 +1,175 @@
+{
+  "artifact_id": "office__20260717-064826",
+  "decision": {
+    "grade": "C-",
+    "release": "blocked",
+    "confidence": "high"
+  },
+  "review_grades": {
+    "answer_correctness": "B",
+    "leakage_and_difficulty": "D",
+    "realism_and_diversity": "C+",
+    "holistic_fairness": "C-"
+  },
+  "headline_metrics": {
+    "sessions": 10,
+    "documents": 104,
+    "raw_questions": 241,
+    "grounded_questions": 181,
+    "grounding_rate": 0.751,
+    "hard_invalid_questions_min": 17,
+    "hard_invalid_rate_min": 0.094,
+    "dependency_affected_questions": 11,
+    "refusal_conflict_questions": 6,
+    "surface_shortcut_questions": 51,
+    "always_absent_baseline_questions": 62
+  },
+  "dependency_adjudication": {
+    "world_atoms": 199,
+    "missing_structured_world_atoms": 34,
+    "renderer_log_dropped_atoms": 47,
+    "scope_note": "47 is the renderer log event count; 34 is the unique structured world-to-fact_refs diff. They are not interchangeable.",
+    "affected_by_capability": {
+      "TR": 6,
+      "MR": 1,
+      "L2_multihop": 4
+    },
+    "affected_qids": [
+      "Q043",
+      "Q045",
+      "Q046",
+      "Q049",
+      "Q053",
+      "Q055",
+      "Q058",
+      "Q095",
+      "Q096",
+      "Q101",
+      "Q102"
+    ],
+    "corrected_early_estimate": {
+      "superseded_claim": "34/36 MR plus multihop questions may be affected",
+      "why_superseded": "The early estimate matched only on entity and overcounted unrelated fields.",
+      "accepted_result": "11/181 questions are affected after entity-field-session dependency recomputation."
+    }
+  },
+  "findings": [
+    {
+      "id": "BR-001",
+      "severity": "P0",
+      "title": "Post-question corpus drops are not followed by dependency-closure validation",
+      "layer": [
+        "pipeline",
+        "grounding"
+      ],
+      "qids": [
+        "Q043",
+        "Q045",
+        "Q046",
+        "Q049",
+        "Q053",
+        "Q055",
+        "Q058",
+        "Q095",
+        "Q096",
+        "Q101",
+        "Q102"
+      ],
+      "release_blocker": true
+    },
+    {
+      "id": "BR-002",
+      "severity": "P0",
+      "title": "Absent, stopped and existing facts receive conflicting gold labels",
+      "layer": [
+        "question_generation",
+        "state_machine",
+        "answer_protocol"
+      ],
+      "qids": [
+        "Q110",
+        "Q111",
+        "Q112",
+        "Q116",
+        "Q152",
+        "Q157"
+      ],
+      "release_blocker": true
+    },
+    {
+      "id": "BR-003",
+      "severity": "P1",
+      "title": "Surface and metadata shortcuts bypass memory use",
+      "layer": [
+        "delivery_interface",
+        "sampling"
+      ],
+      "metrics": {
+        "surface_shortcut_questions": 51,
+        "role_prefixed_doc_ids": 104,
+        "total_doc_ids": 104,
+        "claimed_type_majority_baseline": 93
+      },
+      "release_blocker": false
+    },
+    {
+      "id": "BR-004",
+      "severity": "P1",
+      "title": "Capability quotas and semantic axes are unbalanced",
+      "layer": [
+        "benchmark_design",
+        "sampling"
+      ],
+      "metrics": {
+        "refusal_and_safety_questions": 65,
+        "advanced_multihop_order_conflict_trend_questions": 19,
+        "questions_on_seven_core_attributes_rate": 0.901
+      },
+      "release_blocker": false
+    },
+    {
+      "id": "BR-005",
+      "severity": "P1",
+      "title": "Documents contain weak distractors, field dumps and generation-style meta prose",
+      "layer": [
+        "scenario_modeling",
+        "rendering"
+      ],
+      "metrics": {
+        "filler_documents": 58,
+        "filler_documents_touching_target_entities_or_fields": 0,
+        "signal_documents": 31,
+        "signal_documents_with_at_least_four_core_attributes": 23
+      },
+      "release_blocker": false
+    },
+    {
+      "id": "BR-006",
+      "severity": "P1",
+      "title": "The public answer protocol and scorer contract are incomplete",
+      "layer": [
+        "about",
+        "scorer"
+      ],
+      "qids": [
+        "Q035",
+        "Q107",
+        "Q143",
+        "Q153",
+        "Q163",
+        "Q177",
+        "Q178",
+        "Q180"
+      ],
+      "release_blocker": false
+    }
+  ],
+  "confirmed_strengths": [
+    "No systematic fixed-week off-by-one in 45 checked questions",
+    "Both event-ordering questions are reproducible",
+    "All four trend questions use the stated first-to-last convention",
+    "Stopped and pre-expiry positive question pairs are supported",
+    "The implicit-rule prototype is inferable without directly exposing the threshold",
+    "Ordinary non-rule documents have low mechanical near-duplication"
+  ]
+}

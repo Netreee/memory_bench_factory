@@ -57,9 +57,9 @@ def _render_delta_scope(ws: WorldState, previous_entities: set,
 def _scale_world_contract(wp: dict, n_entities: int, n_sessions: int) -> None:
     """同步闭环规模旋钮到 legacy 镜像与显式 world_blueprint。
 
-    多类型世界按白皮书原有人口比例整体放大，并同比放大 relation/event 最小实例数，
-    防止大世界退化成“大量孤立 primary + 一条装饰边/事件”。没有 blueprint 的历史白皮书
-    仍只改旧字段。
+    多类型世界按白皮书原有人口比例缩放到闭环反推的目标规模，并同比缩放
+    relation/event 最小实例数；后续纠偏轮的目标只增不减，因此不会缩掉已生成实体。
+    没有 blueprint 的历史白皮书仍只改旧字段。
     """
     sw = wp.setdefault("shared_world_spec", {})
     bp = wp.get("world_blueprint")
@@ -89,13 +89,13 @@ def _scale_world_contract(wp: dict, n_entities: int, n_sessions: int) -> None:
                 },
             }
             sw["_typed_scale_baseline"] = baseline
-        desired = max(old_total, int(n_entities), len(types))
-        if old_total > 0 and desired > old_total:
-            base_total = int(baseline["entity_total"])
+        desired = max(int(n_entities), len(types))
+        base_total = int(baseline["entity_total"])
+        if base_total > 0 and desired != old_total:
             factor = desired / base_total
             raw = [int(baseline["entity_counts"][tid]) * factor for tid in type_ids]
-            # 以首次白皮书为比例锚，同时不缩小任何已经生成过的类型。
-            counts = [max(int(t["count"]), 1, math.floor(x)) for t, x in zip(types, raw)]
+            # 以首次白皮书为比例锚；每种核心类型至少保留一个实例。
+            counts = [max(1, math.floor(x)) for x in raw]
             remainder = desired - sum(counts)
             order = sorted(range(len(types)), key=lambda i: (raw[i] - math.floor(raw[i]),
                                                               bool(types[i].get("primary"))), reverse=True)
@@ -105,7 +105,9 @@ def _scale_world_contract(wp: dict, n_entities: int, n_sessions: int) -> None:
                 t["count"] = count
         actual_entities = sum(int(t.get("count", 0)) for t in types)
         temporal = bp.setdefault("temporal_model", {})
-        temporal["n_sessions"] = max(int(temporal.get("n_sessions", 0)), n_sessions)
+        # 时间跨度与实体规模一样服从本轮旋钮；build_to_target 后续轮只会放大参数，
+        # 因而不会把已经生成的世界反向缩短。
+        temporal["n_sessions"] = max(2, int(n_sessions))
         density_factor = actual_entities / int(baseline["entity_total"])
         for key, declarations in (("relation_min_counts", bp.get("relation_types") or []),
                                   ("event_min_counts", bp.get("event_types") or [])):
@@ -113,9 +115,8 @@ def _scale_world_contract(wp: dict, n_entities: int, n_sessions: int) -> None:
             for declaration in declarations:
                 declaration_id = str(declaration.get("id") or "")
                 base_min = int(base_mins.get(declaration_id, declaration.get("min_count", 0)))
-                current_min = int(declaration.get("min_count", 0))
                 if base_min > 0:
-                    declaration["min_count"] = max(current_min, math.ceil(base_min * density_factor))
+                    declaration["min_count"] = max(1, math.ceil(base_min * density_factor))
         # relation 是标量 FK；人口比例取整后，owner 侧可能没长大，不能让同比 min_count 超过容量。
         for relation in bp.get("relation_types") or []:
             if relation_owner_side(bp, relation) is not None:
@@ -147,7 +148,7 @@ def _order_deficit(produced: dict, target_orders: dict, feasible: set) -> dict:
     return out
 
 
-def _grow_for_supply(params: WorldParams, deficit: dict) -> WorldParams:
+def _grow_for_supply(params: WorldParams, deficit: dict, grow_sessions: bool = True) -> WorldParams:
     """①环成长:【实质】供不上才长世界,**按缺口比例温和补**实体(不再 ×1.4 一刀切)。夹 clamp。无赤字原样返回。
     粗率 ~0.4 单/实体(同 invert_rate 的 RATE_L3);缺口大才顺带加几周。"""
     from pipeline.targetspec import N_ENT_CLAMP, N_SESS_CLAMP
@@ -156,7 +157,8 @@ def _grow_for_supply(params: WorldParams, deficit: dict) -> WorldParams:
     short = sum(deficit.values())                                   # 实质短缺总单数
     add_ent = max(3, math.ceil(short / 0.4))                        # 按缺口比例补实体(0.4 单/实体粗率)
     n_ent = min(N_ENT_CLAMP[1], params.n_entities + add_ent)
-    n_sess = min(N_SESS_CLAMP[1], params.n_sessions + 2)            # 实质赤字才到这里 → 顺带 +2 周(助 L1/L3 跨周供给)
+    n_sess = (min(N_SESS_CLAMP[1], params.n_sessions + 2)
+              if grow_sessions else params.n_sessions)             # 增量纠偏轮锁住旧语料的时间轴
     return dataclasses.replace(params, n_entities=n_ent, n_sessions=n_sess)
 
 
@@ -186,7 +188,8 @@ def build_to_target(run: Run, spec: TargetSpec, max_rounds: int = 2, order_subro
                                   stage_questions, stage_corpus, stage_grounding, ART)
     wp = run.read(ART["whitepaper"])
     canon_lines = [{**l, "line": line_for(l.get("line", "")).id}                  # ★白皮书线 id 变体 → 规范 id(与 by_line / 先验键对齐)
-                   for l in wp.get("active_lines", []) if line_for(l.get("line", ""))]
+                   for l in wp.get("active_lines", [])
+                   if line_for(l.get("line", "")) and float(l.get("weight") or 0) > 0]
     active = list(dict.fromkeys(l["line"] for l in canon_lines))                  # 已建且去重的激活线
     if not spec.per_line_min:                                                     # 没显式给 → 白皮书 weight 派生(weight 终于被读)
         spec.per_line_min = spec.derive_per_line_min(canon_lines)
@@ -235,7 +238,7 @@ def build_to_target(run: Run, spec: TargetSpec, max_rounds: int = 2, order_subro
             run.log(f"║  ①供给子轮{sub}:实产 {produced} / 配额 {params.target_orders} → 赤字 {deficit or '无'}")
             if not deficit or sub == order_subrounds:
                 break
-            params = _grow_for_supply(params, deficit)                           # 供不上 → 长世界重建
+            params = _grow_for_supply(params, deficit, grow_sessions=(rnd == 1)) # 第2轮+只长实体，不破坏旧语料时间轴
             _scale_world_contract(wp, params.n_entities, params.n_sessions)
             run.write(ART["whitepaper"], wp)
             run.log(f"║  ↑供给不足 → 长世界 n_ent={params.n_entities} n_sess={params.n_sessions} 重建")

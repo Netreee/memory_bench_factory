@@ -122,6 +122,89 @@ def _observed_blueprint_issues(blueprint: dict, observed: dict) -> list[str]:
     return issues
 
 
+def _separate_observed_relation_fields(candidate: dict, observed: dict) -> list[str]:
+    """把 few-shot 展示字段与同名关系 FK 确定性拆成两条字段。
+
+    LLM 容易在 ``category/person`` 硬事实与 ``reference`` 关系字段之间振荡。
+    这里不改变关系端点或领域语义，只保留观察字段原形，并给使用它的关系创建
+    独立 reference 字段；未绑定关系的误改 reference 则恢复观察 kind。
+    返回修复说明用于 Run 留痕。
+    """
+    if not isinstance(candidate, dict):
+        return []
+    blueprint = candidate.get("world_blueprint", candidate)
+    if not isinstance(blueprint, dict):
+        return []
+    raw_observed = observed.get("observed_fields") if isinstance(observed, dict) else None
+    if not isinstance(raw_observed, list):
+        return []
+    observed_specs = {
+        item.get("name"): item for item in raw_observed
+        if isinstance(item, dict) and isinstance(item.get("name"), str)
+        and item.get("name") and not _observe_unspecified(item.get("kind"))
+    }
+    if not observed_specs:
+        return []
+
+    types = {item.get("id"): item for item in blueprint.get("entity_types", [])
+             if isinstance(item, dict) and isinstance(item.get("id"), str)}
+    relations = [item for item in blueprint.get("relation_types", []) if isinstance(item, dict)]
+    repairs: list[str] = []
+
+    def _field(entity_type: dict, name: str):
+        return next((item for item in entity_type.get("fields", [])
+                     if isinstance(item, dict) and item.get("name") == name), None)
+
+    def _fresh_reference_name(owner: dict, base: str) -> str:
+        names = {item.get("name") for item in owner.get("fields", []) if isinstance(item, dict)}
+        stem = f"{base}引用"
+        if stem not in names:
+            return stem
+        index = 2
+        while f"{stem}{index}" in names:
+            index += 1
+        return f"{stem}{index}"
+
+    # 先处理确实把 observed 显示字段拿去当 relation.field 的关系。
+    for relation in relations:
+        old_name = relation.get("field")
+        observed_spec = observed_specs.get(old_name)
+        if not observed_spec:
+            continue
+        endpoints = [types.get(relation.get("from_type")), types.get(relation.get("to_type"))]
+        owners = [entity_type for entity_type in endpoints
+                  if entity_type is not None and _field(entity_type, old_name) is not None]
+        if len(owners) != 1:
+            continue
+        owner = owners[0]
+        owner_field = _field(owner, old_name)
+        new_name = _fresh_reference_name(owner, old_name)
+        owner["fields"].append({"name": new_name, "kind": "reference"})
+        relation["field"] = new_name
+        # 同名显示字段仍按 observe 硬事实保留，不能被关系改型。
+        owner_field.update({key: deepcopy(value) for key, value in observed_spec.items()
+                            if key in ("kind", "unit", "monotonic", "range")
+                            and not _observe_unspecified(value)})
+        repairs.append(f"{owner.get('id')}.{old_name}→显示字段 + {new_name}(relation={relation.get('id')})")
+
+    # 再恢复没有关系绑定、却被模型误改成 reference 的 observed 同名字段。
+    bound = {(entity_type.get("id"), relation.get("field"))
+             for relation in relations for entity_type in types.values()
+             if entity_type.get("id") in (relation.get("from_type"), relation.get("to_type"))
+             and _field(entity_type, relation.get("field")) is not None}
+    for type_id, entity_type in types.items():
+        for field in entity_type.get("fields", []):
+            spec = observed_specs.get(field.get("name")) if isinstance(field, dict) else None
+            if not spec or (type_id, field.get("name")) in bound:
+                continue
+            for key in ("kind", "unit", "monotonic", "range"):
+                value = spec.get(key)
+                if not _observe_unspecified(value) and field.get(key) != value:
+                    field[key] = deepcopy(value)
+                    repairs.append(f"{type_id}.{field.get('name')}.{key} 恢复 observe={value!r}")
+    return repairs
+
+
 def _assemble_whitepaper(views: dict, desc: str) -> dict:
     """★综合 = 代码确定性装配；世界视角是必须通过机械校验的硬门。"""
     obs = views.get("observe") or {}
@@ -232,15 +315,20 @@ def _canonicalize_lines(wp: dict, draft: dict, log=print):
     """★C4 议会选线稳定化(014559 根因:critic 全文重写无 id 词表约束 + 采纳闸只查 truthy →
     legal run 丢 L7、6 条全自编名,权重经前缀兜底错挂)。代码侧三件事,prompt 铁律只是软约束、这里才是硬闸:
       ① critic 的 active_lines 逐条过 line_for 锁回 canonical id(认不出的丢弃并记日志);
-      ② 以 draft(= map applicable==true 集)补漏 —— critic 不许【删】线(下界锁定);critic 新增且
-         line_for 认得的线会保留(可加不可减,加出来的由 feasible 闸按基质兜底)。draft 没有的线
-         绝不被【本函数】塞回(office 无偏好轴 → L4 不在 draft → 不会被补进来);
+      ② active_lines 的集合锁定为 draft(= map applicable==true 集)：critic 不许删线，也不许把
+         line_mapping 中的“不适用/weight=0”条目重新塞回 active_lines；critic 只可润色正权重和 why；
       ③ domain_profile 的 preference_axis / state_machines 若被 critic 重写丢掉,从 draft 回填(同款丢失防护)。"""
     from pipeline.lines import line_for
+    draft_ids = {
+        ln.id for item in (draft.get("active_lines") or [])
+        if (ln := line_for(item.get("line", ""))) is not None
+    }
     fixed, seen, renamed, dropped = [], set(), [], []
     for l in (wp.get("active_lines") or []):
         ln = line_for(l.get("line", ""))
         if ln is None:
+            dropped.append(l.get("line")); continue
+        if ln.id not in draft_ids or float(l.get("weight") or 0) <= 0:
             dropped.append(l.get("line")); continue
         if ln.id in seen:
             continue
@@ -334,6 +422,9 @@ def central_office(desc, few_shot, tracer, log=print) -> dict:
             [{"role": "system", "content": system}, {"role": "user", "content": user}],
             temperature=0.5 if world_attempt == 1 else 0.2, max_tokens=8192)
         world_out = candidate if isinstance(candidate, dict) else {}
+        relation_repairs = _separate_observed_relation_fields(world_out, views.get("observe") or {})
+        if relation_repairs:
+            log(f"    议会·world 关系/展示字段机械拆分:{relation_repairs}")
         try:
             blueprint = normalize_world_blueprint(world_out)
         except WorldBlueprintError as error:
@@ -364,6 +455,9 @@ def central_office(desc, few_shot, tracer, log=print) -> dict:
                  + (f"\n【上轮未获批准】{review_error}\n请继续修订，勿降低为口头辩解。"
                     if review_attempt > 1 else "")}],
             temperature=0.3, max_tokens=8192)
+        relation_repairs = _separate_observed_relation_fields(review, views.get("observe") or {})
+        if relation_repairs:
+            log(f"    议会·world_review 关系/展示字段机械拆分:{relation_repairs}")
         review_record = (deepcopy(review.get("review"))
                          if isinstance(review, dict) and isinstance(review.get("review"), dict) else {})
         review_problems: list[str] = []
@@ -379,6 +473,9 @@ def central_office(desc, few_shot, tracer, log=print) -> dict:
                      "council.world_repair_user", errors=str(error),
                      candidate=json.dumps(review if isinstance(review, dict) else {}, ensure_ascii=False))}],
                 temperature=0.1, max_tokens=8192)
+            relation_repairs = _separate_observed_relation_fields(repair, views.get("observe") or {})
+            if relation_repairs:
+                log(f"    议会·world_repair 关系/展示字段机械拆分:{relation_repairs}")
             try:
                 reviewed_blueprint = normalize_world_blueprint(repair if isinstance(repair, dict) else {})
             except WorldBlueprintError as repair_error:

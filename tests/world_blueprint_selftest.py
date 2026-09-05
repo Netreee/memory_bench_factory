@@ -25,13 +25,15 @@ from pipeline.world_blueprint import (
     validate_world_blueprint,
 )
 from pipeline.central_office import (_assemble_whitepaper, _observed_blueprint_issues,
-                                     central_office)
+                                     _separate_observed_relation_fields, central_office)
 from pipeline.lines import prepare_lines
 from pipeline.lines.L2_relational import RelationalLine
 from pipeline.lines.L4_preference import PreferenceLine
 from pipeline.prompts import render as render_prompt
-from pipeline.render import _corpus_system, _missing_event_narratives, _session_facts
-from pipeline.world_gen import _wire_declared_causality, build_world
+from pipeline.render import (_corpus_system, _filler_system,
+                             _missing_event_narratives, _session_facts)
+from pipeline.world_gen import (_canonicalize_generated_field_names,
+                                _wire_declared_causality, build_world)
 from pipeline.world_state import WorldState, assemble_world, _date_of
 
 
@@ -395,6 +397,36 @@ event_writes_relation_bp["event_types"][0].update({
     "effect_fields": [{"role": "subject", "field": "关联乙"}],
 })
 _must_reject("② event effect 不得写 relation-owned reference 字段", event_writes_relation_bp)
+
+event_writes_identity_bp = deepcopy(same_field_bp)
+event_writes_identity_bp["entity_types"][1]["fields"].append(
+    {"name": "对象名称", "kind": "category"})
+event_writes_identity_bp["event_types"][0]["effect_fields"] = [
+    {"role": "subject", "field": "对象名称"}]
+_must_reject("② event effect 不得把实体专名重复写入名称字段", event_writes_identity_bp)
+
+observed_relation_bp = deepcopy(same_field_bp)
+observed_relation_bp["entity_types"][0]["fields"] = [
+    field for field in observed_relation_bp["entity_types"][0]["fields"]
+    if field["name"] != "关联乙"
+] + [{"name": "所属阵营", "kind": "reference"}]
+observed_relation_bp["entity_types"].append({
+    "id": "c", "noun": "丙", "count": 1, "primary": False,
+    "fields": [{"name": "所属阵营", "kind": "category"}],
+})
+observed_relation_bp["relation_types"][0]["field"] = "所属阵营"
+observed_relation_wrapper = {"world_blueprint": observed_relation_bp}
+observed_relation_repairs = _separate_observed_relation_fields(
+    observed_relation_wrapper,
+    {"observed_fields": [{"name": "所属阵营", "kind": "category"}]},
+)
+observed_relation_fixed = observed_relation_wrapper["world_blueprint"]
+ck("② observed 显示字段与同名 relation FK 确定性拆分",
+   bool(observed_relation_repairs)
+   and next(field for field in observed_relation_fixed["entity_types"][0]["fields"]
+            if field["name"] == "所属阵营")["kind"] == "category"
+   and observed_relation_fixed["relation_types"][0]["field"] == "所属阵营引用"
+   and validate_world_blueprint(normalize_world_blueprint(observed_relation_fixed)) == [])
 
 static_over_capacity_bp = deepcopy(reverse_owner_bp)
 static_over_capacity_bp["relation_types"][0]["min_count"] = 2
@@ -770,6 +802,15 @@ ck("⑥ 只写 effect 字段值、漏掉参与者关系时事件忠实闸拒绝"
    bool(_missing_event_narratives(event_for_gate, ["熔岩巨兽的 defeat_status 变成 defeated。"])))
 ck("⑥ event label 与全部 participants 同篇出现才通过事件忠实闸",
    _missing_event_narratives(event_for_gate, ["旅者在交锋中完成击败首领，熔岩巨兽随即倒下。"] ) == [])
+game_filler_system = _filler_system(
+    {"entity_noun": "游戏对象", "doc_genres": ["任务日志", "战利品记录"]},
+    compiled.world_blueprint,
+)
+ck("⑥ filler prompt 携带冻结世界的类型、事件和证据渠道",
+   all(marker in game_filler_system for marker in ("player", "击败首领", "任务日志")))
+ck("⑥ filler 被约束为同世界旁支且禁止非办公场景套 OA 模板",
+   "同一领域、同一叙事世界" in game_filler_system
+   and "不得出现公司员工、OA、办公区、食堂培训" in game_filler_system)
 
 
 # ═══════ ⑦ central_office 先冻结世界，再映射能力 ═══════
@@ -818,7 +859,10 @@ class _WorldFirstTracer:
             }]}
         if tag == "council.critique":
             return {
-                "active_lines": [{"line": "L1_timeline", "weight": 0.9, "why": "critic"}],
+                "active_lines": [
+                    {"line": "L1_timeline", "weight": 0.9, "why": "critic"},
+                    {"line": "L10_admission", "weight": 0, "why": "不适用但被错误塞回"},
+                ],
                 "domain_profile": {"entity_noun": "篡改主体", "field_schema": []},
                 "world_blueprint": deepcopy(critic_rewrite),
                 "shared_world_spec": {"entities": {"count": 999}},
@@ -853,6 +897,8 @@ ck("⑦ critic 无法改写已冻结 blueprint",
    and "reviewed-frozen-channel" in world_first_wp["world_blueprint"]["evidence_channels"]
    and "critic-illegal-rewrite" not in world_first_wp["world_blueprint"]["evidence_channels"]
    and world_first_wp["domain_profile"]["entity_noun"] == "玩家")
+ck("⑦ critic 不能把 line_mapping 的不适用零权重线塞回 active_lines",
+   [item["line"] for item in world_first_wp["active_lines"]] == ["L1_timeline"])
 ck("⑦ 换皮反方的审议记录进入白皮书且获低风险批准",
    world_first_wp["world_review"].get("reskin_risk") == "low"
    and world_first_wp["world_review"].get("mechanical_outcome") == "accepted"
@@ -925,6 +971,16 @@ ck("⑦ residual reskin risk 非 low 时五轮后 fail-closed",
 ck("⑦ 换皮评审未批准时不得进入能力 map",
    "council.map" not in high_risk_tags and "council.critique" not in high_risk_tags)
 
+# 模型常把 schema 的 kind 注解误抄进 JSON key；只允许受蓝图白名单约束的安全归一。
+decorated_fields = _canonicalize_generated_field_names(
+    {"当前任务(text)": {"type": "stable", "value": "调查"},
+     "任务状态（status）": {"type": "stable", "value": "进行中"},
+     "未知字段(text)": {"type": "stable", "value": "x"}},
+    {"当前任务", "任务状态"},
+)
+ck("⑷ 已知 kind 后缀归一为蓝图字段",
+   set(decorated_fields) >= {"当前任务", "任务状态"})
+ck("⑷ 未知字段不被冒充成合法字段", "未知字段" not in decorated_fields)
 
 npass = sum(1 for ok, _ in checks if ok)
 for ok, name in checks:

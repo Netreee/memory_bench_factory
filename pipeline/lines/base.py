@@ -69,6 +69,10 @@ class ProductionLine(ABC):
     gt_substrate: str = ""           # gt 基质描述(护城河,人读)
     implemented: bool = True
 
+    # 显式 world_blueprint 冻结后，默认禁止 prepare 再改世界。只有不修改实体、
+    # 关系、事件或 canonical 时间线，仅派生评测证据侧信道的产线，才可显式打开。
+    typed_overlay_safe: bool = False
+
     # ── 依赖声明:本线产题所需的【世界基质特征】(可代码判定的结构化标签)──
     #   Skill-it 依赖图思想的【忠实落地】:我们是评测生成器、不做在线训练混合,
     #   所以这里不是"按学习速度动态重配权重",而是"每条产线依赖世界里的某种基质特征才能产题"。

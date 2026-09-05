@@ -146,17 +146,32 @@ class ConsolidationLine(ProductionLine):
                 continue
             counts = sorted(((ent, _change_count(ws.entities[ent][fname])) for ent in ents),
                             key=lambda x: (-x[1], x[0]))
-            cand = counts[:CMP_MAX_CAND]
-            if len(cand) < 2 or cand[0][1] - cand[1][1] < CMP_MARGIN or cand[0][1] < 1:
+            if not counts or counts[0][1] < 1:
                 continue
+            # 不能固定取 top-k：若前几名并列 7 次，但后面有 4 次的实体，
+            # top-k 会误判“无明确赢家”。题面的候选集本来就是枚举器选定的子集，
+            # 因此从同字段拥有者中选“一个最高者 + 差距达 margin 的对手”，仍保证唯一 gold。
+            winner = counts[0]
+            opponents = [item for item in counts[1:]
+                         if winner[1] - item[1] >= CMP_MARGIN]
+            if not opponents:
+                continue
+            cand = [winner] + opponents[:CMP_MAX_CAND - 1]
             winner = cand[0][0]
             cand_names = sorted(e for e, _ in cand)
             evid = sorted({o.session for e, _ in cand for o in ws.entities[e][fname].change_ops()})
+            winner_values, seen_values = [], set()
+            for _session, _date, value in ws.entities[winner][fname].set_values():
+                normalized = _norm(value)
+                if normalized and normalized not in seen_values:
+                    seen_values.add(normalized)
+                    winner_values.append(str(value))
             out.append({"line": self.id, "capability": "L7_consolidation", "entity": winner, "field": fname,
                         "gt": winner,
                         "evidence_sessions": evid,
                         "aux": {"sub": "S2_compare", "candidates": cand_names,
-                                "counts": {e: c for e, c in cand}}})
+                                "counts": {e: c for e, c in cand},
+                                "winner_values": winner_values}})
         return out
 
     # ── ★护城河:从世界重算趋势标签 / argmax 赢家,== 烘焙则过校验闸 ──
@@ -238,10 +253,12 @@ class ConsolidationLine(ProductionLine):
             return ("grounded", f"{grounded_pts} 个数值就近「{ent}」(趋势可见)")
 
         if sub == "S2_compare":
-            vals = _distinct_attributed_values(order, evidence_docs, ent, fld)
-            if vals < 2:
-                return ("drop", f"赢家变动不可见:「{ent}.{fld}」就近仅 {vals} 个不同值(< 2,看不出'变动频繁')")
-            return ("grounded", f"赢家「{ent}」的「{fld}」≥2 个不同值就近(变动可见)")
+            values = list(dict.fromkeys(str(v) for v in aux.get("winner_values", []) if _norm(v)))
+            grounded_values = [value for value in values if attributed(value, ent, docs)]
+            if len(grounded_values) < 2:
+                return ("drop", f"赢家变动不可见:「{ent}.{fld}」的真实字段值就近仅 "
+                                f"{len(grounded_values)} 个(< 2,看不出'变动频繁')")
+            return ("grounded", f"赢家「{ent}」的「{fld}」≥2 个真实字段值就近(变动可见)")
 
         return ("drop", f"未知归纳型 '{sub}'(fail-closed)")
 
@@ -251,16 +268,6 @@ def _num_tokens(text: str) -> set:
     """从 _norm 文本里抽出数值 token(整数/小数),供 S1 接地数"出现了几个数值"。"""
     import re
     return set(re.findall(r"\d+(?:\.\d+)?", text))
-
-
-def _distinct_attributed_values(order, evidence_docs, ent, fld) -> int:
-    """证据里就近实体出现的【不同数值】个数(S2:赢家变动可见性)。"""
-    from pipeline.grounding import attributed
-    docs = [d["content"] for d in evidence_docs]
-    toks = set()
-    for d in docs:
-        toks |= _num_tokens(_norm(d))
-    return sum(1 for t in toks if attributed(t, ent, docs))
 
 
 # 自检:python -m pipeline.lines.L7_consolidation
@@ -371,8 +378,9 @@ if __name__ == "__main__":
     s2_num_docs = [{"session": 0, "content": "研发部指标 3。", "is_conflict": False},
                    {"session": 1, "content": "研发部指标 7。", "is_conflict": False}]
     s2_num = {"line": line.id, "capability": "L7_consolidation", "entity": "研发部", "field": "指标",
-              "gt": "研发部", "aux": {"sub": "S2_compare", "candidates": ["研发部", "测试部"]}, "evidence_sessions": [0, 1]}
-    ck("ground S2:赢家≥2不同数值就近 → grounded", line.ground(s2_num, s2_num_docs)[0] == "grounded")
+              "gt": "研发部", "aux": {"sub": "S2_compare", "candidates": ["研发部", "测试部"],
+                                          "winner_values": ["3", "7"]}, "evidence_sessions": [0, 1]}
+    ck("ground S2:赢家≥2个真实字段值就近 → grounded", line.ground(s2_num, s2_num_docs)[0] == "grounded")
 
     npass = sum(1 for ok, _ in checks if ok)
     for ok, name in checks:

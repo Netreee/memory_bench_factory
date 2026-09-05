@@ -90,10 +90,29 @@ def _corpus_system(profile, blueprint=None) -> str:
                   genre0=genres.split("/")[0], type_legend=legend, time_unit=time_unit)
 
 
-def _filler_system(profile) -> str:
+def _filler_system(profile, blueprint=None) -> str:
+    """构造同领域、同世界但不承载真值的 filler 提示词。
+
+    输入来自已经冻结的领域画像与世界蓝图；输出只影响草堆文档的风格，
+    不允许 filler 接触被追踪实体或字段，因此不会改变 benchmark gold。
+    """
     noun = profile.get("entity_noun", "实体")
     genres = "/".join(profile.get("doc_genres", ["通知", "纪要", "公告"]))
-    return render("filler.system", noun=noun)
+    blueprint = blueprint or {}
+    context = {
+        "entity_types": [
+            {"id": item.get("id"), "noun": item.get("noun")}
+            for item in blueprint.get("entity_types", []) if item.get("id")
+        ],
+        "relation_types": [item.get("id") for item in blueprint.get("relation_types", []) if item.get("id")],
+        "event_types": [
+            {"id": item.get("id"), "label": item.get("label")}
+            for item in blueprint.get("event_types", []) if item.get("id")
+        ],
+        "evidence_channels": list(blueprint.get("evidence_channels", [])),
+    }
+    return render("filler.system", noun=noun, genres=genres,
+                  world_context=json.dumps(context, ensure_ascii=False))
 
 
 def _session_facts(ws, s):
@@ -138,6 +157,53 @@ def _tracked_blocklist(ws, profile=None):
                     if v and _to_num(v) is None and len(str(v)) >= 2:
                         out.add(str(v))
     return out
+
+
+def _sanitize_corpus(corpus: dict, ws, profile=None) -> dict:
+    """收口语料元数据，尤其处理扩世界后的增量一致性。
+
+    - 信号文档若模型漏了 fact_refs，只从同 session 中在正文里逐字出现的
+      实体+真值（或完整事件参与者）反推；无法反推则删掉该文档。
+    - 扩容后新实体名可能撞上旧 filler，此时删掉撞词 filler，不让草堆变证据。
+    """
+    blocked = {str(x) for x in _tracked_blocklist(ws, profile) if x}
+    blueprint = getattr(ws, "world_blueprint", None) or {}
+    event_labels = {item.get("id"): item.get("label") for item in blueprint.get("event_types", [])}
+    events_by_session = {}
+    for event in getattr(ws, "events", None) or []:
+        events_by_session.setdefault(event.get("session"), []).append(event)
+    stats = {"inferred_refs": 0, "dropped_unref": 0, "dropped_filler_leaks": 0}
+    for session in corpus.get("sessions", []):
+        sid = session.get("session_id")
+        facts = _session_facts(ws, sid)
+        kept = []
+        for doc in session.get("docs", []):
+            content = str(doc.get("content") or "")
+            if doc.get("is_filler") is True:
+                if any(term in content for term in blocked):
+                    stats["dropped_filler_leaks"] += 1
+                    continue
+                doc["fact_refs"] = []
+            elif "_sig_" in str(doc.get("doc_id", "")) and not doc.get("fact_refs"):
+                refs = []
+                for fact in facts:
+                    entity, field, value = str(fact.get("entity") or ""), str(fact.get("field") or ""), fact.get("value")
+                    if entity and entity in content and ((value not in (None, "") and str(value) in content)
+                                                         or (fact.get("stopped") and any(x in content for x in ("停止", "不再", "终止", "暂停")))):
+                        refs.append(f"{entity}.{field}")
+                for event in events_by_session.get(sid, []):
+                    label = event_labels.get(event.get("type")) or event.get("label")
+                    participants = [str(x) for x in (event.get("participants") or {}).values() if x]
+                    if label and label in content and participants and all(x in content for x in participants):
+                        refs.append(f"{event.get('id')}.label")
+                doc["fact_refs"] = list(dict.fromkeys(refs))
+                if not doc["fact_refs"]:
+                    stats["dropped_unref"] += 1
+                    continue
+                stats["inferred_refs"] += 1
+            kept.append(doc)
+        session["docs"] = kept
+    return stats
 
 
 def _render_conflict_docs(ws, s, date, tracer):
@@ -209,7 +275,7 @@ def render_corpus(wp, ws, target_tokens, tracer, corpus, done_weeks, save_cb, lo
     temporal = blueprint.get("temporal_model") or {}
     time_unit = temporal.get("unit", "week")
     step_days = int(temporal.get("step_days", 7) or 7)
-    sys_sig, sys_fil = _corpus_system(profile, blueprint), _filler_system(profile)
+    sys_sig, sys_fil = _corpus_system(profile, blueprint), _filler_system(profile, blueprint)
     blocked = _tracked_blocklist(ws, profile)
     # 估算 filler/周 以达目标 token(~1字≈1token)。周并行后不再 early-stop;filler_per_week 已按目标分摊。
     n_sessions = ws.n_sessions
@@ -369,6 +435,12 @@ def render_corpus(wp, ws, target_tokens, tracer, corpus, done_weeks, save_cb, lo
         return s
 
     config.pmap(_render_week, weeks, workers=max(1, len(weeks)))   # ★周并行;在飞 API 由全局 LLM_CONCURRENCY 兜住
+    sanitized = _sanitize_corpus(corpus, ws, profile)
+    if any(sanitized.values()):
+        save_cb()
+        log(f"  ✓ 语料收口:补 fact_refs {sanitized['inferred_refs']} 篇 / "
+            f"弃无引用信号 {sanitized['dropped_unref']} 篇 / "
+            f"清理扩容后撞词 filler {sanitized['dropped_filler_leaks']} 篇")
     ch = sum(len(dd.get("content", "")) for x in corpus["sessions"] for dd in x["docs"])
     fb = f";⚠fail-loud弃段 {len(fallback_count)} 处/{sum(fallback_count)} 个 atom 未忠实渲染(验收要求趋零)" if fallback_count else ";弃段 0(✓)"
     log(f"  ✓ 渲染完成:{sum(len(x['docs']) for x in corpus['sessions'])} 篇 / {ch/1e6:.2f}M 字(目标 {target_tokens/1e6:.1f}M){fb}")

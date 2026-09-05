@@ -31,6 +31,14 @@ def _as_number(value: Any) -> float | None:
         return None
 
 
+def _looks_like_identity_field(name: str) -> bool:
+    """判断字段是否只是实体身份/专名的重复表示，不应被事件改写。"""
+    normalized = str(name or "").strip().lower().replace("_", "").replace("-", "")
+    if normalized in {"name", "id", "identifier", "entityname", "entityid"}:
+        return True
+    return normalized.endswith(("名称", "姓名", "编号", "标识", "标识符", "唯一id", "唯一标识"))
+
+
 def _legacy_blueprint(wp: dict) -> dict:
     """把历史白皮书投影成单类型蓝图；只用于读取没有显式蓝图的旧产物。"""
     profile = wp.get("domain_profile") or {}
@@ -420,6 +428,10 @@ def validate_world_blueprint(bp: dict) -> list[str]:
                 issues.append(
                     f"event {eid or '?'} effect 不得写 relation-owned 字段 {tid}.{fld} "
                     f"(relation={relation_owned_fields[(tid, fld)]})")
+            elif _looks_like_identity_field(fld):
+                issues.append(
+                    f"event {eid or '?'} effect 不得写实体身份字段 {tid}.{fld};"
+                    "事件必须改变状态/数值/可变属性，不能把实体专名重复 SET 给名称字段")
         minimum = 0 if bp.get("legacy_adapter") else 1
         if (isinstance(event.get("min_count"), bool) or not isinstance(event.get("min_count"), int)
                 or event.get("min_count", -1) < minimum):

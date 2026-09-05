@@ -136,9 +136,23 @@ def prepare_lines(wp, ws, log=print):
     stage_world 与闭环 driver 共用,避免两处各写一遍 prepare 循环。"""
     blueprint = getattr(ws, "world_blueprint", None) or {}
     if blueprint and not blueprint.get("legacy_adapter"):
-        # 显式世界蓝图已经冻结领域本体与动力学。能力线只能在 orders 阶段读取、判断可行性，
-        # 不能再通过 prepare 注入字段、改轨迹或塞入与场景无关的工单/敏感侧世界。
-        log("  ✓ typed world 已冻结:能力线只读映射，不执行 prepare 注入")
+        # 显式世界蓝图已经冻结领域本体与动力学。一般能力线不能再注入字段或改轨迹；
+        # 但允许显式声明 typed_overlay_safe 的产线，从冻结真值派生不改 canonical 的评测证据侧信道。
+        profile = wp.get("domain_profile", {})
+        seen, overlays = set(), []
+        for aid in [item.get("line") for item in wp.get("active_lines", [])]:
+            line = line_for(aid)
+            if not line or line.id in seen or not getattr(line, "typed_overlay_safe", False):
+                continue
+            seen.add(line.id)
+            note = line.prepare(ws, profile)
+            if note:
+                overlays.append(line.id)
+                log(note)
+        if overlays:
+            log(f"  ✓ typed world 已冻结:仅派生评测证据侧信道 {overlays}，canonical 不变")
+        else:
+            log("  ✓ typed world 已冻结:能力线只读映射，canonical 不变")
         return
     profile = wp.get("domain_profile", {})
     seen = set()
