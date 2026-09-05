@@ -9,17 +9,37 @@
 """
 from __future__ import annotations
 import sys
+from copy import deepcopy
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from pipeline.world_state import WorldState, Timeline, Op, SET, UPDATE, EXPIRE, _date_of, validate
 from pipeline.world_gen import _affix_units, imprint_structure
-from pipeline.render import render_corpus
+from pipeline.render import (_attach_story_provenance, _story_signal_groups,
+                             _strict_eq, render_corpus)
+from pipeline.story import StoryLedgerError, compile_story_ledger
 from pipeline.central_office import _canonicalize_lines
 from pipeline.lines.L4_preference import PreferenceLine
 from pipeline.lines import prepare_lines
 
 checks: list[tuple[bool, str]] = []
 def ck(name, cond): checks.append((bool(cond), name))
+
+
+ck("盲读答案的成对引号不改变精确值", _strict_eq("『已拾取』", "已拾取")
+   and _strict_eq("「北境顾问」", "北境顾问"))
+ck("剥引号后仍严格区分量纲", not _strict_eq("『78%』", "0.78"))
+
+grouped = _story_signal_groups({
+    "艾尔文": [
+        {"entity": "艾尔文", "field": "任务状态", "value": "完成"},
+        {"entity": "艾尔文", "field": "称号", "value": "守夜人"},
+    ],
+    "霜牙": [{"entity": "霜牙", "field": "装备状态", "value": "已掉落"}],
+}, [{"effects": [{"entity": "艾尔文", "field": "任务状态", "set": "完成"}]}])
+ck("Story 渲染把 event effect 与同一期普通状态拆组",
+   [[(entity, [fact["field"] for fact in facts]) for entity, facts in group]
+    for group in grouped] == [[("艾尔文", ["任务状态"])],
+                              [("艾尔文", ["称号"]), ("霜牙", ["装备状态"])]] )
 
 
 def _tl(*sv):                            # sv: (session, value);自动 SET/UPDATE + prev 链
@@ -33,8 +53,10 @@ def _tl(*sv):                            # sv: (session, value);自动 SET/UPDAT
 class _ScriptedTracer:
     """按脚本回 docs。只对 render.signal 出脚本+记历史(filler/conflict 等其它调用回空,免互相吃响应)。"""
     def __init__(self, script):
-        self.script = list(script); self.calls = []
+        self.script = list(script); self.calls = []; self.systems = []
     def chat_json(self, tag, messages, **kw):
+        if tag == "narrative.review":
+            return {"unsupported_claims": []}
         if tag == "render.discriminate":
             text = messages[-1]["content"]
             for value in ("86小时", "维持治疗"):
@@ -43,6 +65,7 @@ class _ScriptedTracer:
             return {"answer": "不确定"}
         if tag != "render.signal":
             return {"docs": []}
+        self.systems.append(messages[0]["content"])
         self.calls.append(messages[-1]["content"])
         return self.script.pop(0) if self.script else {"docs": []}
 
@@ -51,10 +74,13 @@ def _mini_ws():
     return WorldState({"鼎晟案": {"累计计费工时": _tl((0, "86小时"))}}, n_sessions=1)
 
 
-def _run_render(tracer):
+def _run_render(tracer, style_spec=None):
     ws = _mini_ws()
     corpus = {"sessions": []}
-    render_corpus({"domain_profile": {"doc_genres": ["纪要"], "stopped_phrase": "停止计费"}},
+    wp = {"domain_profile": {"doc_genres": ["纪要"], "stopped_phrase": "停止计费"}}
+    if style_spec is not None:
+        wp["style_spec"] = style_spec
+    render_corpus(wp,
                   ws, 0, tracer, corpus, set(), save_cb=lambda: None, log=lambda *a: None)
     return corpus["sessions"][0]["docs"] if corpus["sessions"] else []
 
@@ -80,6 +106,222 @@ docs3 = _run_render(t3)
 fb = [d for d in docs3 if d.get("is_fallback")]
 ck("②耗尽 fail-loud:4 轮失败后弃段", len(t3.calls) == 4 and docs3 == [])
 ck("②弃段不注 K=V 兜底备忘", not fb)
+
+# ②b:whitepaper style_spec 必须进入实际 signal system prompt，且旧固定长文约束不得残留
+short_style = {"tone": "客观简洁", "format": "单句", "length": "30-80字"}
+t_style = _ScriptedTracer([{"docs": [good_doc]}])
+_run_render(t_style, short_style)
+ck("②b renderer 消费 whitepaper style_spec",
+   t_style.systems and all(value in t_style.systems[0] for value in short_style.values()))
+ck("②b signal prompt 不再硬编码 1200-2000 字", "1200-2000" not in t_style.systems[0])
+ck("②b 非剧情世界不注入 Story Ledger 上下文",
+   t_style.calls and "game Story Ledger" not in t_style.calls[0])
+
+
+# ②c:game Story Ledger 只给本组当前 scene + 前一 scene canonical events，并逐篇写 provenance。
+def _story_ws():
+    """构造两幕、单主角且可被 Story Ledger 严格重放的最小游戏世界。"""
+    blueprint = {
+        "version": 1,
+        "entity_types": [{
+            "id": "player", "noun": "主角", "count": 1, "primary": True,
+            "cardinality_policy": "exact",
+            "fields": [{"name": "任务状态", "kind": "status",
+                        "states": ["出发", "完成"]}],
+        }],
+        "relation_types": [],
+        "event_types": [
+            {"id": "begin", "label": "启程", "roles": {"actor": "player"},
+             "effect_fields": [{"role": "actor", "field": "任务状态"}], "min_count": 1},
+            {"id": "finish", "label": "决战", "roles": {"actor": "player"},
+             "effect_fields": [{"role": "actor", "field": "任务状态"}], "min_count": 1},
+        ],
+        "causal_rules": [],
+        "temporal_model": {"unit": "chapter", "cadence": "event-driven",
+                           "n_sessions": 2, "step_days": 1},
+        "evidence_channels": ["剧情日志"],
+    }
+    ws = WorldState(
+        {"艾尔文": {"任务状态": _tl((0, "出发"), (1, "完成"))}},
+        n_sessions=2,
+        entity_types={"艾尔文": "player"},
+        events=[
+            {"id": "evt-start", "type": "begin", "session": 0,
+             "participants": {"actor": "艾尔文"},
+             "effects": [{"entity": "艾尔文", "field": "任务状态", "set": "出发"}]},
+            {"id": "evt-finish", "type": "finish", "session": 1,
+             "participants": {"actor": "艾尔文"},
+             "effects": [{"entity": "艾尔文", "field": "任务状态", "set": "完成"}]},
+        ],
+        world_blueprint=blueprint,
+    )
+    ws.narrative = compile_story_ledger(ws, {
+        "premise": "北境长夜吞没了归途。",
+        "goal": "艾尔文必须点亮归途。",
+        "stakes": "失败会让聚落永失补给。",
+        "protagonist_ref": "艾尔文",
+        "key_item_origins": [],
+        "scenes": [
+            {"scene_id": "scene-start", "session": 0, "order": 0,
+             "event_refs": ["evt-start"], "caused_by_scene_refs": [],
+             "dramatic_function": "setup", "summary": "艾尔文踏入长夜。"},
+            {"scene_id": "scene-finish", "session": 1, "order": 0,
+             "event_refs": ["evt-finish"], "caused_by_scene_refs": ["scene-start"],
+             "dramatic_function": "climax", "summary": "艾尔文完成最后决战。"},
+        ],
+    })
+    return ws
+
+
+class _StoryTracer:
+    """按事件返回合格短文，并留存 signal prompt 供剧情边界断言。"""
+    def __init__(self):
+        self.calls = []
+
+    def chat_json(self, tag, messages, **kw):
+        user = messages[-1]["content"]
+        if tag == "narrative.review":
+            return {"unsupported_claims": []}
+        if tag == "render.discriminate":
+            if "任务状态" in user and "记录为出发" in user:
+                return {"answer": "出发"}
+            if "任务状态" in user and "记录为完成" in user:
+                return {"answer": "完成"}
+            return {"answer": "不确定"}
+        if tag != "render.signal":
+            return {"docs": []}
+        self.calls.append(user)
+        if "evt-finish" in user:
+            return {"docs": [{"type": "剧情日志", "content":
+                               "2025-01-07，艾尔文完成决战，任务状态记录为完成。",
+                               "fact_refs": ["艾尔文.任务状态"], "is_filler": True}]}
+        return {"docs": [{"type": "剧情日志", "content":
+                           "2025-01-06，艾尔文响应启程，任务状态记录为出发。",
+                           "fact_refs": ["艾尔文.任务状态"], "is_filler": True}]}
+
+
+story_ws = _story_ws()
+story_tracer = _StoryTracer()
+story_corpus = {"sessions": []}
+render_corpus({"domain_profile": {"doc_genres": ["剧情日志"]}}, story_ws, 0,
+              story_tracer, story_corpus, set(), save_cb=lambda: None, log=lambda *a: None)
+story_calls = {"start": next(x for x in story_tracer.calls if "evt-start" in x),
+               "finish": next(x for x in story_tracer.calls if "evt-finish" in x)}
+ck("②c 首幕只收到当前 scene，不收到未来 scene",
+   "scene-start" in story_calls["start"] and "scene-finish" not in story_calls["start"])
+ck("②c 次幕只收到上一幕 canonical event，不收到自由摘要",
+   "scene-finish" in story_calls["finish"] and "evt-start" in story_calls["finish"]
+   and "艾尔文踏入长夜" not in story_calls["finish"])
+ck("②c premise/goal/stakes 不作为事实喂给正文",
+   all(text not in story_calls["start"] for text in
+       ("北境长夜吞没了归途", "艾尔文必须点亮归途", "失败会让聚落永失补给")))
+story_docs = {session["session_id"]: session["docs"][0]
+              for session in story_corpus["sessions"] if session["docs"]}
+ck("②c accepted doc 的 scene_refs/event_refs 由代码确定",
+   story_docs[0].get("scene_refs") == ["scene-start"]
+   and story_docs[0].get("event_refs") == ["evt-start"]
+   and story_docs[1].get("scene_refs") == ["scene-finish"]
+   and story_docs[1].get("event_refs") == ["evt-finish"])
+ck("②c signal 身份由代码决定，模型不能用 is_filler 删除事件证据",
+   all(doc.get("is_filler") is False for doc in story_docs.values()))
+
+split_docs = [
+    {"content": "艾尔文响应启程，任务状态记录为出发。"},
+    {"content": "艾尔文完成决战，任务状态记录为完成。"},
+]
+event_decls = {"begin": "启程", "finish": "决战"}
+labeled = [{**event, "label": event_decls[event["type"]]} for event in story_ws.events]
+_attach_story_provenance(split_docs, labeled, story_ws.narrative["scenes"])
+ck("②c 多文档 provenance 只标各篇实际承载的事件",
+   split_docs[0]["event_refs"] == ["evt-start"]
+   and split_docs[0]["scene_refs"] == ["scene-start"]
+   and split_docs[1]["event_refs"] == ["evt-finish"]
+   and split_docs[1]["scene_refs"] == ["scene-finish"])
+
+partial_effect_docs = [{"content": "艾尔文响应启程，但没有写明落地后的状态。"}]
+_attach_story_provenance(partial_effect_docs, labeled, story_ws.narrative["scenes"])
+ck("②c provenance 不把只有 label+参与者、缺 effect 结果的文档误标为事件证据",
+   partial_effect_docs[0]["event_refs"] == []
+   and partial_effect_docs[0]["scene_refs"] == [])
+
+wrong_field_docs = [{"content": "艾尔文响应启程，心情记录为出发。"}]
+_attach_story_provenance(wrong_field_docs, labeled, story_ws.narrative["scenes"])
+ck("②c provenance 不把实体和值相同但 effect 字段错误的文档误标为事件证据",
+   wrong_field_docs[0]["event_refs"] == []
+   and wrong_field_docs[0]["scene_refs"] == [])
+
+
+class _UnsupportedStoryTracer(_StoryTracer):
+    """机械事实可读，但每轮都额外编造剧情。"""
+
+    def chat_json(self, tag, messages, **kw):
+        if tag == "narrative.review":
+            return {"unsupported_claims": ["无依据复活"]}
+        return super().chat_json(tag, messages, **kw)
+
+
+unsupported_done = set()
+unsupported_corpus = {"sessions": []}
+try:
+    render_corpus({"domain_profile": {"doc_genres": ["剧情日志"]}}, story_ws, 0,
+                  _UnsupportedStoryTracer(), unsupported_corpus, unsupported_done,
+                  save_cb=lambda: None, log=lambda *a: None)
+except RuntimeError:
+    unsupported_failed_closed = True
+else:
+    unsupported_failed_closed = False
+ck("②c game 语义重试耗尽后整段 fail-closed 且不记完成 checkpoint",
+   unsupported_failed_closed and unsupported_done == set()
+   and unsupported_corpus == {"sessions": []})
+
+
+class _BackgroundUnsupportedTracer(_StoryTracer):
+    """事件文档合格，但普通状态组每轮都会编造跨事实剧情。"""
+
+    def __init__(self):
+        super().__init__()
+        self.background_reviews = []
+
+    def chat_json(self, tag, messages, **kw):
+        user = messages[-1]["content"]
+        if tag == "render.discriminate" and "称号" in user:
+            return {"answer": "守夜人"}
+        if tag == "narrative.review" and "私自复活" in user:
+            self.background_reviews.append(user)
+            return {"unsupported_claims": ["无依据复活"]}
+        if tag == "render.signal" and "evt-start" not in user and "evt-finish" not in user:
+            return {"docs": [{"type": "角色记录",
+                              "content": "2025-01-06，艾尔文的称号记为守夜人，并在无记录下私自复活。",
+                              "fact_refs": ["艾尔文.称号"]}]}
+        return super().chat_json(tag, messages, **kw)
+
+
+background_ws = deepcopy(story_ws)
+background_ws.world_blueprint["entity_types"][0]["fields"].append(
+    {"name": "称号", "kind": "status", "states": ["守夜人"]})
+background_ws.entities["艾尔文"]["称号"] = _tl((0, "守夜人"))
+background_tracer = _BackgroundUnsupportedTracer()
+background_corpus = {"sessions": []}
+render_corpus({"domain_profile": {"doc_genres": ["剧情日志"]}}, background_ws, 0,
+              background_tracer, background_corpus, set(), save_cb=lambda: None,
+              log=lambda *a: None)
+ck("②c game 的 background signal 也经过同一语义闸，串组编造被弃",
+   len(background_tracer.background_reviews) == 4
+   and not any("私自复活" in doc.get("content", "")
+               for session in background_corpus["sessions"] for doc in session["docs"]))
+
+bad_story_ws = deepcopy(story_ws)
+bad_story_ws.narrative["goal"] = ""
+bad_story_tracer = _StoryTracer()
+try:
+    render_corpus({"domain_profile": {"doc_genres": ["剧情日志"]}}, bad_story_ws, 0,
+                  bad_story_tracer, {"sessions": []}, set(), save_cb=lambda: None,
+                  log=lambda *a: None)
+    story_failed_closed = False
+except StoryLedgerError:
+    story_failed_closed = True
+ck("②c 非法 Story Ledger 在任何渲染调用前 fail-closed",
+   story_failed_closed and bad_story_tracer.calls == [])
 
 # ════════ ③ _affix_units ════════
 ws3 = WorldState({"星耀案": {"争议标的额": _tl((0, "200"), (2, "250")),

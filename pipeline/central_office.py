@@ -22,7 +22,11 @@ import json
 import config
 from pipeline.lines import taxonomy_prose
 from pipeline.prompts import render          # ★议会 prompts 收编进注册表(council.*)
-from pipeline.world_blueprint import normalize_world_blueprint, WorldBlueprintError
+from pipeline.world_blueprint import (
+    WorldBlueprintError,
+    normalize_world_blueprint,
+    repair_blueprint_candidate,
+)
 
 # ── 7 个议会视角的 system prompt ──────────────────────────────────────────
 OBSERVE_SYS = render("council.observe")
@@ -32,7 +36,6 @@ MEDIUM_SYS = render("council.medium")
 STYLE_SYS = render("council.style")
 TRAPS_SYS = render("council.traps")
 WORLD_SYS = render("council.world")
-WORLD_REVIEW_SYS = render("council.world_review")
 WORLD_REPAIR_SYS = render("council.world_repair")
 
 # ── 综合 + 批判 ──────────────────────────────────────────────────────────
@@ -205,6 +208,15 @@ def _separate_observed_relation_fields(candidate: dict, observed: dict) -> list[
     return repairs
 
 
+def _repair_candidate_blueprint(candidate: dict, observed: dict) -> tuple[dict, list[str]]:
+    """机械归一模型候选，并在展示字段拆分后再确认一次引用闭包。"""
+    repaired, repairs = repair_blueprint_candidate(candidate)
+    repairs.extend(_separate_observed_relation_fields(repaired, observed))
+    repaired, final_repairs = repair_blueprint_candidate(repaired)
+    repairs.extend(final_repairs)
+    return repaired, repairs
+
+
 def _assemble_whitepaper(views: dict, desc: str) -> dict:
     """★综合 = 代码确定性装配；世界视角是必须通过机械校验的硬门。"""
     obs = views.get("observe") or {}
@@ -213,7 +225,6 @@ def _assemble_whitepaper(views: dict, desc: str) -> dict:
     med = views.get("medium") or {}
     sty = views.get("style") or {}
     trp = views.get("traps") or {}
-    world_review = deepcopy(views.get("world_review") or {})
     # 新白皮书不允许 world 视角失败后悄悄退化成 legacy 单类型；历史适配只在读取旧产物时启用。
     world_view = views.get("world") or {}
     blueprint = normalize_world_blueprint(world_view)
@@ -289,8 +300,6 @@ def _assemble_whitepaper(views: dict, desc: str) -> dict:
                            "preference_axis": preference_axis,       # L4 只引用 blueprint 中唯一归属的真实字段
                            "state_machines": state_machines},     # ★C1③ 单向状态序声明(议会出;validate 据此查 illegal_transition,只查声明字段)
         "world_blueprint": blueprint,
-        # 审议记录与可执行契约并列留在白皮书中，方便人工先审“世界骨子”，再看能力映射。
-        "world_review": world_review,
         "medium": {"type": "documents", "genres": genres[:6], "cadence": temporal["cadence"],
                    "time_unit": temporal["unit"],
                    "candidates": (med.get("common_media") or []) + [m.get("form") for m in (med.get("unconventional_media") or [])]},
@@ -377,9 +386,6 @@ def _canonicalize_lines(wp: dict, draft: dict, log=print):
         wp["medium"] = deepcopy(draft.get("medium") or {})
         wp["shared_world_spec"] = deepcopy(draft.get("shared_world_spec") or {})
         normalize_world_blueprint(wp)  # 最终再走一次硬校验，防未来 canonical 逻辑破坏引用闭包。
-    if "world_review" in draft:
-        # 最终能力/文风 critic 无权覆写或删除先于能力映射完成的世界审议记录。
-        wp["world_review"] = deepcopy(draft["world_review"])
     if renamed or dropped or backfilled:
         log(f"    议会·canonical 化:改名 {renamed or '无'} / 丢弃不可识别 {dropped or '无'} / 补漏 {backfilled or '无'}")
 
@@ -421,10 +427,10 @@ def central_office(desc, few_shot, tracer, log=print) -> dict:
         candidate = tracer.chat_json("council.world" if first_pass else "council.world_repair",
             [{"role": "system", "content": system}, {"role": "user", "content": user}],
             temperature=0.5 if world_attempt == 1 else 0.2, max_tokens=8192)
-        world_out = candidate if isinstance(candidate, dict) else {}
-        relation_repairs = _separate_observed_relation_fields(world_out, views.get("observe") or {})
-        if relation_repairs:
-            log(f"    议会·world 关系/展示字段机械拆分:{relation_repairs}")
+        world_out, mechanical_repairs = _repair_candidate_blueprint(
+            candidate if isinstance(candidate, dict) else {}, views.get("observe") or {})
+        if mechanical_repairs:
+            log(f"    议会·world 候选机械归一:{mechanical_repairs}")
         try:
             blueprint = normalize_world_blueprint(world_out)
         except WorldBlueprintError as error:
@@ -442,75 +448,6 @@ def central_office(desc, few_shot, tracer, log=print) -> dict:
         raise WorldBlueprintError("world 架构师六轮后仍未通过机械/观察校验:" + world_error)
     # world 是能力映射的前置条件：先机械验骨架，再让 map 只判断哪些能力天然可读。
     views["world"] = {"world_blueprint": deepcopy(blueprint)}
-    world_draft = deepcopy(views["world"])
-    review_record: dict = {}
-    review_candidate = blueprint
-    review_error = "反方未返回结果"
-    for review_attempt in range(1, 6):
-        review = tracer.chat_json("council.world_review",
-            [{"role": "system", "content": WORLD_REVIEW_SYS},
-             {"role": "user", "content": render(
-                 "council.world_review_user", desc=desc, fs=fs,
-                 candidate=json.dumps(review_candidate, ensure_ascii=False))
-                 + (f"\n【上轮未获批准】{review_error}\n请继续修订，勿降低为口头辩解。"
-                    if review_attempt > 1 else "")}],
-            temperature=0.3, max_tokens=8192)
-        relation_repairs = _separate_observed_relation_fields(review, views.get("observe") or {})
-        if relation_repairs:
-            log(f"    议会·world_review 关系/展示字段机械拆分:{relation_repairs}")
-        review_record = (deepcopy(review.get("review"))
-                         if isinstance(review, dict) and isinstance(review.get("review"), dict) else {})
-        review_problems: list[str] = []
-        schema_repaired = False
-        try:
-            reviewed_blueprint = normalize_world_blueprint(review if isinstance(review, dict) else {})
-        except WorldBlueprintError as error:
-            # 语义反方容易在重写 JSON 时制造纯 schema 错误；交给独立修理员修引用闭包，
-            # 不让反方一边讨论领域一边猜校验规则。
-            repair = tracer.chat_json("council.world_repair",
-                [{"role": "system", "content": WORLD_REPAIR_SYS},
-                 {"role": "user", "content": render(
-                     "council.world_repair_user", errors=str(error),
-                     candidate=json.dumps(review if isinstance(review, dict) else {}, ensure_ascii=False))}],
-                temperature=0.1, max_tokens=8192)
-            relation_repairs = _separate_observed_relation_fields(repair, views.get("observe") or {})
-            if relation_repairs:
-                log(f"    议会·world_repair 关系/展示字段机械拆分:{relation_repairs}")
-            try:
-                reviewed_blueprint = normalize_world_blueprint(repair if isinstance(repair, dict) else {})
-            except WorldBlueprintError as repair_error:
-                reviewed_blueprint = None
-                review_problems.append(f"blueprint 修理后仍未通过机械校验:{repair_error}")
-            else:
-                review_record["schema_repaired"] = True
-                schema_repaired = True
-        if reviewed_blueprint is not None:
-            review_problems.extend(
-                _observed_blueprint_issues(reviewed_blueprint, views.get("observe") or {}))
-        if schema_repaired:
-            # 修理员只保证 JSON 契约；其输出必须在下一轮重新接受领域/换皮评审。
-            review_problems.append("schema 修理后的 blueprint 必须重新经过反方评审")
-        risk = str(review_record.get("reskin_risk") or "").strip().lower()
-        if risk != "low":
-            review_problems.append(f"修订后 residual reskin_risk 必须为 low，当前={risk or 'missing'}")
-        for key in ("findings", "decisions"):
-            values = review_record.get(key)
-            if not isinstance(values, list) or not any(isinstance(x, str) and x.strip() for x in values):
-                review_problems.append(f"review.{key} 必须保留至少一条非空审议记录")
-        if not review_problems and reviewed_blueprint is not None:
-            blueprint = reviewed_blueprint
-            views["world"] = {"world_blueprint": deepcopy(blueprint)}
-            review_record.update({"mechanical_outcome": "accepted", "attempts": review_attempt})
-            log("    议会·world_review ✓(换皮/本体/动力学/拓扑/时间/证据复核)")
-            break
-        if reviewed_blueprint is not None:
-            review_candidate = reviewed_blueprint
-        review_error = "; ".join(review_problems)
-        log(f"    议会·world_review 第{review_attempt}轮未批准:{review_error}")
-    else:
-        raise WorldBlueprintError("world_review 五轮后仍未批准，停止能力映射:" + review_error)
-    views["world_review"] = review_record
-    views["world_draft"] = world_draft
     map_ask = ("基于下面这份【已经冻结并通过机械校验的 world_blueprint】做能力映射。"
                "只能引用其中已有的实体类型、字段、关系和事件；不准为了激活某条产线要求世界补结构。\n"
                + json.dumps(blueprint, ensure_ascii=False))

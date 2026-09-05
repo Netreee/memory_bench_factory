@@ -59,7 +59,7 @@ p_big = WorldParams(n_entities=N_ENT_CLAMP[1], n_sessions=N_SESS_CLAMP[1], quota
 p_big2 = _grow_for_supply(p_big, {"L1_timeline": 99})
 ck("_grow_for_supply:已到 clamp 上限 → 不越界", p_big2.n_entities == N_ENT_CLAMP[1] and p_big2.n_sessions == N_SESS_CLAMP[1])
 
-# ── _scale_world_contract:typed 世界按类型比例扩容，结构密度同步增长 ────────────
+# ── _scale_world_contract:只固定显式 exact 类型，结构密度同步增长 ──────────
 typed_wp = {
     "shared_world_spec": {
         "entities": {"count": 999},
@@ -67,7 +67,7 @@ typed_wp = {
     },
     "world_blueprint": {
         "entity_types": [
-            {"id": "player", "count": 2, "primary": True},
+            {"id": "player", "count": 2, "primary": True, "cardinality_policy": "exact"},
             {"id": "boss", "count": 3},
             {"id": "equipment", "count": 5},
         ],
@@ -88,8 +88,8 @@ scaled_bp = typed_wp["world_blueprint"]
 scaled_counts = {item["id"]: item["count"] for item in scaled_bp["entity_types"]}
 scaled_rel_min = {item["id"]: item["min_count"] for item in scaled_bp["relation_types"]}
 scaled_event_min = {item["id"]: item["min_count"] for item in scaled_bp["event_types"]}
-ck("_scale_world_contract:typed 实体按原 2:3:5 比例扩到 20",
-   scaled_counts == {"player": 4, "boss": 6, "equipment": 10})
+ck("_scale_world_contract:exact 主角固定为 2，外围实体按原比例扩到总数 20",
+   scaled_counts == {"player": 2, "boss": 7, "equipment": 11})
 ck("_scale_world_contract:relation min_count 随实体规模同比放大且 0 保持可选",
    scaled_rel_min == {"equips": 2, "drops": 4, "optional_link": 0})
 ck("_scale_world_contract:event min_count 随实体规模同比放大",
@@ -101,8 +101,9 @@ ck("_scale_world_contract:typed blueprint 与 legacy 镜像使用实际实体/se
 
 # 缩放目标来自闭环旋钮：小目标也必须能压回小世界；比例锚始终取首次白皮书。
 _scale_world_contract(typed_wp, n_entities=7, n_sessions=6)
-ck("_scale_world_contract:较小目标按原比例缩小且每类至少一个",
+ck("_scale_world_contract:较小目标仍固定 exact 类型，外围按比例缩小且每类至少一个",
    sum(item["count"] for item in scaled_bp["entity_types"]) == 7
+   and scaled_bp["entity_types"][0]["count"] == 2
    and all(item["count"] >= 1 for item in scaled_bp["entity_types"])
    and {item["id"]: item["min_count"] for item in scaled_bp["relation_types"]}
        == {"equips": 1, "drops": 2, "optional_link": 0}
@@ -110,7 +111,7 @@ ck("_scale_world_contract:较小目标按原比例缩小且每类至少一个",
        == {"defeat_boss": 2, "acquire_item": 3}
    and scaled_bp["temporal_model"]["n_sessions"] == 6)
 
-# target-owned static 标量 FK：比例取整后 owner 仍只有 1 个，min_count 不能从 1 膨胀到 2。
+# target-owned static 标量 FK：未标 exact 的 primary 维持旧缩放行为。
 reverse_owner_scale_wp = {
     "shared_world_spec": {},
     "world_blueprint": {
@@ -127,11 +128,12 @@ reverse_owner_scale_wp = {
     },
 }
 _scale_world_contract(reverse_owner_scale_wp, n_entities=15, n_sessions=4)
-ck("_scale_world_contract:relation min_count 受真实 owner 标量容量约束",
-   reverse_owner_scale_wp["world_blueprint"]["entity_types"][1]["count"] == 1
+ck("_scale_world_contract:未标 exact 的 primary 仍按比例扩容",
+   reverse_owner_scale_wp["world_blueprint"]["entity_types"][0]["count"] == 14
+   and reverse_owner_scale_wp["world_blueprint"]["entity_types"][1]["count"] == 1
    and reverse_owner_scale_wp["world_blueprint"]["relation_types"][0]["min_count"] == 1)
 
-# 多轮小步扩容必须始终锚定白皮书初始密度，不能对已 ceil 的 min_count 再乘一次。
+# 只有未标 exact 的 primary 类型时仍保持历史扩容语义。
 incremental_scale_wp = {
     "shared_world_spec": {},
     "world_blueprint": {
@@ -143,9 +145,41 @@ incremental_scale_wp = {
 }
 for target_size in range(11, 16):
     _scale_world_contract(incremental_scale_wp, n_entities=target_size, n_sessions=4)
-ck("_scale_world_contract:多轮增量缩放不累积 ceil 爆炸",
+ck("_scale_world_contract:未标 exact 的单 primary 维持旧扩容语义且不累积 ceil",
    incremental_scale_wp["world_blueprint"]["entity_types"][0]["count"] == 15
    and incremental_scale_wp["world_blueprint"]["event_types"][0]["min_count"] == 2)
+
+# 单一主人公显式 exact：闭环目标再大也不能复制第二个主角。
+exact_character_wp = {
+    "shared_world_spec": {},
+    "world_blueprint": {
+        "entity_types": [{"id": "player_character", "count": 1, "primary": True,
+                          "cardinality_policy": "exact"}],
+        "relation_types": [],
+        "event_types": [{"id": "story_beat", "min_count": 1}],
+        "temporal_model": {"n_sessions": 4},
+    },
+}
+_scale_world_contract(exact_character_wp, n_entities=15, n_sessions=4, narrative=True)
+ck("_scale_world_contract:exact 单主角不被闭环复制",
+   exact_character_wp["world_blueprint"]["entity_types"][0]["count"] == 1
+   and exact_character_wp["shared_world_spec"]["entities"]["count"] == 1
+   and exact_character_wp["world_blueprint"]["event_types"][0]["min_count"] == 1)
+
+event_capacity_wp = {
+    "shared_world_spec": {},
+    "world_blueprint": {
+        "entity_types": [{"id": "player", "count": 1, "primary": True,
+                          "cardinality_policy": "exact"}],
+        "relation_types": [],
+        "event_types": [{"id": "tick", "roles": {"actor": "player"},
+                         "min_count": 8}],
+        "temporal_model": {"n_sessions": 2},
+    },
+}
+_scale_world_contract(event_capacity_wp, n_entities=100, n_sessions=2)
+ck("_scale_world_contract:event min_count 不超过角色组合×session 的实例容量",
+   event_capacity_wp["world_blueprint"]["event_types"][0]["min_count"] == 2)
 
 # ── _floor_status:达标/可行未达(growable)/不可行未达(permanent)/总数闸 ─────────
 spec = TargetSpec(min_questions=20, per_line_min={"L1_timeline": 8, "L2_relational": 6, "L3_process": 5})

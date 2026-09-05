@@ -11,6 +11,7 @@ import config
 from pipeline.world_state import _date_of, week_label, _to_num, _dicts, EXPIRE, DELETE
 from pipeline.lines import line_for
 from pipeline.prompts import render
+from pipeline.story import replay_story_ledger, review_narrative_supportedness
 
 
 LEAK_BANNED = ["当前", "现在", "最新", "目前", "截至目前", "迄今", "至今", "一直", "历来",
@@ -23,13 +24,16 @@ _DISC_UNSURE = ["不确定", "无法确定", "读不出", "读不到", "不清�
 
 
 def _dim_norm(s) -> str:
-    """★量纲严格归一(死钉④):只做"去空格 + 全角→半角",★保留尾部 %/单位/小数点不剥。
+    """★量纲严格归一(死钉④):去空格、全角数字归一并剥成对引号，保留 %/单位/小数点。
     与 world_state._norm / eval.judge._norm 的关键区别:那两个 .rstrip('%。.') 会把
     "78%"→"78" 抹平双量纲;本函数【保留 %】,使 _dim_norm("78%")!="0.78"、!="78"。"""
     if s is None:
         return ""
     t = str(s).strip().replace(" ", "").replace("　", "")
     t = t.translate(str.maketrans("０１２３４５６７８９％．", "0123456789%."))
+    quote_pairs = {"\"": "\"", "'": "'", "“": "”", "‘": "’", "「": "」", "『": "』"}
+    while len(t) >= 2 and quote_pairs.get(t[0]) == t[-1]:
+        t = t[1:-1].strip()
     return t
 
 
@@ -79,15 +83,23 @@ def _discriminator_recovers(docs, entity, field, true_value, tracer):
     return (_strict_eq(ans, str(true_value)), ans)
 
 
-def _corpus_system(profile, blueprint=None) -> str:
+def _corpus_system(profile, blueprint=None, style_spec=None) -> str:
+    """构造信号文档提示词，并把白皮书写作规格作为唯一风格约束传入。"""
     genres = "/".join(profile.get("doc_genres", ["周报", "通报", "邮件"]))
     stopped = profile.get("stopped_phrase", "停止统计")
     noun = profile.get("entity_noun", "实体")
     types = (blueprint or {}).get("entity_types") or []
     legend = "、".join(f"{t.get('id')}={t.get('noun')}" for t in types if t.get("id")) or f"legacy={noun}"
     time_unit = ((blueprint or {}).get("temporal_model") or {}).get("unit", "week")
+    if isinstance(style_spec, dict):
+        style_text = json.dumps(style_spec, ensure_ascii=False)
+    elif style_spec:
+        style_text = str(style_spec)
+    else:
+        style_text = "未另行指定；采用该领域真实文档的自然写法，篇幅以完整承载本组事实为准。"
     return render("corpus.system", noun=noun, genres=genres, stopped=stopped,
-                  genre0=genres.split("/")[0], type_legend=legend, time_unit=time_unit)
+                  genre0=genres.split("/")[0], type_legend=legend, time_unit=time_unit,
+                  style_spec=style_text)
 
 
 def _filler_system(profile, blueprint=None) -> str:
@@ -129,18 +141,37 @@ def _session_facts(ws, s):
     return facts
 
 
+def _event_is_narrated(event: dict, content: str) -> bool:
+    """事件的参与者和全部 effect 三元组同篇出现，才允许挂该事件 provenance。"""
+    participants = {str(x) for x in (event.get("participants") or {}).values() if x}
+    effects = [effect for effect in (event.get("effects") or []) if isinstance(effect, dict)]
+
+    def _effect_visible(effect: dict) -> bool:
+        entity = str(effect.get("entity") or "").strip()
+        field = str(effect.get("field") or "").strip()
+        value = effect.get("set", effect.get("value"))
+        return bool(entity and field and value is not None
+                    and entity in content and field in content and str(value) in content)
+
+    return bool(participants and effects
+                and all(name in content for name in participants)
+                and all(_effect_visible(effect) for effect in effects))
+
+
 def _missing_event_narratives(events, contents) -> list[str]:
-    """机械检查每个领域事件是否以“事件 label + 全部参与者同篇”真正进入文档。"""
+    """机械检查每个领域事件的参与者和 effect 三元组是否完整进入同一篇文档。"""
     missing = []
     for event in events:
         label = str(event.get("label") or "").strip()
         participants = sorted({str(x) for x in (event.get("participants") or {}).values() if x})
-        if not label or not participants:
-            missing.append(f"事件 {event.get('id') or event.get('type')} 缺 label/participants，无法验叙事")
-            continue
-        if not any(label in content and all(name in content for name in participants) for content in contents):
+        effects = [effect for effect in (event.get("effects") or []) if isinstance(effect, dict)]
+        if not label or not participants or not effects:
             missing.append(
-                f"事件「{label}」必须与参与者 {participants} 在同一篇文档中形成明确叙事")
+                f"事件 {event.get('id') or event.get('type')} 缺 label/participants/effects，无法验叙事")
+            continue
+        if not any(_event_is_narrated(event, content) for content in contents):
+            missing.append(
+                f"事件「{label}」必须把参与者 {participants} 与全部 effect 三元组写在同一篇文档中")
     return missing
 
 
@@ -265,17 +296,101 @@ def _chunk(lst, n):
         yield lst[i:i + n]
 
 
+def _story_signal_groups(bysku: dict, events: list[dict]) -> list[list[tuple[str, list[dict]]]]:
+    """把事件 effect 事实与同一期普通状态拆组，避免整张角色表拖累主线场景。"""
+    effect_keys = {
+        (effect.get("entity"), effect.get("field"))
+        for event in events for effect in (event.get("effects") or [])
+        if isinstance(effect, dict)
+    }
+    story_group, background = [], []
+    for entity, facts in bysku.items():
+        event_facts = [fact for fact in facts
+                       if (fact.get("entity"), fact.get("field")) in effect_keys]
+        other_facts = [fact for fact in facts
+                       if (fact.get("entity"), fact.get("field")) not in effect_keys]
+        if event_facts:
+            story_group.append((entity, event_facts))
+        if other_facts:
+            background.append((entity, other_facts))
+    return ([story_group] if story_group else []) + list(_chunk(background, 2))
+
+
+def _story_context_for_group(ledger, scenes, session, event_ids, event_by_id):
+    """只传当前幕作用与上一幕 canonical events，不把自由摘要当事实喂回正文。"""
+    if not ledger:
+        return ""
+
+    def _rank(scene):
+        order = scene.get("order", 0)
+        return scene.get("session", -1), order if isinstance(order, int) and not isinstance(order, bool) else 0
+
+    event_ids = list(dict.fromkeys(x for x in event_ids if x))
+    event_id_set = set(event_ids)
+    current = [scene for scene in scenes
+               if scene.get("session") == session
+               and event_id_set.intersection(scene.get("event_refs") or [])]
+    current.sort(key=lambda scene: (*_rank(scene), str(scene.get("scene_id") or "")))
+    anchor = _rank(current[0]) if current else (session, -1)
+    prior = [scene for scene in scenes
+             if _rank(scene) < anchor]
+    previous = max(prior, key=_rank, default=None)
+    previous_events = []
+    for event_ref in (previous.get("event_refs") or []) if previous else []:
+        event = event_by_id.get(event_ref)
+        if event:
+            previous_events.append({key: event.get(key) for key in (
+                "id", "label", "session", "participants", "effects")})
+    payload = {
+        "protagonist_ref": ledger.get("protagonist_ref"),
+        "previous_scene": ({"scene_id": previous.get("scene_id"),
+                            "canonical_events": previous_events}
+                           if previous else None),
+        "current_scenes": [
+            {"scene_id": scene.get("scene_id"),
+             "event_refs": [ref for ref in scene.get("event_refs", []) if ref in event_id_set],
+             "dramatic_function": scene.get("dramatic_function")}
+            for scene in current
+        ],
+    }
+    context = ("\n【game Story Ledger（只用于组织本期行文）】"
+               + json.dumps(payload, ensure_ascii=False)
+               + "\n★previous_scene 只含已经发生的 canonical events；不得写出任何未来 scene。"
+                 "事件参与者、结果、字段值仍只以本期 domain_events/facts 为准，"
+                 "不得补造死亡、掉落、获得、阵营变化或其他动态真值。")
+    return context
+
+
+def _attach_story_provenance(docs, events, scenes) -> None:
+    """按单篇实际承载的事件写 provenance，避免把整组 refs 复制给每篇。"""
+    event_to_scene = {
+        event_ref: scene.get("scene_id")
+        for scene in scenes
+        for event_ref in (scene.get("event_refs") or [])
+    }
+    for doc in docs:
+        content = str(doc.get("content") or "")
+        refs = [event.get("id") for event in events
+                if event.get("id") and _event_is_narrated(event, content)]
+        doc["event_refs"] = refs
+        doc["scene_refs"] = list(dict.fromkeys(
+            event_to_scene[ref] for ref in refs if ref in event_to_scene))
+
+
 def render_corpus(wp, ws, target_tokens, tracer, corpus, done_weeks, save_cb, log=print,
                   only_entities=None, only_entity_sessions=None):
     """only_entities=None:全量渲(每周全实体+filler)。
     only_entities=set:★增量 delta(§10.1)——【只渲这些新实体的 signal】并【追加】到已有周 docs,
     ``only_entity_sessions`` 精确补渲被新关系/事件改变的旧实体周；不重灌 filler。"""
+    story_ledger = getattr(ws, "narrative", None) or {}
+    story_scenes = replay_story_ledger(ws, story_ledger) if story_ledger else []
     profile = wp.get("domain_profile", {})
     blueprint = getattr(ws, "world_blueprint", None) or wp.get("world_blueprint") or {}
     temporal = blueprint.get("temporal_model") or {}
     time_unit = temporal.get("unit", "week")
     step_days = int(temporal.get("step_days", 7) or 7)
-    sys_sig, sys_fil = _corpus_system(profile, blueprint), _filler_system(profile, blueprint)
+    sys_sig = _corpus_system(profile, blueprint, wp.get("style_spec"))
+    sys_fil = _filler_system(profile, blueprint)
     blocked = _tracked_blocklist(ws, profile)
     # 估算 filler/周 以达目标 token(~1字≈1token)。周并行后不再 early-stop;filler_per_week 已按目标分摊。
     n_sessions = ws.n_sessions
@@ -292,8 +407,13 @@ def render_corpus(wp, ws, target_tokens, tracer, corpus, done_weeks, save_cb, lo
         date = _date_of(s, step_days=step_days)
         facts = _session_facts(ws, s)
         event_decls = {e.get("id"): e for e in blueprint.get("event_types", [])}
-        session_events = [{**e, "label": (event_decls.get(e.get("type")) or {}).get("label", e.get("type", ""))}
-                          for e in (getattr(ws, "events", None) or []) if e.get("session") == s]
+        labeled_events = [
+            {**event, "label": (event_decls.get(event.get("type")) or {}).get(
+                "label", event.get("type", ""))}
+            for event in (getattr(ws, "events", None) or [])
+        ]
+        event_by_id = {event.get("id"): event for event in labeled_events if event.get("id")}
+        session_events = [event for event in labeled_events if event.get("session") == s]
         if delta_mode:                                    # ★delta:新实体全程 + 旧实体受结构变化的精确 session
             facts = [f for f in facts if (f["entity"] in only_entities
                                           or (f["entity"], s) in only_entity_sessions)]
@@ -302,15 +422,28 @@ def render_corpus(wp, ws, target_tokens, tracer, corpus, done_weeks, save_cb, lo
         bysku = {}
         for f in facts:
             bysku.setdefault(f["entity"], []).append(f)
-        sig_groups = list(_chunk(list(bysku.items()), 2))   # ★2 实体/组:文档更聚焦、归属更清晰、逼渲全(6→3→2)
+        if story_ledger:
+            sig_groups = _story_signal_groups(bysku, session_events)
+        else:
+            sig_groups = list(_chunk(list(bysku.items()), 2))   # 非剧情场景保持原两实体一组
         n_batches = (filler_per_week + 5) // 6
 
         def _render_sig(grp):                             # ★信号块:渲全 + 渲对 —— 盲判别器据渲文能否唯一还原 (实体,字段) 才算渲到
             from pipeline.grounding import STOP_MARKERS    # ★只借停用标记(STOP_MARKERS);忠实检不再用 §G 的 attributed(死钉②不同尺)
             gf = [f for _e, fs in grp for f in fs]
             group_entities = {f["entity"] for f in gf}
-            group_events = [e for e in session_events
-                            if group_entities.intersection((e.get("participants") or {}).values())]
+            if story_ledger:
+                group_fact_keys = {(f.get("entity"), f.get("field")) for f in gf}
+                group_events = [
+                    event for event in session_events
+                    if any((effect.get("entity"), effect.get("field")) in group_fact_keys
+                           for effect in (event.get("effects") or []) if isinstance(effect, dict))
+                ]
+            else:
+                group_events = [e for e in session_events
+                                if group_entities.intersection((e.get("participants") or {}).values())]
+            story_context = _story_context_for_group(
+                story_ledger, story_scenes, s, [e.get("id") for e in group_events], event_by_id)
             # 待渲事实:非停用 → 派盲判别器读 (实体,字段) 的值,代码量纲严格对账;停用 → 验 (实体,停用标记) 同篇
             want_val = [(f["entity"], f["field"], str(f["value"])) for f in gf if f.get("value") and not f.get("stopped")]
             want_stop = [(f["entity"], f["field"]) for f in gf if f.get("stopped")]
@@ -347,15 +480,16 @@ def render_corpus(wp, ws, target_tokens, tracer, corpus, done_weeks, save_cb, lo
                     masked = masked.replace(nm, "■" * len(nm))
                 return [b for b in LEAK_BANNED if b in masked]
 
-            grp_docs, hint = [], ""
+            grp_docs, hint, left = [], "", []
             for _att in range(4):                         # 多给几次重渲机会,强制渲全(世界辛苦生成,必须全用上)
                 out = tracer.chat_json("render.signal",
                     [{"role": "system", "content": sys_sig},
                      {"role": "user", "content": render(
                          "corpus.user", s=week_label(s), time_unit=time_unit, date=date,
                          facts=json.dumps(gf, ensure_ascii=False),
-                         events=json.dumps(group_events, ensure_ascii=False), hint=hint)}],
-                    temperature=0.6, max_tokens=8192)
+                         events=json.dumps(group_events, ensure_ascii=False),
+                         story_context=story_context, hint=hint)}],
+                    temperature=0.6 if _att == 0 else 0.2, max_tokens=8192)
                 cand, leak_notes = [], []
                 for d in _dicts(out.get("docs") if isinstance(out, dict) else []):
                     if not d.get("content"):
@@ -364,29 +498,58 @@ def render_corpus(wp, ws, target_tokens, tracer, corpus, done_weeks, save_cb, lo
                     if hits:                              # 犯禁不再静默丢:记下死因,进诚实反馈(它驮的事实会出现在 missing 里)
                         leak_notes.append(f"《{(d.get('title') or d.get('type') or '无题')}》因使用全局口径词{hits}被废弃")
                     else:
-                        cand.append(d)
+                        # signal/filler 身份由代码决定，模型不能用额外元数据让已验收
+                        # 的事件文档在 sanitize 阶段被当草堆删除。
+                        clean = {key: d[key] for key in ("title", "type", "content", "fact_refs")
+                                 if key in d}
+                        clean["is_filler"] = False
+                        cand.append(clean)
                 contents = [d.get("content", "") for d in cand]
                 miss_val, miss_stop, miss_event = _discriminate(contents)
                 missing = miss_val + miss_stop + miss_event
-                grp_docs = cand or grp_docs
-                if not missing:
+                unsupported = []
+                if not missing and story_ledger:
+                    unsupported = review_narrative_supportedness(
+                        tracer,
+                        canon={"session": s, "facts": gf, "domain_events": group_events,
+                               "allowed_past_context": story_context},
+                        candidate=cand,
+                        scope=f"game corpus session {s}")
+                left = missing + [f"无依据剧情断言:{item}" for item in unsupported]
+                grp_docs = cand
+                if not left:
                     break
                 # ★hint 如实(老版把"写了但犯禁被废"误报成"没写"→ 重试不收敛):缺什么、为什么缺,分开说
-                hint = (f"\n★ 这些事实在上一版【没有合格呈现】(每条必须让对应实体名与值在同一句/紧邻就近出现,值逐字照抄):{missing}。")
+                hint = ""
+                if missing:
+                    hint += (f"\n★ 这些事实在上一版【没有合格呈现】"
+                             f"(实体名与值必须就近、值逐字照抄):{missing}。")
+                if miss_event:
+                    exact_effects = [
+                        {"entity": effect.get("entity"), "field": effect.get("field"),
+                         "set": effect.get("set", effect.get("value"))}
+                        for event in group_events for effect in (event.get("effects") or [])
+                        if isinstance(effect, dict)
+                    ]
+                    hint += ("\n★ 只修上述事件证据：同一篇中明确写动作，并逐字写出这些"
+                             f" entity/field/set，禁止同义替换：{json.dumps(exact_effects, ensure_ascii=False)}。")
+                if unsupported:
+                    hint += (f"\n★ 上一版含 canonical 之外的断言:{unsupported}。"
+                             "删除这些断言，只用给定 facts/events 与已发生上下文重写。")
                 if leak_notes:
                     hint += (f"\n★ 另:上一版 {leak_notes}——重写时把其中事实写进正文,但【删掉这些全局口径词】"
                              f"(注意:字段名/实体名/事实值本身含这些字的照常写,不算犯禁)。")
                 hint += "逐条重写进正文(仍只写本期)。"
-            # ★fail-loud 弃段(删 K=V fail-open 兜底):轮次耗尽后再跑一次盲判别器,仍不可还原的 atom →
-            #   【不】再往 grp_docs 硬注 K=V 模板备忘(那是 fail-open、稳过 §G、把缺渲症状吸收掉),而是【弃段】:
-            #   grp_docs 不追加任何东西,缺的 atom 让出厂 §G 接地闸自然弃题;只显式告警 + 计 fallback_count(语义=弃段计数)。
-            contents = [d.get("content", "") for d in grp_docs]
-            miss_val, miss_stop, miss_event = _discriminate(contents)
-            left = miss_val + miss_stop + miss_event
-            if left:
+            else:
                 fallback_count.append(len(left))          # ★机械验收落点(语义改为"弃段计数"):汇总进末尾日志
                 ents = sorted({m.split("的「")[0] for m in left})
                 log(f"  ⚠fail-loud弃段[{time_unit}{week_label(s)}]:{len(left)} 个 atom 多轮重渲后盲读者仍不可还原,弃段不入库({ents})")
+                if group_events:
+                    raise RuntimeError(
+                        f"game narrative 渲染失败:{time_unit}{week_label(s)} 仍有 {len(left)} 个未通过项")
+                return []
+            if story_ledger:
+                _attach_story_provenance(grp_docs, group_events, story_scenes)
             return grp_docs
 
         def _render_fil(ci):                              # 一个草堆批
@@ -436,6 +599,28 @@ def render_corpus(wp, ws, target_tokens, tracer, corpus, done_weeks, save_cb, lo
 
     config.pmap(_render_week, weeks, workers=max(1, len(weeks)))   # ★周并行;在飞 API 由全局 LLM_CONCURRENCY 兜住
     sanitized = _sanitize_corpus(corpus, ws, profile)
+    if story_ledger:
+        covered = {
+            event_ref
+            for session in corpus.get("sessions", [])
+            for doc in session.get("docs", [])
+            for event_ref in (doc.get("event_refs") or [])
+        }
+        expected = {str(event.get("id")) for event in (getattr(ws, "events", None) or [])
+                    if isinstance(event, dict) and event.get("id")}
+        missing_events = sorted(expected - covered)
+        if missing_events:
+            # 清掉缺证据事件所在周的 checkpoint，人工续跑时会真正重渲，而非
+            # 反复读取同一份坏断点。
+            missing_sessions = {
+                event.get("session") for event in (getattr(ws, "events", None) or [])
+                if isinstance(event, dict) and str(event.get("id")) in missing_events
+            }
+            done_weeks.difference_update(missing_sessions)
+            corpus["sessions"] = [session for session in corpus.get("sessions", [])
+                                  if session.get("session_id") not in missing_sessions]
+            save_cb()
+            raise RuntimeError(f"game narrative 缺 canonical event 正文证据:{missing_events}")
     if any(sanitized.values()):
         save_cb()
         log(f"  ✓ 语料收口:补 fact_refs {sanitized['inferred_refs']} 篇 / "

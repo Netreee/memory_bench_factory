@@ -122,6 +122,7 @@ class WorldState:
     relations: list[dict] = field(default_factory=list)          # 已校验、已编译成软外键 Timeline 的关系实例
     events: list[dict] = field(default_factory=list)             # 已校验、effect 已编译成 Timeline 的领域事件
     world_blueprint: dict = field(default_factory=dict)          # 生成本世界所依据的可执行白皮书骨架
+    narrative: dict = field(default_factory=dict)                # 可选 Story Ledger；只引用 events，不复制动态真值
 
     def timeline(self, entity: str, fld: str) -> Optional[Timeline]:
         return self.entities.get(entity, {}).get(fld)
@@ -164,6 +165,7 @@ class WorldState:
             "relations": self.relations,
             "events": self.events,
             "world_blueprint": self.world_blueprint,
+            "narrative": self.narrative,
             # ★imprint 已注趋势标记必须随世界落盘(刀1审计·高危):否则闭环 ②环 augment 从盘重载后
             #   done 集为空 → 旧实体被【复注且 shuffle 翻向】,而 delta 续渲不重渲旧 docs → 语料与 canonical 矛盾。
             "_trended_fields": [list(t) for t in getattr(self, "_trended_fields", [])],
@@ -185,7 +187,8 @@ class WorldState:
                  entity_types=d.get("entity_types", {}),
                  relations=d.get("relations", []),
                  events=d.get("events", []),
-                 world_blueprint=d.get("world_blueprint", {}))
+                 world_blueprint=d.get("world_blueprint", {}),
+                 narrative=d.get("narrative", {}))
         ws._trended_fields = [tuple(t) for t in d.get("_trended_fields", [])]
         return ws
 
@@ -911,6 +914,9 @@ def assemble_world(table: dict, base: str = "2025-01-06", step_days: int = 7,
             rtype = rel_types.get(rel.get("type"))
             instance_id = rel.get("id")
             src, dst = rel.get("from"), rel.get("to")
+            extra_keys = sorted(set(rel) - {"id", "type", "from", "to", "session"})
+            if extra_keys:
+                issues.append(f"relation {instance_id or '?'} 含契约外字段:{extra_keys}")
             if not rtype:
                 issues.append(f"relation instance 类型未声明:{rel.get('type')}")
                 continue
@@ -943,7 +949,8 @@ def assemble_world(table: dict, base: str = "2025-01-06", step_days: int = 7,
             if not _inject(owner, rtype["field"], sess, referenced, f"relation {instance_id}"):
                 issues.append(f"relation {instance_id} 没有形成合法 FK 变化")
                 continue
-            relations.append(dict(rel))
+            relations.append({"id": instance_id, "type": rel.get("type"),
+                              "from": src, "to": dst, "session": sess})
             relation_ids.add(instance_id)
             relation_edges.add(edge)
             rel_counts[rtype["id"]] = rel_counts.get(rtype["id"], 0) + 1
@@ -974,11 +981,23 @@ def assemble_world(table: dict, base: str = "2025-01-06", step_days: int = 7,
             decl = event_types.get(event.get("type"))
             eid = event.get("id")
             participants = _dict(event.get("participants"))
+            extra_keys = sorted(set(event) - {
+                "id", "type", "session", "participants", "effects", "caused_by",
+            })
+            if extra_keys:
+                issues.append(f"event {eid or '?'} 含契约外字段:{extra_keys}")
             if not decl:
                 issues.append(f"event instance 类型未声明:{event.get('type')}")
                 continue
             if not eid or eid in event_by_id:
                 issues.append(f"event id 为空或重复:{eid}")
+                continue
+            declared_roles = set(decl.get("roles", {}))
+            actual_roles = set(participants)
+            if actual_roles != declared_roles:
+                issues.append(
+                    f"event {eid} participants roles 必须精确等于声明:"
+                    f"actual={sorted(actual_roles)} expected={sorted(declared_roles)}")
                 continue
             bad_role = False
             for role, tid in decl.get("roles", {}).items():
@@ -1004,6 +1023,9 @@ def assemble_world(table: dict, base: str = "2025-01-06", step_days: int = 7,
             clean_effects = []
             for eff in _dicts(event.get("effects", [])):
                 entity, fld = eff.get("entity"), eff.get("field")
+                effect_extra = sorted(set(eff) - {"entity", "field", "set", "value"})
+                if effect_extra:
+                    issues.append(f"event {eid} effect 含契约外字段:{effect_extra}")
                 matching_roles = [role for role, ename in participants.items() if ename == entity]
                 role = next((r for r in matching_roles if (r, fld) in allowed_effects), None)
                 value = eff.get("set", eff.get("value"))
@@ -1030,13 +1052,18 @@ def assemble_world(table: dict, base: str = "2025-01-06", step_days: int = 7,
                     issues.append(f"event {eid} effect 违反 monotonic={mono}:{entity}.{fld} {prev_mag}->{mag}")
                     continue
                 if _inject(entity, fld, sess, value, f"event {eid}"):
-                    clean_effects.append(dict(eff))
+                    clean_effects.append({"entity": entity, "field": fld, "set": value})
                 else:
                     issues.append(f"event {eid} effect 是空操作:{entity}.{fld}@{sess}={value}")
             if not clean_effects:
                 issues.append(f"event {eid} 没有合法 effect")
                 continue
-            clean_event = {**event, "session": sess, "effects": clean_effects}
+            clean_event = {
+                "id": eid, "type": event.get("type"), "session": sess,
+                "participants": dict(participants), "effects": clean_effects,
+            }
+            if event.get("caused_by"):
+                clean_event["caused_by"] = event["caused_by"]
             events.append(clean_event)
             event_by_id[eid] = clean_event
             event_instances.add(event_instance)
@@ -1046,8 +1073,29 @@ def assemble_world(table: dict, base: str = "2025-01-06", step_days: int = 7,
             if event_counts.get(event_id, 0) < decl.get("min_count", 1):
                 issues.append(f"event type {event_id} 实例不足:{event_counts.get(event_id, 0)}/{decl.get('min_count', 1)}")
 
+        # caused_by 只有匹配蓝图类型对与精确 delay 才能进入 canonical world。
+        # 非法边留 issue 并从干净事件移除，避免后续叙事把模型私造因果当真。
+        causal_rules = [rule for rule in blueprint.get("causal_rules", [])
+                        if isinstance(rule, dict)]
+        for child in events:
+            parent_ref = child.get("caused_by")
+            if not parent_ref:
+                continue
+            parent = event_by_id.get(parent_ref)
+            valid_edge = any(
+                parent and parent.get("id") != child.get("id")
+                and parent.get("type") == rule.get("trigger_event")
+                and child.get("type") == rule.get("effect_event")
+                and child.get("session") - parent.get("session")
+                == _as_int(rule.get("delay_sessions"), 0)
+                for rule in causal_rules
+            )
+            if not valid_edge:
+                issues.append(f"event {child.get('id')} caused_by 未被蓝图声明:{parent_ref}")
+                child.pop("caused_by", None)
+
         # 因果规则不是一段 prose：必须由 caused_by 的真实事件对见证，并记录到 cascades 留痕。
-        for rule in blueprint.get("causal_rules", []):
+        for rule in causal_rules:
             witnesses = []
             delay = _as_int(rule.get("delay_sessions"), 0)
             for child in events:
@@ -1326,6 +1374,26 @@ def _self_test() -> bool:
        gt_ie(typed_rel, "A1", "同类引用", 0), "A2")
     ck("typed relation owner 同步到缺字段排除与 witness 校验", typed_rel_issues, [])
 
+    extra_role_table = deepcopy(relation_table)
+    extra_role_table["events"][0]["participants"]["undeclared_actor"] = "A2"
+    extra_role_world, extra_role_issues = assemble_world(
+        extra_role_table, blueprint=relation_bp)
+    ck("typed event 拒绝蓝图未声明的额外 participant role",
+       not extra_role_world.events
+       and any("roles 必须精确等于声明" in issue for issue in extra_role_issues), True)
+
+    extra_payload_table = deepcopy(relation_table)
+    extra_payload_table["relations"][0]["future_hint"] = "A1 已倒戈"
+    extra_payload_table["events"][0]["result"] = "A1 将会复活"
+    extra_payload_table["events"][0]["effects"][0]["description"] = "隐藏结局"
+    extra_payload_world, extra_payload_issues = assemble_world(
+        extra_payload_table, blueprint=relation_bp)
+    ck("typed relation/event 契约外 payload 报错且不进入 canonical world",
+       "future_hint" not in extra_payload_world.relations[0]
+       and "result" not in extra_payload_world.events[0]
+       and "description" not in extra_payload_world.events[0]["effects"][0]
+       and sum("契约外字段" in issue for issue in extra_payload_issues) == 3, True)
+
     reversed_table = deepcopy(relation_table)
     reversed_table["relations"] = list(reversed(reversed_table["relations"]))
     reversed_table["events"] = list(reversed(reversed_table["events"]))
@@ -1356,6 +1424,7 @@ def _self_test() -> bool:
         self_causal_table, blueprint=self_causal_bp)
     ck("typed causal 单事件不得 caused_by 自己形成自环见证",
        not self_causal_world.cascades
+       and "caused_by" not in self_causal_world.events[0]
        and any("没有 caused_by 事件见证" in issue for issue in self_causal_issues), True)
 
     # V11 Tier 0:ORDER / DURATION / pre_expire / 形状

@@ -155,6 +155,147 @@ def relation_owner_side(blueprint: dict, relation: dict) -> str | None:
     return "from" if source_owns else "to"
 
 
+def repair_blueprint_candidate(value: dict) -> tuple[dict, list[str]]:
+    """纯函数修复模型候选中可确定的 FK 归属与最小实例数。
+
+    标量 FK 放在实体数更多的一端（并列稳定选 ``from``）；如果字段已经只在
+    一个端点声明，则尊重该端点。函数不删除关系或事件，只删除未被任何关系
+    使用的 ``reference`` 字段，并把非法的 ``min_count`` 收敛到 1。
+    """
+    repaired = deepcopy(value)
+    if not isinstance(repaired, dict):
+        return repaired, []
+    blueprint = repaired.get("world_blueprint", repaired)
+    if not isinstance(blueprint, dict):
+        return repaired, []
+
+    raw_types = blueprint.get("entity_types")
+    raw_relations = blueprint.get("relation_types")
+    raw_events = blueprint.get("event_types")
+    if not isinstance(raw_types, list):
+        raw_types = []
+    if not isinstance(raw_relations, list):
+        raw_relations = []
+    if not isinstance(raw_events, list):
+        raw_events = []
+    types = {
+        item.get("id"): item for item in raw_types
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
+    }
+    repairs: list[str] = []
+
+    def _fields(entity_type: dict) -> list:
+        fields = entity_type.get("fields")
+        return fields if isinstance(fields, list) else []
+
+    def _has_field(entity_type: dict, name: str) -> bool:
+        return any(isinstance(item, dict) and item.get("name") == name
+                   for item in _fields(entity_type))
+
+    def _entity_count(entity_type: dict) -> int:
+        count = entity_type.get("count")
+        return count if isinstance(count, int) and not isinstance(count, bool) and count >= 0 else 0
+
+    def _choose_side(relation: dict, source: dict, target: dict, field_name: str) -> str:
+        if relation.get("from_type") == relation.get("to_type"):
+            return "from"
+        source_has = _has_field(source, field_name)
+        target_has = _has_field(target, field_name)
+        if source_has != target_has:
+            return "from" if source_has else "to"
+        if _entity_count(target) > _entity_count(source):
+            return "to"
+        return "from"
+
+    for relation in raw_relations:
+        if not isinstance(relation, dict):
+            continue
+        relation_id = relation.get("id") or "?"
+        minimum = relation.get("min_count")
+        if isinstance(minimum, bool) or not isinstance(minimum, int) or minimum < 1:
+            relation["min_count"] = 1
+            repairs.append(f"relation {relation_id}.min_count→1")
+
+        source_id, target_id, field_name = (
+            relation.get("from_type"), relation.get("to_type"), relation.get("field"))
+        source, target = types.get(source_id), types.get(target_id)
+        if (source is None or target is None or not isinstance(field_name, str)
+                or not field_name or field_name != field_name.strip()):
+            continue
+        owner_side = _choose_side(relation, source, target, field_name)
+        owner = source if owner_side == "from" else target
+        owner_id = source_id if owner_side == "from" else target_id
+        other = target if owner_side == "from" else source
+        other_id = target_id if owner_side == "from" else source_id
+
+        owner_fields = _fields(owner)
+        if not isinstance(owner.get("fields"), list):
+            continue
+        matches = [item for item in owner_fields
+                   if isinstance(item, dict) and item.get("name") == field_name]
+        if matches:
+            kept = matches[0]
+            if kept.get("kind") != "reference":
+                kept["kind"] = "reference"
+                repairs.append(f"relation {relation_id} owner {owner_id}.{field_name}.kind→reference")
+            if len(matches) > 1:
+                deduplicated = []
+                kept_match = False
+                for item in owner_fields:
+                    is_match = isinstance(item, dict) and item.get("name") == field_name
+                    if is_match and kept_match:
+                        continue
+                    kept_match = kept_match or is_match
+                    deduplicated.append(item)
+                owner["fields"] = deduplicated
+                repairs.append(
+                    f"relation {relation_id} owner {owner_id}.{field_name} 删除重复声明")
+        else:
+            owner_fields.append({"name": field_name, "kind": "reference"})
+            repairs.append(f"relation {relation_id} 创建 owner {owner_id}.{field_name}")
+
+        if source_id != target_id and isinstance(other.get("fields"), list):
+            before = len(other["fields"])
+            other["fields"] = [
+                item for item in other["fields"]
+                if not (isinstance(item, dict) and item.get("name") == field_name)
+            ]
+            if len(other["fields"]) != before:
+                repairs.append(f"relation {relation_id} 删除非 owner {other_id}.{field_name}")
+    for event in raw_events:
+        if not isinstance(event, dict):
+            continue
+        minimum = event.get("min_count")
+        if isinstance(minimum, bool) or not isinstance(minimum, int) or minimum < 1:
+            event["min_count"] = 1
+            repairs.append(f"event {event.get('id') or '?'}.min_count→1")
+
+    bound_fields: set[tuple[str, str]] = set()
+    for relation in raw_relations:
+        if not isinstance(relation, dict):
+            continue
+        side = relation_owner_side(blueprint, relation)
+        if side is None:
+            continue
+        owner_id = relation.get("from_type") if side == "from" else relation.get("to_type")
+        bound_fields.add((owner_id, relation.get("field")))
+
+    for type_id, entity_type in types.items():
+        fields = entity_type.get("fields")
+        if not isinstance(fields, list):
+            continue
+        kept = [
+            item for item in fields
+            if not (isinstance(item, dict) and item.get("kind") == "reference"
+                    and (type_id, item.get("name")) not in bound_fields)
+        ]
+        removed = len(fields) - len(kept)
+        if removed:
+            entity_type["fields"] = kept
+            repairs.append(f"entity {type_id} 删除 {removed} 个悬空 reference 字段")
+    return repaired, repairs
+
+
 def relation_capacity(blueprint: dict, relation: dict) -> int:
     """返回当前标量 FK 编译模型下，单一 relation type 可形成的最大有效实例数。"""
     side = relation_owner_side(blueprint, relation)
@@ -254,6 +395,10 @@ def validate_world_blueprint(bp: dict) -> list[str]:
             issues.append(f"entity type {tid or '?'} 缺 noun")
         if isinstance(t.get("count"), bool) or not isinstance(t.get("count"), int) or t.get("count", 0) < 1:
             issues.append(f"entity type {tid or '?'} count 必须 >=1")
+        cardinality = t.get("cardinality_policy")
+        if cardinality not in (None, "exact"):
+            issues.append(
+                f"entity type {tid or '?'} cardinality_policy 只允许 exact；可增长类型直接省略")
         fields = t.get("fields") or []
         if not isinstance(fields, list) or (not fields and not bp.get("legacy_adapter")):
             issues.append(f"entity type {tid or '?'} fields 至少一个")
@@ -398,6 +543,11 @@ def validate_world_blueprint(bp: dict) -> list[str]:
                     "v1 不允许悬空引用")
 
     event_ids = {e.get("id") for e in events if isinstance(e.get("id"), str) and e.get("id")}
+    event_labels = [e.get("label") for e in events
+                    if isinstance(e.get("label"), str) and e.get("label").strip()]
+    for duplicate, count in Counter(event_labels).items():
+        if count > 1:
+            issues.append(f"event label 重复:{duplicate}")
     for event in events:
         eid, roles = event.get("id"), event.get("roles")
         label = event.get("label")

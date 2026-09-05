@@ -12,12 +12,24 @@ from pipeline.world_state import (assemble_world, validate, WorldState, _strip_d
                                    _to_num, _as_int)
 from pipeline.world_blueprint import relation_owner_side
 from pipeline.prompts import render
+from pipeline.story import (connected_story_entities, disconnected_story_events,
+                            narrative_world_issues)
 
 _BARE_NUM = re.compile(r"^-?\d+(?:\.\d+)?$")
 _FIELD_KIND_SUFFIX = re.compile(
     r"\s*[\(\uff08]\s*(?:text|status|category|numeric|number|person|reference|string)\s*[\)\uff09]\s*$",
     re.IGNORECASE,
 )
+
+_NARRATIVE_ADVISORY_DEFECTS = frozenset({"monotonic", "fake_evolving"})
+
+
+def _blocking_world_defects(defects: list[dict], narrative: bool) -> list[dict]:
+    """返回必须阻塞世界冻结的缺陷；游戏剧情不为题型形状强扭自然轨迹。"""
+    if not narrative:
+        return list(defects)
+    return [item for item in defects
+            if item.get("type") not in _NARRATIVE_ADVISORY_DEFECTS]
 
 
 def _canonicalize_generated_field_names(fields: dict, allowed: set[str]) -> dict:
@@ -92,7 +104,7 @@ def _filter_incremental_structure(structure: dict, existing: WorldState,
 
 
 def _wire_declared_causality(structure: dict, blueprint: dict) -> int:
-    """只在已有事件已满足类型与时差时补 caused_by，不创建事件或改写 session。"""
+    """已有事件满足类型与时差时校正 caused_by，不创建事件或改写 session。"""
     events = [event for event in structure.get("events", []) if isinstance(event, dict)]
     rules = [rule for rule in blueprint.get("causal_rules", []) if isinstance(rule, dict)]
     wired = 0
@@ -111,7 +123,7 @@ def _wire_declared_causality(structure: dict, blueprint: dict) -> int:
                and _as_int(child.get("session"), -1) - _as_int(parent.get("session"), -1) == delay
                for child in children for parent in parents):
             continue
-        pair = next(((parent, child) for child in children if not child.get("caused_by")
+        pair = next(((parent, child) for child in children
                      for parent in parents
                      if child.get("id") != parent.get("id")
                      and _as_int(child.get("session"), -1)
@@ -121,6 +133,40 @@ def _wire_declared_causality(structure: dict, blueprint: dict) -> int:
             child["caused_by"] = parent["id"]
             wired += 1
     return wired
+
+
+def _connect_narrative_events(structure: dict, trial: WorldState, blueprint: dict) -> int:
+    """把断开事件的一个同类型 participant 换成主角分量内实体；无可用候选则不动。"""
+    disconnected = set(disconnected_story_events(trial))
+    connected = connected_story_entities(trial)
+    if not disconnected or not connected:
+        return 0
+    declarations = {
+        item.get("id"): item for item in blueprint.get("event_types", [])
+        if isinstance(item, dict) and item.get("id")
+    }
+    candidates_by_type: dict[str, list[str]] = {}
+    for entity in sorted(connected):
+        candidates_by_type.setdefault(trial.entity_types.get(entity), []).append(entity)
+
+    for event in structure.get("events", []):
+        if not isinstance(event, dict) or event.get("id") not in disconnected:
+            continue
+        declaration = declarations.get(event.get("type")) or {}
+        roles = declaration.get("roles") or {}
+        participants = event.get("participants") or {}
+        for role, old_entity in list(participants.items()):
+            choices = [name for name in candidates_by_type.get(roles.get(role), [])
+                       if name != old_entity]
+            if not choices:
+                continue
+            replacement = choices[0]
+            participants[role] = replacement
+            for effect in event.get("effects") or []:
+                if isinstance(effect, dict) and effect.get("entity") == old_entity:
+                    effect["entity"] = replacement
+            return 1
+    return 0
 
 
 def _affix_units(ws: WorldState, profile: dict | None, log=print) -> int:
@@ -271,25 +317,49 @@ def _field_desc(f: dict) -> str:
     return f"{f.get('name')}({'·'.join(str(a) for a in ann)})"
 
 
-def _world_system(profile: dict, type_id: str, time_unit: str, open_schema: bool = False) -> str:
+def _world_system(profile: dict, type_id: str, time_unit: str, open_schema: bool = False,
+                  narrative: bool = False) -> str:
     noun = profile.get("entity_noun", "实体")
     fields = profile.get("field_schema", [])
     fdesc = "、".join(_field_desc(f) for f in fields) or ("若干随时间演化字段" if open_schema else "无内在字段")
     stopped = profile.get("stopped_phrase", "停止/失效")
+    if narrative:
+        numeric_policy = (
+            "- numeric 字段:按领域规律与事件节奏自然变化；不得为题型刻意制造峰谷。"
+            "若清单声明累计只增/只减/值域，必须遵守；数值写纯阿拉伯数字、不加千分位逗号，单位按字段清单。")
+        coverage_policy = (
+            "- 非结构驱动字段可按剧情需要演化或保持稳定，不强制停用/null；"
+            "domain event 驱动字段仍只给可选初态。")
+    else:
+        numeric_policy = (
+            "- numeric 字段:给 trajectory。默认非单调(峰/谷/反弹,最大或最小值落在非首非尾期,防 MR 退化);"
+            "若字段标了累计只增则逐期不减、标了只减则逐期不增、标了值域则全程不出界。"
+            "所有数值写纯阿拉伯数字、不加千分位逗号，单位按字段清单。")
+        coverage_policy = (
+            f"- 若存在非结构驱动字段，至少 1 个字段末尾 null(={stopped})；"
+            "若全部字段由 domain event 驱动，可直接输出空 fields。")
     return render("world.system", noun=noun, type_id=type_id, time_unit=time_unit,
-                  fdesc=fdesc, stopped=stopped)
+                  fdesc=fdesc, stopped=stopped, numeric_policy=numeric_policy,
+                  coverage_policy=coverage_policy)
 
 
-def build_world(wp, tracer, log=print, existing=None) -> WorldState:
+def build_world(wp, tracer, log=print, existing=None, narrative: bool = False) -> WorldState:
     """按白皮书蓝图生成 typed world，并将关系/事件编译进既有 Timeline 地基。
 
     历史白皮书会先适配成单类型蓝图；显式蓝图不合法、类型数量不足或声明结构没有
     合法实例时 fail-loud，不允许静默退化回扁平世界。``existing`` 只增长缺口实体。
+    ``narrative=True`` 时等 canonical world 冻结后，再独立调用至多 4 次
+    ``world.story`` 生成轻量 Story Ledger；不新增 Agent 或 Stage。
     """
     from pipeline.world_blueprint import normalize_world_blueprint, WorldBlueprintError
 
     blueprint = normalize_world_blueprint(wp)
     typed_contract = not blueprint.get("legacy_adapter", False)
+    if narrative and not typed_contract:
+        raise WorldBlueprintError("game Story Ledger 只支持显式 typed world_blueprint")
+    if narrative and existing is not None:
+        raise WorldBlueprintError(
+            "game Story Ledger 不允许增量缝合旧/新 canon；请全量重建 world 并重渲下游产物")
     temporal = blueprint["temporal_model"]
     n_sessions = int(temporal["n_sessions"])
     time_unit = temporal["unit"]
@@ -321,8 +391,10 @@ def build_world(wp, tracer, log=print, existing=None) -> WorldState:
     # 近重名陷阱已在源头【议会菜单 council.traps】删除(不靠代码子串猜,审计★1);
     # 万一漏网,seen_base 在收集期按主干去重(出口拦截)= 真兜底,故此处不再用关键词黑名单过滤。
     traps = [t.get("trap") for t in (wp.get("traps") or []) if t.get("trap")][:3]
-    base_extra = (f"★变更密度:evolving 字段尽量按「{cd}」铺满全程。" if cd else "")
-    base_extra += (f"★陷阱布局:本场景需自然埋入这些坑——{traps}(如可矛盾的多源字段、易混字段)。" if traps else "")
+    base_extra = ""
+    if not narrative:
+        base_extra = (f"★变更密度:evolving 字段尽量按「{cd}」铺满全程。" if cd else "")
+        base_extra += (f"★陷阱布局:本场景需自然埋入这些坑——{traps}(如可矛盾的多源字段、易混字段)。" if traps else "")
     merged = {"entities": [], "relations": [], "events": [], "cascades": [], "absent_fields": []}
     base_ents = existing.entities if existing is not None else {}    # ★增量:在既有世界上只长新实体
     seen = set(base_ents)                             # 新实体名避开既有
@@ -406,7 +478,11 @@ def build_world(wp, tracer, log=print, existing=None) -> WorldState:
                 type_extra += ("★本类型全部字段都由 event 驱动：请直接输出 fields={}；"
                                "不要为了满足末尾 null 要求擅自生成任何字段轨迹。")
         open_schema = bool(blueprint.get("legacy_adapter") and not intrinsic)
-        sysp = _world_system(type_profile, tid, time_unit, open_schema=open_schema)
+        sysp = _world_system(type_profile, tid, time_unit, open_schema=open_schema,
+                             narrative=narrative)
+        trajectory_request = (
+            "非结构驱动字段只按剧情世界的自然节奏变化，不为题型造峰谷或强塞 null"
+            if narrative else "非结构驱动字段允许时做非单调演化并让至少一个字段 null 结尾")
 
         for rnd in range(4):
             need = want_total - base_count - len(produced)
@@ -419,7 +495,9 @@ def build_world(wp, tracer, log=print, existing=None) -> WorldState:
                 return tracer.chat_json("world.batch",
                     [{"role": "system", "content": sysp},
                      {"role": "user", "content": render("world.user", want=want, noun=type_noun,
-                                                          type_id=tid, smax=n_sessions - 1, extra=type_extra)
+                                                          type_id=tid, smax=n_sessions - 1,
+                                                          trajectory_request=trajectory_request,
+                                                          extra=type_extra)
                       + f"\n【全世界已占用专名，禁止复用或换类型冒用】{used_names}"
                         "\n必须返回足量、与本类型 noun 相称的新专名。"}],
                     temperature=0.7, max_tokens=8192)
@@ -464,8 +542,9 @@ def build_world(wp, tracer, log=print, existing=None) -> WorldState:
                 f"entity type {tid} 实例不足:{base_count + len(produced)}/{want_total}；4 轮后仍未满足蓝图")
         merged["entities"].extend(produced[:max(0, want_total - base_count)])
 
-    # 关系/事件在所有 typed entities 生成后统一实例化；提示中带完整契约与可引用实体目录。
+    # 关系/事件在所有 typed entities 生成后统一实例化；此处只负责 canonical world。
     structural_markers = ("entity ", "relation", "event", "causal rule")
+    structure: dict = {}
     if typed_contract and (blueprint.get("relation_types") or blueprint.get("event_types")):
         def _initial_state(name, tid, raw_fields=None):
             out = {}
@@ -500,7 +579,12 @@ def build_world(wp, tracer, log=print, existing=None) -> WorldState:
                  {"role": "user", "content": render(
                      "world.structure_user", time_unit=time_unit, cadence=temporal["cadence"],
                      smax=n_sessions - 1, blueprint=json.dumps(blueprint, ensure_ascii=False),
-                     entities=json.dumps(catalog, ensure_ascii=False)) + hint}],
+                     entities=json.dumps(catalog, ensure_ascii=False))
+                 + (("\n【game 剧情节奏】事件至少铺到 3 个 session，任何一个 session 不得堆入过半事件；"
+                     "按前置行动→结果组织，禁止把击败、完成、解锁等收束事件全塞进开场。"
+                     "所有事件必须经共享参与者、显式关系或 caused_by 连到唯一主角。")
+                    if narrative else "")
+                 + hint}],
                 temperature=0.4, max_tokens=8192)
             if isinstance(structure, dict):
                 _wire_declared_causality(structure, blueprint)
@@ -510,7 +594,21 @@ def build_world(wp, tracer, log=print, existing=None) -> WorldState:
                     relations, events = _filter_incremental_structure(structure, existing, blueprint)
                 merged["relations"], merged["events"] = relations, events
             trial, trial_issues = assemble_world(merged, blueprint=blueprint, existing=existing)
+            if narrative and isinstance(structure, dict):
+                connected = 0
+                for _ in range(len(trial.events)):
+                    if not _connect_narrative_events(structure, trial, blueprint):
+                        break
+                    connected += 1
+                    merged["events"] = [x for x in structure.get("events", []) if isinstance(x, dict)]
+                    trial, trial_issues = assemble_world(
+                        merged, blueprint=blueprint, existing=existing)
+                if connected:
+                    log(f"  ✓ 代码连接 {connected} 个断开剧情事件到主角分量")
             structural_issues = [x for x in trial_issues if x.startswith(structural_markers)]
+            if narrative:
+                structural_issues.extend(
+                    f"story world 不可叙事:{issue}" for issue in narrative_world_issues(trial))
             if not structural_issues:
                 break
             log(f"  ⟳ 世界骨架实例修复轮{attempt+1}:{len(structural_issues)} 个契约违例")
@@ -521,12 +619,16 @@ def build_world(wp, tracer, log=print, existing=None) -> WorldState:
 
     ws, compile_issues = assemble_world(merged, blueprint=blueprint, existing=existing)
     structural_issues = [x for x in compile_issues if x.startswith(structural_markers)]
+    if narrative:
+        structural_issues.extend(
+            f"story world 不可叙事:{issue}" for issue in narrative_world_issues(ws))
     if structural_issues:
         raise WorldBlueprintError("世界实例未满足 blueprint:\n- " + "\n- ".join(structural_issues))
     # ★W.3 CRITIC 修复轮:assemble 算出的缺陷不再"只 log 就扔"——定向重生成坏字段(复用并行骨架:发散批次→收敛修复)
     ent_idx = {e.get("name"): e for e in merged["entities"]}
     for rep in range(3):
-        defects = validate(ws, merged, profile)       # ★profile 进闸:illegal_transition(状态倒流)也进 CRITIC 修复轮
+        all_defects = validate(ws, merged, profile)
+        defects = _blocking_world_defects(all_defects, narrative)
         if not defects:
             break
         by_ent: dict = {}
@@ -555,7 +657,12 @@ def build_world(wp, tracer, log=print, existing=None) -> WorldState:
         ws, compile_issues = assemble_world(merged, blueprint=blueprint, existing=existing)
         structural_issues = [x for x in compile_issues if x.startswith(structural_markers)]
         if structural_issues:
-            raise WorldBlueprintError("修复后世界结构破坏 blueprint:\n- " + "\n- ".join(structural_issues))
+            # 字段修复模型仍可能写出状态表外的值；这仍是下一轮的字段缺陷，
+            # 不应在第一次失败时绕过既有三轮修复预算。
+            log(f"  ↻ 字段修复仍有 {len(structural_issues)} 个 schema 值违例，交给下一轮")
+    if structural_issues:
+        raise WorldBlueprintError(
+            "字段修复后世界结构仍不满足 blueprint:\n- " + "\n- ".join(structural_issues))
     ws.n_sessions = max(ws.n_sessions or 0, n_sessions, (existing.n_sessions if existing is not None else 0))
     if existing is not None:                          # ★增量 augment:只把【新实体】并入既有世界,旧实体/旧 docs 全不动
         # 保持调用方持有的对象身份不变，但用“旧世界 + delta 编译”的完整结果原子替换其状态。
@@ -566,9 +673,64 @@ def build_world(wp, tracer, log=print, existing=None) -> WorldState:
         existing._trended_fields = list(getattr(ws, "_trended_fields", []) or [])
         ws = existing
     rem = validate(ws, merged, profile)               # ★validate 在【注趋势前】跑(对 merged 一致,不误报);imprint 产出本就良构,无需复验
-    if typed_contract and rem:
-        details = [f"{d.get('entity')}.{d.get('field')}[{d.get('type')}]:{d.get('detail')}" for d in rem]
+    blocking_rem = _blocking_world_defects(rem, narrative)
+    if narrative and len(rem) > len(blocking_rem):
+        log(f"  · 保留 {len(rem) - len(blocking_rem)} 个自然轨迹提示，不为题型强扭剧情世界")
+    if typed_contract and blocking_rem:
+        details = [f"{d.get('entity')}.{d.get('field')}[{d.get('type')}]:{d.get('detail')}"
+                   for d in blocking_rem]
         raise WorldBlueprintError("typed world 修复轮耗尽后仍有真值缺陷:\n- " + "\n- ".join(details))
+    if narrative:
+        # 世界已通过结构编译、字段修复和最终 validate；坏剧情只重试剧情，不回滚世界。
+        from pipeline.story import (StoryLedgerError, compile_story_ledger,
+                                    review_narrative_supportedness)
+
+        story_entities = [
+            {"name": name, "type": ws.entity_types.get(name)} for name in sorted(ws.entities)
+        ]
+        event_labels = {item.get("id"): item.get("label")
+                        for item in blueprint.get("event_types", [])}
+        story_canon = {
+            "entities": story_entities,
+            "relations": ws.relations,
+            "events": [{**event, "label": event_labels.get(event.get("type"), event.get("type"))}
+                       for event in ws.events],
+        }
+        story_hint = ""
+        story_issues: list[str] = []
+        for attempt in range(4):
+            proposal = tracer.chat_json(
+                "world.story",
+                [{"role": "system", "content": render("world.story")},
+                 {"role": "user", "content": render(
+                     "world.story_user",
+                     blueprint=json.dumps(blueprint, ensure_ascii=False),
+                     entities=json.dumps(story_entities, ensure_ascii=False),
+                     events=json.dumps(ws.events, ensure_ascii=False),
+                     hint=story_hint)}],
+                temperature=0.6 if attempt == 0 else 0.2, max_tokens=8192)
+            try:
+                ledger = compile_story_ledger(ws, proposal)
+            except StoryLedgerError as exc:
+                story_issues = [f"[{x.code}] {x.path}: {x.message}" for x in exc.issues]
+                log(f"  ⟳ Story Ledger 修复轮{attempt + 1}:{len(story_issues)} 个契约违例")
+                reason = "机械校验失败"
+            else:
+                story_issues = review_narrative_supportedness(
+                    tracer, canon=story_canon, candidate=ledger, scope="Story Ledger")
+                if not story_issues:
+                    ws.narrative = ledger
+                    break
+                log(f"  ⟳ Story Ledger 语义修复轮{attempt + 1}:{len(story_issues)} 个无依据断言")
+                reason = "语义审查失败"
+            story_hint = (f"\n【上轮 Story Ledger {reason}，只修剧情编排，不改世界；"
+                          "只改被点名句子，保留其余已通过内容】\n- "
+                          + "\n- ".join(story_issues)
+                          + "\n【上轮候选 JSON】\n"
+                          + json.dumps(proposal, ensure_ascii=False))
+        else:
+            raise WorldBlueprintError("game Story Ledger 四轮修复后仍不合法:\n- "
+                                      + "\n- ".join(story_issues))
     coll = name_collisions(ws)                        # ★Fix3:表面塌缩兜底检测(收集期已按主干去重,这里抓漏网)
     log(f"  ✓ 基础世界:{len(ws.entities)} 实体 / {ws.n_sessions} {time_unit} / 修复后残留缺陷 {len(rem)}"
         + (f" / ⚠表面塌缩近重名 {coll}" if coll else ""))  # 产线基质由 stage_world 的 line.prepare() 叠加

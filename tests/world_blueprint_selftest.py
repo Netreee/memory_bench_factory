@@ -18,13 +18,16 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from pipeline.world_blueprint import (
+    WorldBlueprintError,
     normalize_world_blueprint,
     relation_capacity,
     relation_owner_side,
+    repair_blueprint_candidate,
     structure_signature,
     validate_world_blueprint,
 )
 from pipeline.central_office import (_assemble_whitepaper, _observed_blueprint_issues,
+                                     _repair_candidate_blueprint,
                                      _separate_observed_relation_fields, central_office)
 from pipeline.lines import prepare_lines
 from pipeline.lines.L2_relational import RelationalLine
@@ -384,6 +387,104 @@ dangling_reference_bp["entity_types"][1]["fields"].append(
     {"name": "悬空引用", "kind": "reference"})
 _must_reject("② reference 字段必须绑定且只绑定一个 relation", dangling_reference_bp)
 
+# 模型修理 relation.field 时容易在“零端/两端/悬空”之间振荡；这些纯机械问题
+# 在进入 validator 前一次性、确定性收敛，不消费新的 LLM 重试。
+none_owner_bp = deepcopy(same_field_bp)
+none_owner_bp["entity_types"][0]["count"] = 1
+none_owner_bp["entity_types"][1]["count"] = 4
+none_owner_bp["entity_types"][0]["fields"] = [
+    field for field in none_owner_bp["entity_types"][0]["fields"]
+    if field["name"] != "关联乙"
+]
+none_owner_bp["entity_types"][0]["fields"].append(
+    {"name": "无关引用", "kind": "reference"})
+none_owner_bp["relation_types"][0]["min_count"] = 0
+none_owner_bp["event_types"][0]["min_count"] = "invalid"
+none_owner_before = deepcopy(none_owner_bp)
+none_owner_fixed, none_owner_repairs = repair_blueprint_candidate(none_owner_bp)
+ck("② FK 归一是纯函数且零端时创建在实体数更多的一端",
+   none_owner_bp == none_owner_before
+   and relation_owner_side(none_owner_fixed, none_owner_fixed["relation_types"][0]) == "to"
+   and any(field.get("name") == "关联乙" and field.get("kind") == "reference"
+           for field in none_owner_fixed["entity_types"][1]["fields"])
+   and bool(none_owner_repairs))
+ck("② FK 归一删除所有未绑定 reference 并把非法 min_count 修为一",
+   not any(field.get("name") == "无关引用"
+           for field in none_owner_fixed["entity_types"][0]["fields"])
+   and none_owner_fixed["relation_types"][0]["min_count"] == 1
+   and none_owner_fixed["event_types"][0]["min_count"] == 1
+   and len(none_owner_fixed["relation_types"]) == len(none_owner_bp["relation_types"])
+   and len(none_owner_fixed["event_types"]) == len(none_owner_bp["event_types"])
+   and validate_world_blueprint(normalize_world_blueprint(none_owner_fixed)) == [])
+
+# game__20260906-060616 第六轮的真实失败形态：四条 FK 同时出现在两端，
+# player 还残留两个与自身无关的 reference。数量与关系方向保持该 Run 原样。
+smoke_fk_bp = {
+    "version": 1,
+    "entity_types": [
+        {"id": "player_character", "noun": "玩家角色", "count": 1, "primary": True,
+         "fields": [{"name": "等级", "kind": "numeric"},
+                    {"name": "控制阵营", "kind": "reference"},
+                    {"name": "拥有者", "kind": "reference"}]},
+        {"id": "region", "noun": "地区", "count": 10,
+         "fields": [{"name": "解锁状态", "kind": "status"},
+                    {"name": "目标地区", "kind": "reference"}]},
+        {"id": "quest", "noun": "任务", "count": 20,
+         "fields": [{"name": "任务状态", "kind": "status"},
+                    {"name": "目标地区", "kind": "reference"},
+                    {"name": "目标首领", "kind": "reference"}]},
+        {"id": "faction", "noun": "阵营", "count": 5,
+         "fields": [{"name": "阵营名称", "kind": "text"},
+                    {"name": "控制阵营", "kind": "reference"}]},
+        {"id": "boss", "noun": "首领", "count": 8,
+         "fields": [{"name": "存活状态", "kind": "status"},
+                    {"name": "目标首领", "kind": "reference"},
+                    {"name": "掉落来源", "kind": "reference"}]},
+        {"id": "equipment", "noun": "装备", "count": 30,
+         "fields": [{"name": "流转状态", "kind": "status"},
+                    {"name": "掉落来源", "kind": "reference"},
+                    {"name": "拥有者", "kind": "reference"}]},
+    ],
+    "relation_types": [
+        {"id": "faction_controls_region", "from_type": "faction", "to_type": "region",
+         "field": "控制阵营", "temporal": True, "min_count": 0},
+        {"id": "quest_targets_region", "from_type": "quest", "to_type": "region",
+         "field": "目标地区", "temporal": False, "min_count": 1},
+        {"id": "quest_targets_boss", "from_type": "quest", "to_type": "boss",
+         "field": "目标首领", "temporal": False, "min_count": 1},
+        {"id": "boss_drops_equipment", "from_type": "boss", "to_type": "equipment",
+         "field": "掉落来源", "temporal": True, "min_count": 1},
+        {"id": "player_owns_equipment", "from_type": "player_character", "to_type": "equipment",
+         "field": "拥有者", "temporal": True, "min_count": 1},
+    ],
+    "event_types": [{
+        "id": "explore_region", "label": "探索地区",
+        "roles": {"actor": "player_character", "target": "region"},
+        "effect_fields": [{"role": "target", "field": "解锁状态"}], "min_count": 0,
+    }],
+    "causal_rules": [], "evidence_channels": ["剧情日志"],
+    "temporal_model": {"unit": "chapter", "cadence": "per_encounter",
+                       "n_sessions": 10, "step_days": 1},
+}
+smoke_fk_fixed, _ = repair_blueprint_candidate(smoke_fk_bp)
+smoke_owner_sides = [
+    relation_owner_side(smoke_fk_fixed, relation)
+    for relation in smoke_fk_fixed["relation_types"]
+]
+ck("② 真实 smoke 的双端 FK 按多端收敛、单端 FK 保持原位",
+   smoke_owner_sides == ["from", "from", "from", "to", "to"]
+   and validate_world_blueprint(smoke_fk_fixed) == [])
+ck("② 真实 smoke 的跨类型悬空 reference 被清除且声明不丢失",
+   [field["name"] for field in smoke_fk_fixed["entity_types"][0]["fields"]] == ["等级"]
+   and len(smoke_fk_fixed["relation_types"]) == 5
+   and len(smoke_fk_fixed["event_types"]) == 1
+   and all(item["min_count"] >= 1 for item in
+           smoke_fk_fixed["relation_types"] + smoke_fk_fixed["event_types"]))
+
+idempotent_fixed, idempotent_repairs = repair_blueprint_candidate(none_owner_fixed)
+ck("② FK/min_count 归一幂等",
+   idempotent_fixed == none_owner_fixed and idempotent_repairs == [])
+
 reused_reference_bp = deepcopy(same_field_bp)
 reused_reference_bp["relation_types"].append({
     "id": "links_again", "from_type": "a", "to_type": "b",
@@ -428,6 +529,28 @@ ck("② observed 显示字段与同名 relation FK 确定性拆分",
    and observed_relation_fixed["relation_types"][0]["field"] == "所属阵营引用"
    and validate_world_blueprint(normalize_world_blueprint(observed_relation_fixed)) == [])
 
+observed_both_bp = deepcopy(same_field_bp)
+observed_both_bp["entity_types"][0]["fields"] = [
+    field for field in observed_both_bp["entity_types"][0]["fields"]
+    if field["name"] != "关联乙"
+] + [{"name": "所属阵营", "kind": "reference"}]
+observed_both_bp["entity_types"][1]["fields"].append(
+    {"name": "所属阵营", "kind": "reference"})
+observed_both_bp["relation_types"][0]["field"] = "所属阵营"
+observed_both_wrapper = {"world_blueprint": observed_both_bp}
+observed_both_before = deepcopy(observed_both_wrapper)
+observed_both_fixed, _ = _repair_candidate_blueprint(
+    observed_both_wrapper,
+    {"observed_fields": [{"name": "所属阵营", "kind": "category"}]},
+)
+ck("② observed 拆分后再归一，双端冲突不会删除展示硬事实",
+   observed_both_wrapper == observed_both_before
+   and observed_both_fixed["world_blueprint"]["relation_types"][0]["field"] == "所属阵营引用"
+   and any(field.get("name") == "所属阵营" and field.get("kind") == "category"
+           for entity_type in observed_both_fixed["world_blueprint"]["entity_types"]
+           for field in entity_type["fields"])
+   and validate_world_blueprint(normalize_world_blueprint(observed_both_fixed)) == [])
+
 static_over_capacity_bp = deepcopy(reverse_owner_bp)
 static_over_capacity_bp["relation_types"][0]["min_count"] = 2
 _must_reject("② static 标量 FK min_count 不得超过 owner 数量", static_over_capacity_bp)
@@ -469,6 +592,9 @@ string_boolean_bp = deepcopy(same_field_bp)
 string_boolean_bp["entity_types"][0]["primary"] = "false"
 string_boolean_bp["relation_types"][0]["temporal"] = "false"
 _must_reject("② 显式 blueprint 不把字符串 false 强转为 true", string_boolean_bp)
+bad_cardinality_bp = deepcopy(same_field_bp)
+bad_cardinality_bp["entity_types"][0]["cardinality_policy"] = "fixed"
+_must_reject("② cardinality_policy 只接受 exact（可增长时省略）", bad_cardinality_bp)
 negative_count_bp = deepcopy(same_field_bp)
 negative_count_bp["relation_types"][0]["min_count"] = -3
 _must_reject("② 显式 blueprint 不把负 min_count 钳成合法值", negative_count_bp)
@@ -559,6 +685,13 @@ causal_structure = {"events": [
 ck("③ 声明因果在已有事件满足时差时由代码补 caused_by",
    _wire_declared_causality(causal_structure, build_bp) == 1
    and causal_structure["events"][1].get("caused_by") == "cause")
+wrong_parent_structure = {"events": [
+    {"id": "cause", "type": "defeat_boss", "session": 1},
+    {"id": "effect", "type": "acquire_loot", "session": 2, "caused_by": "ghost"},
+]}
+ck("③ 声明因果由代码校正错误 caused_by，不再交给模型重写",
+   _wire_declared_causality(wrong_parent_structure, build_bp) == 1
+   and wrong_parent_structure["events"][1].get("caused_by") == "cause")
 wrong_delay_structure = {"events": [
     {"id": "cause", "type": "defeat_boss", "session": 0},
     {"id": "effect", "type": "acquire_loot", "session": 3},
@@ -648,6 +781,35 @@ ck("③ relation 编译进 source timeline", ws.timeline("旅者", "equipped_ite
 ck("③ event effect 编译进 target timeline", ws.timeline("熔岩巨兽", "defeat_status") is not None
    and ws.timeline("熔岩巨兽", "defeat_status").value_at_session(2) == "defeated")
 ck("③ event 实例留存在世界真源", any(e.get("id") == "evt-1" for e in getattr(ws, "events", [])))
+
+
+class _InvalidRepairTracer(_BlueprintTracer):
+    """先制造可修缺陷，再让 repair 返回不可编译值。"""
+
+    def chat_json(self, tag, messages, **_kw):
+        text = "\n".join(str(m.get("content", "")) for m in messages)
+        self.calls.append((tag, text))
+        if tag == "world.repair":
+            return {"fields": {"level": {"type": "stable", "value": "banana"}}}
+        table = _typed_table()
+        table["entities"][0]["fields"]["level"] = {
+            "type": "evolving",
+            "trajectory": [{"session": 0, "value": "9"}, {"session": 1, "value": "8"}],
+        }
+        return table
+
+
+invalid_repair_wp = deepcopy(build_wp)
+next(field for field in invalid_repair_wp["world_blueprint"]["entity_types"][0]["fields"]
+     if field["name"] == "level")["monotonic"] = "up"
+try:
+    build_world(invalid_repair_wp, _InvalidRepairTracer(), log=lambda *_args: None)
+except WorldBlueprintError:
+    invalid_repair_failed_closed = True
+else:
+    invalid_repair_failed_closed = False
+ck("③ repair 写出不可编译字段后 typed world 必须 fail-closed",
+   invalid_repair_failed_closed)
 
 frozen_wp = deepcopy(build_wp)
 frozen_wp["active_lines"] = [
@@ -800,8 +962,15 @@ ck("⑥ signal user 只携带当期 domain event",
 event_for_gate = [{**render_events[0], "label": "击败首领"}]
 ck("⑥ 只写 effect 字段值、漏掉参与者关系时事件忠实闸拒绝",
    bool(_missing_event_narratives(event_for_gate, ["熔岩巨兽的 defeat_status 变成 defeated。"])))
-ck("⑥ event label 与全部 participants 同篇出现才通过事件忠实闸",
-   _missing_event_narratives(event_for_gate, ["旅者在交锋中完成击败首领，熔岩巨兽随即倒下。"] ) == [])
+ck("⑥ event 动作可自然改写，但 participants 与 effect 三元组必须同篇",
+   _missing_event_narratives(
+       event_for_gate,
+       ["旅者在交锋中战胜了对手，熔岩巨兽的 defeat_status 变成 defeated。"]
+   ) == [])
+duplicate_label = deepcopy(build_wp["world_blueprint"])
+duplicate_label["event_types"][1]["label"] = duplicate_label["event_types"][0]["label"]
+ck("⑥ event type 的人类可读 label 必须唯一，避免 provenance 歧义",
+   any("event label 重复" in issue for issue in validate_world_blueprint(duplicate_label)))
 game_filler_system = _filler_system(
     {"entity_noun": "游戏对象", "doc_genres": ["任务日志", "战利品记录"]},
     compiled.world_blueprint,
@@ -816,14 +985,12 @@ ck("⑥ filler 被约束为同世界旁支且禁止非办公场景套 OA 模板"
 # ═══════ ⑦ central_office 先冻结世界，再映射能力 ═══════
 architect_blueprint = deepcopy(_game_whitepaper()["world_blueprint"])
 architect_blueprint["evidence_channels"] = ["architect-draft-channel"]
-reviewed_blueprint = deepcopy(architect_blueprint)
-reviewed_blueprint["evidence_channels"] = ["reviewed-frozen-channel"]
 critic_rewrite = deepcopy(_office_whitepaper()["world_blueprint"])
 critic_rewrite["evidence_channels"] = ["critic-illegal-rewrite"]
 
 
 class _WorldFirstTracer:
-    """离线议会桩：评审改一次骨架，critic 再恶意改写，便于验证两道闸。"""
+    """离线议会桩：架构师先冻结骨架，critic 再恶意改写，验证硬门。"""
 
     def __init__(self) -> None:
         self.calls: list[tuple[str, str]] = []
@@ -843,15 +1010,6 @@ class _WorldFirstTracer:
             return {"traps": []}
         if tag == "council.world":
             return {"world_blueprint": deepcopy(architect_blueprint)}
-        if tag == "council.world_review":
-            return {
-                "review": {
-                    "reskin_risk": "low",
-                    "findings": ["候选事件链已有游戏专属动力学"],
-                    "decisions": ["保留击败首领到获得装备的因果链"],
-                },
-                "world_blueprint": deepcopy(reviewed_blueprint),
-            }
         if tag == "council.map":
             return {"per_line": [{
                 "line": "L1_timeline", "applicable": True,
@@ -874,103 +1032,25 @@ world_first_tracer = _WorldFirstTracer()
 world_first_wp = central_office(
     "测试 world-first 议会", [], world_first_tracer, log=lambda *_args: None)
 world_first_tags = [tag for tag, _text in world_first_tracer.calls]
-world_review_prompt = next(text for tag, text in world_first_tracer.calls
-                           if tag == "council.world_review")
 world_map_prompt = next(text for tag, text in world_first_tracer.calls if tag == "council.map")
 expected_frozen_blueprint = normalize_world_blueprint(
-    {"world_blueprint": reviewed_blueprint})
-ck("⑦ world/world_review 严格先于 map",
-   world_first_tags.index("council.world")
-   < world_first_tags.index("council.world_review")
-   < world_first_tags.index("council.map"))
-ck("⑦ world_review 审的是架构师候选骨架",
-   "architect-draft-channel" in world_review_prompt
-   and "reviewed-frozen-channel" not in world_review_prompt)
-ck("⑦ map prompt 收到评审后的冻结 blueprint",
-   "reviewed-frozen-channel" in world_map_prompt
-   and "architect-draft-channel" not in world_map_prompt
+    {"world_blueprint": architect_blueprint})
+ck("⑦ world 严格先于 map",
+   world_first_tags.index("council.world") < world_first_tags.index("council.map"))
+ck("⑦ 已删无执行效果的 world_review 调用",
+   "council.world_review" not in world_first_tags)
+ck("⑦ map prompt 收到架构师已冻结 blueprint，反方无权改写",
+   "architect-draft-channel" in world_map_prompt
    and '"type": "defeat_boss"' not in world_map_prompt
    and '"id": "defeat_boss"' in world_map_prompt)
 ck("⑦ critic 无法改写已冻结 blueprint",
    structure_signature(world_first_wp["world_blueprint"])
    == structure_signature(expected_frozen_blueprint)
-   and "reviewed-frozen-channel" in world_first_wp["world_blueprint"]["evidence_channels"]
+   and "architect-draft-channel" in world_first_wp["world_blueprint"]["evidence_channels"]
    and "critic-illegal-rewrite" not in world_first_wp["world_blueprint"]["evidence_channels"]
    and world_first_wp["domain_profile"]["entity_noun"] == "玩家")
 ck("⑦ critic 不能把 line_mapping 的不适用零权重线塞回 active_lines",
    [item["line"] for item in world_first_wp["active_lines"]] == ["L1_timeline"])
-ck("⑦ 换皮反方的审议记录进入白皮书且获低风险批准",
-   world_first_wp["world_review"].get("reskin_risk") == "low"
-   and world_first_wp["world_review"].get("mechanical_outcome") == "accepted"
-   and world_first_wp["world_review"].get("attempts") == 1)
-
-
-class _SchemaRepairTracer(_WorldFirstTracer):
-    """首轮反方产出坏 schema；修理后必须再做一次语义反方评审。"""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.review_round = 0
-
-    def chat_json(self, tag, messages, **kwargs):
-        if tag == "council.world_review":
-            text = "\n".join(str(message.get("content", "")) for message in messages)
-            self.calls.append((tag, text))
-            self.review_round += 1
-            candidate = deepcopy(reviewed_blueprint)
-            if self.review_round == 1:
-                candidate["relation_types"][0]["field"] = "不存在字段"
-            return {
-                "review": {"reskin_risk": "low", "findings": ["语义审查"], "decisions": ["保留骨架"]},
-                "world_blueprint": candidate,
-            }
-        if tag == "council.world_repair":
-            text = "\n".join(str(message.get("content", "")) for message in messages)
-            self.calls.append((tag, text))
-            return {"world_blueprint": deepcopy(reviewed_blueprint)}
-        return super().chat_json(tag, messages, **kwargs)
-
-
-schema_repair_tracer = _SchemaRepairTracer()
-schema_repair_wp = central_office(
-    "测试 schema 修理后复审", [], schema_repair_tracer, log=lambda *_args: None)
-schema_repair_tags = [tag for tag, _text in schema_repair_tracer.calls]
-ck("⑦ schema 修理结果不能沿用修理前风险结论，必须重新反方评审",
-   schema_repair_tags.count("council.world_repair") == 1
-   and schema_repair_tags.count("council.world_review") == 2
-   and schema_repair_wp["world_review"].get("attempts") == 2)
-
-
-class _HighRiskTracer(_WorldFirstTracer):
-    """反方连续判定仍可换皮；白皮书必须在 map 前停下。"""
-
-    def chat_json(self, tag, messages, **kwargs):
-        if tag == "council.world_review":
-            text = "\n".join(str(message.get("content", "")) for message in messages)
-            self.calls.append((tag, text))
-            return {
-                "review": {
-                    "reskin_risk": "high",
-                    "findings": ["改名后仍可迁移到办公世界"],
-                    "decisions": ["尚未形成可批准的领域动力学"],
-                },
-                "world_blueprint": deepcopy(architect_blueprint),
-            }
-        return super().chat_json(tag, messages, **kwargs)
-
-
-high_risk_tracer = _HighRiskTracer()
-try:
-    central_office("测试换皮硬闸", [], high_risk_tracer, log=lambda *_args: None)
-    high_risk_rejected = False
-except ValueError:
-    high_risk_rejected = True
-high_risk_tags = [tag for tag, _text in high_risk_tracer.calls]
-ck("⑦ residual reskin risk 非 low 时五轮后 fail-closed",
-   high_risk_rejected and high_risk_tags.count("council.world_review") == 5)
-ck("⑦ 换皮评审未批准时不得进入能力 map",
-   "council.map" not in high_risk_tags and "council.critique" not in high_risk_tags)
-
 # 模型常把 schema 的 kind 注解误抄进 JSON key；只允许受蓝图白名单约束的安全归一。
 decorated_fields = _canonicalize_generated_field_names(
     {"当前任务(text)": {"type": "stable", "value": "调查"},

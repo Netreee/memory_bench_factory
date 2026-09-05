@@ -8,7 +8,7 @@ import dataclasses, math
 from pipeline.world_state import WorldState
 from pipeline.world_blueprint import relation_capacity, relation_owner_side
 from pipeline.lines import line_for
-from pipeline.run import Run, _run_stage
+from pipeline.run import Run, _finalize_run, _run_stage, _update_run_metadata
 from pipeline.targetspec import TargetSpec, invert_rate, WorldParams, DEFAULT_SLACK
 
 
@@ -54,11 +54,13 @@ def _render_delta_scope(ws: WorldState, previous_entities: set,
     return new_entities, [[entity, session] for entity, session in sorted(pairs)]
 
 
-def _scale_world_contract(wp: dict, n_entities: int, n_sessions: int) -> None:
+def _scale_world_contract(wp: dict, n_entities: int, n_sessions: int,
+                          narrative: bool = False) -> None:
     """同步闭环规模旋钮到 legacy 镜像与显式 world_blueprint。
 
-    多类型世界按白皮书原有人口比例缩放到闭环反推的目标规模，并同比缩放
-    relation/event 最小实例数；后续纠偏轮的目标只增不减，因此不会缩掉已生成实体。
+    多类型世界按白皮书原有人口比例缩放到闭环反推的目标规模；只有显式声明
+    ``cardinality_policy=exact`` 的唯一角色保持原 count。
+    relation/event 最小实例数同比缩放；没有显式基数约束的 primary 仍可正常扩容。
     没有 blueprint 的历史白皮书仍只改旧字段。
     """
     sw = wp.setdefault("shared_world_spec", {})
@@ -89,20 +91,39 @@ def _scale_world_contract(wp: dict, n_entities: int, n_sessions: int) -> None:
                 },
             }
             sw["_typed_scale_baseline"] = baseline
-        desired = max(int(n_entities), len(types))
-        base_total = int(baseline["entity_total"])
-        if base_total > 0 and desired != old_total:
-            factor = desired / base_total
-            raw = [int(baseline["entity_counts"][tid]) * factor for tid in type_ids]
-            # 以首次白皮书为比例锚；每种核心类型至少保留一个实例。
-            counts = [max(1, math.floor(x)) for x in raw]
+        base_counts = [int(baseline["entity_counts"][tid]) for tid in type_ids]
+        fixed = [i for i, item in enumerate(types)
+                 if item.get("cardinality_policy") == "exact"]
+        scalable = [i for i in range(len(types)) if i not in fixed]
+        fixed_total = sum(base_counts[i] for i in fixed)
+        desired = max(int(n_entities), fixed_total + len(scalable))
+        if not fixed:
+            # 未声明基数约束时保持旧行为，避免 office 等人口型 primary 被意外冻结。
+            factor = desired / int(baseline["entity_total"])
+            raw = [count * factor for count in base_counts]
+            counts = [max(1, math.floor(value)) for value in raw]
             remainder = desired - sum(counts)
             order = sorted(range(len(types)), key=lambda i: (raw[i] - math.floor(raw[i]),
                                                               bool(types[i].get("primary"))), reverse=True)
             for i in order[:max(0, remainder)]:
                 counts[i] += 1
-            for t, count in zip(types, counts):
-                t["count"] = count
+        else:
+            counts = list(base_counts)
+            scalable_target = desired - fixed_total
+            scalable_base = sum(base_counts[i] for i in scalable)
+            free_slots = scalable_target - len(scalable)
+            raw = [(base_counts[i] * free_slots / scalable_base) if scalable_base > 0
+                   else (free_slots / len(scalable)) for i in scalable]
+            scaled = [1 + math.floor(value) for value in raw]
+            remainder = scalable_target - sum(scaled)
+            order = sorted(range(len(scalable)),
+                           key=lambda pos: raw[pos] - math.floor(raw[pos]), reverse=True)
+            for pos in order[:max(0, remainder)]:
+                scaled[pos] += 1
+            for i, count in zip(scalable, scaled):
+                counts[i] = count
+        for t, count in zip(types, counts):
+            t["count"] = count
         actual_entities = sum(int(t.get("count", 0)) for t in types)
         temporal = bp.setdefault("temporal_model", {})
         # 时间跨度与实体规模一样服从本轮旋钮；build_to_target 后续轮只会放大参数，
@@ -116,12 +137,22 @@ def _scale_world_contract(wp: dict, n_entities: int, n_sessions: int) -> None:
                 declaration_id = str(declaration.get("id") or "")
                 base_min = int(base_mins.get(declaration_id, declaration.get("min_count", 0)))
                 if base_min > 0:
-                    declaration["min_count"] = max(1, math.ceil(base_min * density_factor))
+                    # 剧情事件是 canonical spine，不随为了补 benchmark 题而扩的外围实体膨胀。
+                    scaled_min = base_min if narrative and key == "event_min_counts" \
+                        else math.ceil(base_min * density_factor)
+                    declaration["min_count"] = max(1, scaled_min)
         # relation 是标量 FK；人口比例取整后，owner 侧可能没长大，不能让同比 min_count 超过容量。
         for relation in bp.get("relation_types") or []:
             if relation_owner_side(bp, relation) is not None:
                 relation["min_count"] = min(int(relation.get("min_count", 0)),
                                              relation_capacity(bp, relation))
+        # event 实例唯一键是 type/session/participants；最小数不得超过角色组合容量。
+        counts_by_type = {item.get("id"): int(item.get("count", 0)) for item in types}
+        for event in bp.get("event_types") or []:
+            capacity = actual_sessions
+            for type_id in (event.get("roles") or {}).values():
+                capacity *= counts_by_type.get(type_id, 0)
+            event["min_count"] = min(int(event.get("min_count", 0)), capacity)
         actual_sessions = temporal["n_sessions"]
     sw.setdefault("entities", {})["count"] = actual_entities
     sw.setdefault("timeline", {})["n_sessions"] = actual_sessions
@@ -185,7 +216,8 @@ def build_to_target(run: Run, spec: TargetSpec, max_rounds: int = 2, order_subro
     一轮 = ①订单供给环(stage_world+stage_orders 多子轮长世界) → 出题 → 整轮重渲 → 接地 → ② floor 校验/纠偏。
     达标 MET 返回;耗尽 max_rounds 仍不达 → fail-open 标 UNMET(不抛错,题库照出,留痕 manifest.algo.met_status)。"""
     from pipeline.factory import (stage_world, stage_orders, stage_well_posed,
-                                  stage_questions, stage_corpus, stage_grounding, ART)
+                                  stage_questions, stage_corpus, stage_grounding,
+                                  ART, CORPUS_CKPT)
     wp = run.read(ART["whitepaper"])
     canon_lines = [{**l, "line": line_for(l.get("line", "")).id}                  # ★白皮书线 id 变体 → 规范 id(与 by_line / 先验键对齐)
                    for l in wp.get("active_lines", [])
@@ -215,15 +247,17 @@ def build_to_target(run: Run, spec: TargetSpec, max_rounds: int = 2, order_subro
     prev_entities = None                                                         # round1 已渲世界快照，作 ②环 delta 基线
     prev_relations: set = set()
     prev_events: set = set()
+    narrative_mode = run.scenario == "game"
     for rnd in range(1, max_rounds + 1):
         run.log(f"╠═ 第 {rnd}/{max_rounds} 轮 ══════════════════════════════")
-        _scale_world_contract(wp, params.n_entities, params.n_sessions)           # patch 规模旋钮；显式蓝图同步更新 primary/time
+        _scale_world_contract(wp, params.n_entities, params.n_sessions,
+                              narrative=narrative_mode)                           # patch 规模旋钮；显式蓝图同步更新 primary/time
         sw = wp["shared_world_spec"]
         wp.setdefault("domain_profile", {})["l5_max_conflicts"] = params.max_n_conflicts
         run.write(ART["whitepaper"], wp)
         run_cfg["quotas"] = dict(params.target_orders)                            # ★经 config 喂配额给 stage_orders(不内联 run_lines)
-        run_cfg["augment"] = (rnd > 1)                                            # ★rnd>1:stage_world 增量 augment(在既有世界上长新实体,§10.1)
-        run._save_manifest()
+        # 普通场景续长实体；game 的 canon 很小，整轮重建比拼接新旧剧情更可靠。
+        run_cfg["augment"] = (rnd > 1 and not narrative_mode)
 
         # ── ① 订单供给环:直调 stage_world + stage_orders(便宜,绝不渲);供不上 → 长世界重跑 ──
         feasible: set = set()
@@ -239,18 +273,22 @@ def build_to_target(run: Run, spec: TargetSpec, max_rounds: int = 2, order_subro
             if not deficit or sub == order_subrounds:
                 break
             params = _grow_for_supply(params, deficit, grow_sessions=(rnd == 1)) # 第2轮+只长实体，不破坏旧语料时间轴
-            _scale_world_contract(wp, params.n_entities, params.n_sessions)
+            _scale_world_contract(wp, params.n_entities, params.n_sessions,
+                                  narrative=narrative_mode)
             run.write(ART["whitepaper"], wp)
             run.log(f"║  ↑供给不足 → 长世界 n_ent={params.n_entities} n_sess={params.n_sessions} 重建")
 
         # ── 出题 → 渲染(round1 全量;round2+ ★增量 delta:只渲新实体、旧 docs 原样保留,§10.1)→ 接地 ──
         _run_stage(run, "questions", stage_questions, ART["questions"])
         ws = WorldState.from_dict(run.read(ART["world"]))
-        if rnd == 1:
+        if rnd == 1 or narrative_mode:
+            run_cfg.pop("render_only", None)
+            run_cfg.pop("render_only_pairs", None)
             prev_entities = set(ws.entities)
             prev_relations = {_relation_key(r) for r in ws.relations}
             prev_events = {_event_key(e) for e in ws.events}
-            (run.dir / ART["corpus"]).unlink(missing_ok=True)                    # 全量:清残留 ckpt 从头
+            # 全量重渲只清中断点；旧正式 05 保留到 stage_corpus 成功后原子替换。
+            (run.dir / CORPUS_CKPT).unlink(missing_ok=True)
             _run_stage(run, "corpus", stage_corpus, ART["corpus"])
         else:
             new_ents, touched_pairs = _render_delta_scope(
@@ -258,9 +296,11 @@ def build_to_target(run: Run, spec: TargetSpec, max_rounds: int = 2, order_subro
             run_cfg["render_only"] = new_ents
             run_cfg["render_only_pairs"] = touched_pairs
             run.log(f"║  增量续渲:+{len(new_ents)} 新实体全程 + {len(touched_pairs)} 个旧实体·结构变化期")
-            _run_stage(run, "corpus", stage_corpus, ART["corpus"])
-            run_cfg.pop("render_only", None)
-            run_cfg.pop("render_only_pairs", None)
+            try:
+                _run_stage(run, "corpus", stage_corpus, ART["corpus"])
+            finally:
+                _update_run_metadata(
+                    run, config_remove=("render_only", "render_only_pairs"))
             prev_entities = set(ws.entities)
             prev_relations = {_relation_key(r) for r in ws.relations}
             prev_events = {_event_key(e) for e in ws.events}
@@ -273,9 +313,13 @@ def build_to_target(run: Run, spec: TargetSpec, max_rounds: int = 2, order_subro
         o = report["overall"]
         run.log(f"║  ②接地后:总 {o['grounded']}/{spec.min_questions}  逐线 {per_line_final}")
         run.log(f"║  达标={met}  待长(可行未达){growable or '无'}  永久(不可行){permanent or '无'}")
-        run.set_algo(targetspec={"min_questions": spec.min_questions, "per_line_min": spec.per_line_min,
-                                 "haystack_ratio": spec.haystack_ratio},
-                     per_line_final=per_line_final, met_status="MET" if met else f"round{rnd}_unmet")
+        _update_run_metadata(run, algo={
+            "targetspec": {"min_questions": spec.min_questions,
+                           "per_line_min": spec.per_line_min,
+                           "haystack_ratio": spec.haystack_ratio},
+            "per_line_final": per_line_final,
+            "met_status": "MET" if met else f"round{rnd}_unmet",
+        })
         if met:
             run.log(f"╚═ ✓ 旋钮达标(MET):总 {o['grounded']}≥{spec.min_questions},各线 floor 均满足。")
             break
@@ -292,10 +336,9 @@ def build_to_target(run: Run, spec: TargetSpec, max_rounds: int = 2, order_subro
 
     if not met:
         unmet = (last["growable"] + last["permanent"]) or ["总数未达 min_questions"]
-        run.set_algo(met_status=f"UNMET: {unmet}")
+        _update_run_metadata(run, algo={"met_status": f"UNMET: {unmet}"})
         run.log(f"╚═ ✗ 旋钮未达标(UNMET,已尽 {max_rounds} 轮):{unmet}。题库仍写出(fail-open,留痕 met_status)。")
-    run.manifest["current_stage"] = ""
-    run_cfg.pop("augment", None); run_cfg.pop("render_only", None)
-    run_cfg.pop("render_only_pairs", None)                                        # ★清增量信号,免泄漏到后续 --only 重跑
-    run.set_status("done")
+    _update_run_metadata(
+        run, config_remove=("augment", "render_only", "render_only_pairs"))       # ★清增量信号,免泄漏到后续 --only 重跑
+    _finalize_run(run)
     return last["kept"], ("MET" if met else "UNMET")

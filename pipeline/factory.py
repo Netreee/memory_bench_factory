@@ -14,13 +14,14 @@ closed_loop);此处只放:场景输入 + stage 薄包装 + STAGES 注册 + CLI�
 """
 from __future__ import annotations
 from pathlib import Path
-import argparse, json, sys, time
+import argparse, hashlib, json, sys, time
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from pipeline.world_state import WorldState
 from pipeline.lines import run_lines, prepare_lines as _prepare_lines
 from pipeline.central_office import central_office
 from pipeline.world_gen import build_world
+from pipeline.world_blueprint import WorldBlueprintError, normalize_world_blueprint, relation_capacity
 from pipeline.render import render_corpus, phrase_questions
 from pipeline.run import Run, Stage, drive, list_runs, latest_run_for, new_run_id, RUNS_DIR
 from pipeline.targetspec import TargetSpec
@@ -146,6 +147,8 @@ SCENARIOS = {
 ART = {"input": "00_input.json", "whitepaper": "01_whitepaper.json", "world": "02_world.json",
        "orders": "03_orders.json", "questions": "04_questions.json", "corpus": "05_corpus.json",
        "grounding": "06_grounded_questions.json"}
+CORPUS_CKPT = "05_corpus.ckpt.json"
+CORPUS_RENDER_CONTRACT_VERSION = 3
 
 # ★作答协议(B类①修复):benchmark 出厂【显式声明】None 的两类语义 + 期望作答,治"None 未定义→理性系统被误判"。
 #   契约层一处声明(非逐题补丁),所有 None 题共享;eval 侧据此把 gold 哨兵映射到人类作答。
@@ -176,9 +179,37 @@ def stage_input(run: Run):
     run.write("00_about.json", {"answer_protocol": ANSWER_PROTOCOL})   # ★出厂作答协议(随题库交付,eval 侧读)
 
 
+def _pin_game_primary(wp: dict) -> None:
+    """把游戏唯一主角固定为一个实例，并同步白皮书的实体总数。
+
+    这是 game 场景的产品语义，不由通用 closed-loop 猜测；外围角色仍可扩容，
+    主角则由 ``exact`` 策略永久锁为 1。
+    """
+    blueprint = wp.get("world_blueprint") or {}
+    types = blueprint.get("entity_types") or []
+    primaries = [item for item in types if isinstance(item, dict) and item.get("primary") is True]
+    if len(primaries) != 1:
+        raise WorldBlueprintError(
+            f"game 白皮书必须且只能有一个 primary entity type，当前={len(primaries)}")
+    primaries[0]["count"] = 1
+    primaries[0]["cardinality_policy"] = "exact"
+    # 标量 FK 的容量取决于 owner 数量；主角收缩为 1 后，同步收紧不可实现的关系下限。
+    for relation in blueprint.get("relation_types") or []:
+        minimum = relation.get("min_count")
+        capacity = relation_capacity(blueprint, relation)
+        if (isinstance(minimum, int) and not isinstance(minimum, bool)
+                and capacity > 0 and minimum > capacity):
+            relation["min_count"] = capacity
+    normalize_world_blueprint(wp)
+    total = sum(int(item.get("count", 0)) for item in types if isinstance(item, dict))
+    wp.setdefault("shared_world_spec", {}).setdefault("entities", {})["count"] = total
+
+
 def stage_whitepaper(run: Run):
     sc = run.read(ART["input"])
     wp = central_office(sc["description"], sc["few_shot"], run.tracer, run.log)
+    if run.scenario == "game":
+        _pin_game_primary(wp)
     run.write(ART["whitepaper"], wp)
     run.set_algo(active_lines=[l.get("line") for l in wp.get("active_lines", [])],
                  medium=wp.get("output_medium") or wp.get("domain_profile", {}).get("medium"))
@@ -188,11 +219,16 @@ def stage_whitepaper(run: Run):
 def stage_world(run: Run):
     wp = run.read(ART["whitepaper"])
     existing = None
-    if run.manifest["config"].get("augment") and run.has(ART["world"]):   # ★增量(§10.1):在既有世界上 augment 新实体,旧不动
+    # game 的 Story Ledger 必须基于单一 canon；即使 manifest 残留 augment 也始终全量重建。
+    if (run.scenario != "game" and run.manifest["config"].get("augment")
+            and run.has(ART["world"])):                         # ★增量(§10.1):旧世界上 augment 新实体
         existing = WorldState.from_dict(run.read(ART["world"]))
-    ws = build_world(wp, run.tracer, run.log, existing=existing)
+    ws = build_world(wp, run.tracer, run.log, existing=existing,
+                     narrative=(run.scenario == "game"))
     _prepare_lines(wp, ws, run.log)
     run.write(ART["world"], ws.to_dict())
+    # world 已更换，任何旧渲染中断点都不再与当前 canon 对应。
+    (run.dir / CORPUS_CKPT).unlink(missing_ok=True)
     run.set_algo(entities=len(ws.entities), sessions=ws.n_sessions)
 
 
@@ -229,27 +265,66 @@ def stage_questions(run: Run):
     run.set_algo(questions=len(qs))
 
 
+def _corpus_checkpoint_identity(wp: dict, world: dict, target: int,
+                                delta_mode: bool, only: set | None,
+                                pairs: set[tuple[str, int]] | None) -> str:
+    """计算渲染中断点的稳定身份；输入或渲染范围变化即不可续用。"""
+    payload = {
+        "version": CORPUS_RENDER_CONTRACT_VERSION,
+        "whitepaper": wp,  # style_spec 属于白皮书，随整体一起绑定。
+        "world": world,
+        "target_tokens": target,
+        "delta_scope": {
+            "mode": "delta" if delta_mode else "full",
+            "entities": sorted(only or []),
+            "entity_sessions": [[entity, session] for entity, session in sorted(pairs or set())],
+        },
+    }
+    canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                           separators=(",", ":"), allow_nan=False)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def stage_corpus(run: Run):
-    wp = run.read(ART["whitepaper"]); ws = WorldState.from_dict(run.read(ART["world"]))
-    ckpt = run.dir / ART["corpus"]
-    if ckpt.exists():                                       # ★续渲:加载已完成周,接着跑(stage 内部 resume)
-        st = json.loads(ckpt.read_text(encoding="utf-8"))
-        corpus, done = st["corpus"], set(st["done_weeks"])
-        run.log(f"  ↻ 续渲:已完成 {len(done)} 周")
-    else:
-        corpus, done = {"sessions": []}, set()
-    target = int(run.manifest["config"].get("target_tokens", 1_000_000))
-
-    def save():
-        ckpt.write_text(json.dumps({"corpus": corpus, "done_weeks": sorted(done)}, ensure_ascii=False), encoding="utf-8")
-
+    wp = run.read(ART["whitepaper"]); world = run.read(ART["world"])
+    ws = WorldState.from_dict(world)
+    if run.scenario == "game" and not ws.narrative:
+        raise WorldBlueprintError(
+            "game corpus 缺少合法 Story Ledger；请先强制重跑 world，禁止退化为普通语料渲染")
     cfg = run.manifest["config"]
-    delta_mode = "render_only" in cfg or "render_only_pairs" in cfg
+    requested_delta = "render_only" in cfg or "render_only_pairs" in cfg
+    delta_mode = requested_delta and not bool(ws.narrative)
+    if requested_delta and ws.narrative:
+        run.log("  ⓘ game Story Ledger 启用：忽略残留 delta 配置，按完整 canon 渲染")
+    target = int(run.manifest["config"].get("target_tokens", 1_000_000))
     only = set(cfg.get("render_only") or []) if delta_mode else None
     pairs = ({(item[0], int(item[1])) for item in (cfg.get("render_only_pairs") or [])
               if isinstance(item, (list, tuple)) and len(item) == 2} if delta_mode else None)
+    identity = _corpus_checkpoint_identity(wp, world, target, delta_mode, only, pairs)
+    ckpt = run.dir / CORPUS_CKPT
+    if ckpt.exists():                                       # 中断续渲只读独立 checkpoint
+        st = run.read(CORPUS_CKPT)
+        if st.get("identity") == identity:
+            corpus, done = st["corpus"], set(st["done_weeks"])
+            run.log(f"  ↻ 续渲:已完成 {len(done)} 周")
+        else:
+            corpus, done = {"sessions": []}, set()
+            run.log("  ⓘ 渲染 checkpoint 与当前输入不匹配，忽略并从空语料开始")
+    elif delta_mode and run.has(ART["corpus"]):             # 非剧情闭环的增量渲染从上一版成品起步
+        st = run.read(ART["corpus"])
+        corpus, done = st["corpus"], set(st["done_weeks"])
+    else:
+        corpus, done = {"sessions": []}, set()
+
+    def save():
+        run.write(CORPUS_CKPT, {"identity": identity, "corpus": corpus,
+                                "done_weeks": sorted(done)})
+
     render_corpus(wp, ws, target, run.tracer, corpus, done, save, run.log,
                   only_entities=only, only_entity_sessions=pairs)
+    # 只有整个渲染成功后才发布最终产物；中断时旧成品不会被半成品覆盖。
+    run.write(ART["corpus"], {"corpus": corpus, "done_weeks": sorted(done)})
+    ckpt.unlink(missing_ok=True)
     ch = sum(len(dd.get("content", "")) for x in corpus["sessions"] for dd in x["docs"])
     run.set_algo(docs=sum(len(x["docs"]) for x in corpus["sessions"]), chars=ch)
 
@@ -350,12 +425,12 @@ def main():
     cfg = {"from": a.from_stage, "to": a.to_stage, "only": a.only}
     if a.target_mtokens is not None:
         cfg["target_tokens"] = int(a.target_mtokens * 1_000_000)
+    elif not (RUNS_DIR / run_id / "manifest.json").exists():
+        cfg["target_tokens"] = 1_000_000
     run = Run(scenario, run_id, tag=a.tag, config_meta=cfg)
-    run.manifest["config"].setdefault("target_tokens", 1_000_000)   # 新 run 缺省目标
-    run._save_manifest()
 
     t0 = time.time()
-    tgt = run.manifest["config"]["target_tokens"]
+    tgt = run.manifest["config"].get("target_tokens", 1_000_000)
     run.log(f"=== run {run_id}(scenario={scenario},目标 {tgt/1e6:.1f}M token)===")
 
     if a.min_questions is not None:                         # ★闭环旋钮路径:先把 input+whitepaper 跑出来,再交给 driver 自管 world→grounding

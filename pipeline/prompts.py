@@ -22,11 +22,9 @@ PROMPTS: dict[str, str] = {
 【每个 $noun = 一个 entity】★核心:name 是这个【$noun】个体的【正式专名】,且必须【与「$noun」这个类别相称】——\
 是部门就起部门名(如「支付平台部」)、是商品就起商品名、是人才起人名;★不要跨类(别把部门起成人名),也★不要拿它的指标/字段当名字(别叫「XX缺陷率」)。
 ★字段【只能从下面这份给定清单里选】,逐字照抄字段名,严禁新增/改名/拆分同义字段(下游 gold 只认这份清单,擅自加的字段会被丢弃且制造近义串味坏题):$fdesc。
-- numeric 字段:给 trajectory。★默认【非单调】(峰/谷/反弹,最大或最小值落在【非首非尾】某周,防 MR 退化);
-  但若字段在清单里标了【累计只增】就逐周【不减】(可个别周持平、整体递增,此时不要非单调!)、标了【只减】就逐周【不增】,标了【值域 a-b】就全程不出界。
-  ★所有数值【写纯阿拉伯数字、不加千分位逗号】(写 1050 不写 1,050),单位按字段清单。
+$numeric_policy
 - person/status/category 字段:给 trajectory(随时间换),或 stable 给单一 value；但 user 若标为【domain event 驱动】，这里只能给可选初态，后续变化留给 event effect
-- 若本类型存在非结构驱动字段，至少 1 个字段末尾 null 结尾(= 该字段「$stopped」,考遗忘/停用前最后值)；若 user 明示全部字段均由 domain event 驱动，可直接输出空 fields，不适用此要求。
+$coverage_policy
 
 【硬约束】1.全新虚构值(防泄漏);2.session 用 0..N-1 整数,不写日期;3.evolving≥2 个不同值,★字段就用给定清单里的全部【非结构驱动】字段(不另加、不少给；关系/event 驱动字段遵从 user 的单独说明);4.★所有专名(实体名 + 人名类字段值)**表面互不近似**:禁止"张三/张三(数据)/张三_数据"这类共享主干的近重名(下游机械校验表面塌缩,近重名整条作废)。
 
@@ -35,7 +33,7 @@ PROMPTS: dict[str, str] = {
 【严格 JSON,name 是专名而非字段,type 必须逐字为 type id】{"entities":[{"name":"<一个真实$noun的专名>","type":"$type_id","fields":{"<字段名>":{"type":"evolving","value_type":"...","trajectory":[{"session":0,"value":"..."}]},"<稳定字段>":{"type":"stable","value":"..."}}}]}""",
 
     # ── 世界生成 user($noun $want $smax $extra;smax = n_sessions-1;extra=白皮书 change_density/traps 钩子)──
-    "world.user": """设计 $want 个【$noun】(type id=$type_id,名字互不相同),session 用 0..$smax；非结构驱动字段允许时做非单调演化并让至少一个字段 null 结尾。严格 JSON。$extra""",
+    "world.user": """设计 $want 个【$noun】(type id=$type_id,名字互不相同),session 用 0..$smax；$trajectory_request。严格 JSON。$extra""",
 
     # ── 世界骨架实例化：只连已生成实体，不再发明实体/字段/关系/事件类型 ──
     "world.structure": """你是世界蓝图实例化器。给定【已经生成的 typed entities】和【机器契约 blueprint】，只实例化契约声明的关系与领域事件。
@@ -53,6 +51,34 @@ PROMPTS: dict[str, str] = {
 【typed entities】$entities
 实例化全部 min_count 约束，严格 JSON。""",
 
+    # ── game-only 轻量 Story Ledger；canonical world 冻结后独立生成 ──
+    "world.story": """你是游戏剧情编排器。给你的世界实体和事件已经通过机器契约并被冻结；不得修改、补写或重新生成它们。
+你只需把全部 canonical event 编排成一条易于渲染的剧情主线：
+1. premise、goal、stakes 各写一个非空短句；protagonist_ref 必须是唯一 primary 实例。goal 必须能被给定 canonical events 在最后一幕真正完成，不能许诺事件表里不存在的“最终挑战”。
+2. 每个 scene 至少引用一个 event；每个 canonical event ID 必须且只能出现一次。scene.session 必须与其引用的所有 event session 相同。
+3. 同一 session 有多幕时用 order=0,1,... 排列；所有 session/order 都必须写 JSON 整数，不能写字符串。
+4. dramatic_function 只允许 setup、inciting_incident、rising_action、reversal、crisis、climax、resolution；不得倒退，三幕以上时必须从 setup/inciting_incident/rising_action 起步，并以 resolution 收束。
+5. scene 只承担排序和事件引用，不写自由摘要；事件内容由代码按 event_refs 从 CANON 读取。
+严格 JSON，只输出：{"premise":"...","goal":"...","stakes":"...","protagonist_ref":"...","scenes":[{"scene_id":"scene-...","session":0,"order":0,"event_refs":["evt-..."],"dramatic_function":"setup"}]}""",
+
+    "world.story_user": """【world_blueprint】$blueprint
+【typed entities】$entities
+【canonical events】$events$hint
+编排全部 canonical events，严格 JSON。""",
+
+    # ── game 叙事共用的只读 supportedness 闸；不改 canon，只指出编造 ──
+    "narrative.review": """你是只读的叙事事实审查员。判断候选文本中每个具体的身份、状态、行动、持有关系、物品来源、阵营归属、生死、因果、结果和时间断言，是否被 CANON 明确支持。
+允许文风化连接、情绪和明确标为目标/风险/假设的语句；明确以“若失败”表述的 stakes 无需在 CANON 中有反事实事件，只要不与 CANON 冲突。不得把可能性写成已发生事实，不得为事件添加 CANON 没有的执行者、掉落物、复活、立场变化或后果。
+若审查对象是 Story Ledger，还要检查 premise/goal 是否与整条事件链一致、goal 是否确实在最后一幕完成；未完成的许诺也要报告，但不要仅因 stakes 是反事实风险而报告。
+若审查对象是语料，还要检查每个 CANON domain_event 的动作、全部参与者和全部 effect 是否在同一篇文档里被明确叙述；只罗列状态、分散在多篇或漏掉事件也要报告。
+只报候选中不受支持或未闭合的具体问题，每条一句；全部通过则返回空数组。
+严格 JSON:{"unsupported_claims":["..."]}""",
+
+    "narrative.review_user": """【审查对象】$scope
+【CANON（唯一事实边界）】$canon
+【候选】$candidate
+只输出严格 JSON:{"unsupported_claims":[]}""",
+
     # ── §W.3 世界修复轮(system;定向重生成有缺陷字段;$noun $smax)──────────────
     "world.repair": """你是 ground-truth 世界设计师,在做【定向修复】。给你一个【$noun】的若干【有缺陷的字段】,只重写这些字段的取值轨迹来消除缺陷——别动其它字段、别改实体名、别新增字段。
 【缺陷与修法】monotonic=数值轨迹单调 → 让峰【或】谷落在【非首非尾】的中间某周(其余可起伏);fake_evolving=只有 1 个值 → 给【≥2 个不同值】的演化轨迹;illegal_transition=状态倒流/出界 → 只用缺陷里给出的【声明状态表】取值,且按表序【单向推进】(可跳级、不可回头);monotonic_violation=该字段语义只增(或只减)却逆向了 → 重写成单向【不减/不增】(可个别周持平、整体要演化)的轨迹(如累计量逐周递增);out_of_range=值出界 → 重写到给定值域内。数值写纯阿拉伯数字、不加千分位逗号。
@@ -65,8 +91,10 @@ $defects
 严格 JSON。""",
 
     # ── §7 信号渲染(system;$noun $genres $stopped $genre0)──────────────────
-    "corpus.system": """你是【$noun】领域的语料合成专家。场景里有多类对象：$type_legend。给你某一$time_unit各 typed entity 的当期字段值与领域事件,合成 1-2 篇详尽异质文档(体裁:$genres),像【真实的该体裁文档】那样把这些值与事件【自然叙述】进去、写厚(每篇1200-2000字)。
-★每条 fact 的 entity_type 决定它是什么对象；严禁把 Boss/装备/项目/预算等一律称作 primary 类型。若给了 domain_events，文档应以“发生了什么”组织叙事，并忠实承载其 participants/effects；每个 event 的人类可读 label 必须逐字出现，并与全部 participant 专名写在同一篇文档里，而非退回字段清单。
+    "corpus.system": """你是【$noun】领域的语料合成专家。场景里有多类对象：$type_legend。给你某一$time_unit各 typed entity 的当期字段值与领域事件,合成 1-3 篇异质文档(体裁:$genres),像【真实的该体裁文档】那样把这些值与事件【自然叙述】进去。
+【白皮书写作规格】$style_spec
+写作规格控制语气、格式、术语和信息显隐。其中篇幅是风格目标，不是可以牺牲事实的硬上限；事实较多时拆成多篇，始终以完整、忠实承载为先。
+★每条 fact 的 entity_type 决定它是什么对象；严禁把 Boss/装备/项目/预算等一律称作 primary 类型。若给了 domain_events，文档应以“发生了什么”组织叙事，并忠实承载其 participants/effects；每个 event 的动作语义、全部 participant 专名、每条 effect 的实体/字段名/set 值必须出现在同一篇文档里。label 可自然改写，不要求逐字复述，但不能退回字段清单。
 【就近·硬约束(是就近、不是句式)】每条事实里,【该实体的专名】与【它的值】要落在【同一句或紧邻一句】(下游有盲读者逐条校验"据本文,该实体的该字段是多少")。但这只要求【挨得近、能被唯一读出】、不规定句式——用真实文档的行文把值带出来:★绝不要写成「<实体>本期<字段>为<值>」这种字段表口吻,也不要逐字段平铺罗列。示例:写「复盘会上,星海广场项目的风险评分已抬到 80,主办人陈明据此提示团队收紧排期」,而非「星海广场本期风险评分为80。本期主办人为陈明。」
 【防剧透·硬约束】1.只写本期快照值,严禁"当前/现在/最新/目前/一直/维持/累计/现任/仍为"等全局口径词(字段名本身含这些字的照常写);2.严禁回顾历史值/叙述"由X变Y";3.含本期日期锚点;4.某字段本期 stopped 就自然写明「自本期起$stopped」、不写其过去数值;5.绝不编造未给定的字段/值;6.★数值/专名的【值】逐字保留(★给的是 0.78 就写 0.78,绝不换算成 78%/78 分;给的是 320万 就写 320万,不去单位),但承载它的句子自由发挥;7.同一实体的关系/负责人写清楚、别让一个实体冒出多个互相矛盾的负责人(否则盲读者读不出唯一答案)。
 【★元话术禁令】正文只写文档内容本身;★绝不在文中复述或声明你遵守了哪些约束(如"未使用全局口径词""无历史回顾""所有字段均就近""本期快照"之类说明性元话术,一律不得出现在正文)。
@@ -74,7 +102,7 @@ $defects
 
     # ── 信号 user($s $date $facts $hint)────────────────────────────────────
     "corpus.user": """【第 $s $time_unit / $date】各 typed entity 当期字段值(只写这些、只写本期):$facts
-【本期 domain_events】$events$hint
+【本期 domain_events】$events$story_context$hint
 严格 JSON。""",
 
     # ── 渲染链·盲判别器(Blinded Discriminator;只读渲染文档、对世界一无所知)──────
@@ -191,25 +219,6 @@ observe.observed_fields 是字面硬事实：其中每个 name 必须逐字出�
 
 ★所有 id 唯一、引用闭合；跨类型同名字段若存在，kind/unit/monotonic/range 必须完全一致。至少设计 2 种实体类型、1 种关系和 1 种事件，形成该场景自己的拓扑与事件生态。不要提 L1–L10。
 只输出 JSON:{"world_blueprint":{"version":1,"entity_types":[{"id":"...","noun":"...","count":3,"primary":true,"fields":[{"name":"...","kind":"status"}]}],"relation_types":[{"id":"...","from_type":"...","to_type":"...","field":"...","temporal":true,"min_count":1}],"event_types":[{"id":"...","label":"人类可读事件名","roles":{"actor":"..."},"effect_fields":[{"role":"actor","field":"..."}],"min_count":1}],"temporal_model":{"unit":"week","cadence":"weekly","n_sessions":10,"step_days":7},"causal_rules":[],"evidence_channels":["..."]}}""",
-
-    "council.world_review": """你是【世界骨架反方评审】。你只审领域世界，不看也不迎合任何记忆产线。对候选 world_blueprint 做一次换皮压力测试并直接给出修订后的完整 blueprint：
-1. 本体：实体类型是否真有不同身份/字段归属/生命周期，还是一个主表拆成几张同义表？
-2. 动力学：领域事件是否真驱动状态迁移，effect 是否落在正确 owner；因果只保留领域稳定成立、无需额外主体选择就必然发生的链。尤其区分“击败导致掉落”与“玩家随后拾取”，前者不能直接写成击败必然导致拾取。
-3. 拓扑：关系方向、时变性和关联实体是否符合领域，不能靠换 noun 就迁移到任意场景。逐条把 relation 读成“from 谓词 to”；field owner 在哪一端与语义方向无关，禁止因缺类型而用别的实体顶替（如玩家顶替阵营）。
-4. 时间：unit/cadence 是否是这个世界自然运转的节律，而不是一律 weekly。
-5. 证据生态：evidence_channels 是否是该领域真实留下痕迹的渠道，且足以观察核心事件。
-6. 核心覆盖与换皮反证：先把场景描述中的核心名词、关系谓词、事件动词逐项对照 blueprint；任何一项被降成 category/text、偷换端点、合并事件或 min_count=0 都不得评 low。随后假设把所有 noun/field/id 换成另一个行业词，如果结构和动力学仍毫无违和，说明仍同质化，必须补领域独有结构；但不许靠无意义加类型凑差异。
-保留 v1 schema，至少 2 个 entity type、1 个 relation、1 个 event、1 个 evidence channel；所有引用闭合、恰一个 primary。所有可执行约束仍须落在 schema 中，不得输出 prose invariants。
-★机械修订铁律：可选字段不适用就省略或置 null；range 只允许放在 numeric 字段且须为两个不同 JSON 数字，reference 绝不能用 range 表示目标类型或基数；monotonic 只写 up/down；所有 relation/event min_count>=1；跨类型 relation.field 必须真实属于 from/to 中恰好一个端点且 kind=reference；每个 reference 字段必须且只能绑定一种 relation；event effect 只能 SET 已声明且非 relation-owned 的字段，不能“创建实体”或引用另一字段作为值；不要添加 schema 外键。
-★实体 name 已经承载稳定身份。“XX名称/姓名/编号/ID”等身份字段不得作为 event effect；若事件缺少可变化效果，新增领域自然的状态/数值/类别字段并给出可执行状态序，禁止把实体专名 SET 给名称字段制造空操作。
-★候选已经通过 few-shot 观察闭包。候选中承接字面观察的字段及其 kind/unit/monotonic/range 是冻结硬事实：不得删除、改名、翻译或改约束。你只能在保留它们的前提下修订世界骨架。
-★person/category/text 等已观测显示字段不是 relation FK。需要结构化同一语义时，保留原字段并另加不同名的 reference 字段；relation.field 只能选 kind=reference 的字段，禁止把已观测字段改型。
-只输出 {"review":{"reskin_risk":"low|medium|high","findings":["..."],"decisions":["..."]},"world_blueprint":{...}}。reskin_risk 必须评价【你修订后的版本】；仍为 medium/high 就表示尚未批准。review 是白皮书审议记录，world_blueprint 是修订后的完整可执行契约。""",
-
-    "council.world_review_user": """【场景描述】$desc
-【few-shot 文档】$fs
-【架构师候选 world_blueprint】$candidate
-请完成反方评审，保留审议结论并输出修订后的完整 world_blueprint，严格 JSON。""",
 
     "council.world_repair": """你是【world_blueprint schema 修理员】，不是世界架构师。候选世界的领域意图已经确定；你只能依据机械错误清单修复 JSON 契约，不能删掉实体/关系/事件来逃避校验，也不能重新发挥另一套世界。
 逐项复核：
