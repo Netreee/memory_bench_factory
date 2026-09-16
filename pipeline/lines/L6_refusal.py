@@ -19,6 +19,7 @@ pipeline.lines.L6_refusal —— L6 抗虚构拒答产线(单能力线:L6_refusa
 """
 from __future__ import annotations
 import random
+import re
 from collections import defaultdict
 
 from pipeline.lines.base import ProductionLine, field_kind, interrogative
@@ -31,6 +32,61 @@ _SEED = 20260608
 # ★[R2,R1,R3] 加权轮转(强型优先、弱型兜底):R2 假前提最强、R1 邻字段次之、R3 窗外最弱
 _ROTATION = ["T3_premise", "T1_adjacent", "T2_window"]
 _WEIGHT = {"T3_premise": 3, "T1_adjacent": 2, "T2_window": 1}
+
+
+def field_ownership_mentions(entity: str, field: str, texts: list[str]) -> list[dict]:
+    """Conservative three-way attribution of nearby field mentions.
+
+    The old 90-character window only proposes candidates. A mention is cleared
+    only by an explicit absence statement or a separately named owner in the
+    same clause. Unresolved pronouns/ownership stay ambiguous and fail closed.
+    This intentionally recognizes a small grammar, not arbitrary coreference.
+    """
+    from pipeline.grounding import WINDOW
+    entity, field = _norm(entity), _norm(field)
+    if not entity or not field:
+        return []
+    findings = []
+    boundary = re.compile(r"[。！？!?；;\n]")
+    modifiers = r"(?:本周|本期|当前|最新)?"
+    for text in texts:
+        normalized = _norm(text)
+        breaks = [-1] + [match.start() for match in boundary.finditer(normalized)] + [len(normalized)]
+        for match in re.finditer(re.escape(field), normalized):
+            position = match.start()
+            window = normalized[max(0, position - WINDOW):match.end() + WINDOW]
+            if entity not in window:
+                continue
+            start = max(point for point in breaks if point < position) + 1
+            end = min(point for point in breaks if point >= match.end())
+            prefix, suffix = normalized[start:position], normalized[match.end():end]
+            status, reason = "ambiguous", "field_owner_unresolved"
+            if re.fullmatch(r"[」】\"]?(?:在[^，,；;。]{0,12})?(?:尚无记录|暂无记录|未记录|未提供|没有记录|无记录)(?:[，,](?:不得据此|不能据此)[^；;。]*)?", suffix):
+                status, reason = "cleared", "explicit_absence"
+            elif re.search(re.escape(entity) + r"[」】》\"]?(?:的|[，,]其)?" + modifiers + r"[「【\"]?$", prefix):
+                if re.match(r"[」】\"]?(?:为|是|登记为|调整为|更新为|记录为|[:：])[^，,；;。]+", suffix) and not suffix.startswith(("是什么", "为何")):
+                    status, reason = "target", "explicit_target_owner"
+            else:
+                # E.g. “报告乙的字段”. Never infer an owner from “其/该…”.
+                owner_match = re.search(r"([^，,:：；;。！？!?\n]{2,80})的" + modifiers + r"[「【\"]?$", prefix)
+                owner = owner_match.group(1).strip("《》「」【】") if owner_match else ""
+                generic = {"客户", "公司", "集团", "企业", "部门", "报告", "双方", "他们", "保险公司", "保险客户", "保险集团"}
+                if owner and owner not in generic and entity not in owner and not owner.startswith(("其", "该", "本", "上述", "相关", "同一", "此", "非", "除")):
+                    status, reason = "cleared", "explicit_other_owner"
+                else:
+                    # A single explicitly titled subject can retain ownership
+                    # through its predicate and “其”, but not across semicolons
+                    # or another literal mention of the probed entity.
+                    owners = re.findall(r"《([^《》]+)》", prefix)
+                    if len(owners) == 1 and entity not in prefix:
+                        after_owner = prefix.split("》", 1)[1]
+                        if re.fullmatch(r"(?:的|进行[^，,]{0,20}[，,]其|以该[^，,]{0,20}为客户[，,]|[^，,]{0,20}[，,]其)?[「【\"]?", after_owner):
+                            status, reason = "cleared", "explicit_titled_owner"
+            clause = normalized[start:end]
+            if re.search(r"但|然而|实际|其实|而是|并非|不是|不属于|不能认定|不认为|不表示|不代表", clause):
+                status, reason = "ambiguous", "contrast_or_negated_ownership"
+            findings.append({"status": status, "reason": reason, "clause": clause})
+    return findings
 
 
 def _has_field(ws: WorldState, ent: str, fld: str) -> bool:
@@ -281,12 +337,16 @@ class RefusalLine(ProductionLine):
         lv = lure.get("value")
 
         if t == "T1_adjacent":
-            # ★翻转:要求 E【丰富在场】(邻字段诱饵值就近 E)+ 目标字段【名/值不就近 E】(E 确实没这一项)
+            # Presence is lexical; field ownership requires a separate check.
             if not attributed(lv, ent, docs):
                 return ("drop", f"E 未丰富在场:邻字段诱饵 '{lv}' 未就近「{ent}」(题不够诱)")
-            if attributed(fld, ent, docs):
-                return ("drop", f"假拒答:目标字段名「{fld}」就近「{ent}」(E 其实有该字段)")
-            return ("grounded", f"邻字段诱饵 '{lv}' 就近「{ent}」、目标「{fld}」不就近(拒答成立)")
+            visible = docs + (all_signal_text.splitlines() if all_signal_text else [])
+            ownership = field_ownership_mentions(ent, fld, visible)
+            if any(item["status"] == "target" for item in ownership):
+                return ("drop", f"拒答与正文冲突:正文明确把「{fld}」归属于「{ent}」")
+            if any(item["status"] == "ambiguous" for item in ownership):
+                return ("drop", f"归属歧义待审:「{fld}」与「{ent}」就近共现，无法唯一确定字段主体")
+            return ("grounded", f"邻字段诱饵 '{lv}' 就近「{ent}」；目标字段无就近断言，或已明确归属其他主体/未记录")
 
         if t == "T2_window":
             if not attributed(lv, ent, docs):
