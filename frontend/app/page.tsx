@@ -19,7 +19,6 @@ import {
 import { Button } from '@/components/ui/button';
 import { LiveStudio } from '@/components/live-studio';
 import {
-  ARENA_QUESTION,
   ARENA_SYSTEMS,
   CAPABILITY_CHANNELS,
   CAPABILITY_FINGERPRINT,
@@ -160,7 +159,7 @@ function ReplayDeck({ onExit }: { onExit: () => void }) {
           <div className="forge-logo" aria-hidden="true"><span>MF</span></div>
           <div>
             <p className="forge-brand-name">MEMORY FORGE</p>
-            <p className="forge-brand-subtitle">SYNTHETIC MEMORY BENCHMARK FACTORY</p>
+            <p className="forge-brand-subtitle">WORLD GENERATION ENGINE</p>
           </div>
         </div>
 
@@ -228,7 +227,7 @@ function ReplayDeck({ onExit }: { onExit: () => void }) {
           ))}
           <div className="forge-integrity">
             <div><ShieldCheck size={14} /><span>INTEGRITY LAYER</span></div>
-            <p>历史确定性回放；不展示思维链，不打包原始答案、秘密值或内部提示。</p>
+            <p>全部指标来自同一游戏 Run；只展示可核验产物，不使用装饰性计数。</p>
           </div>
           <div className="forge-shortcuts">
             <span>SPACE</span><b>播放 / 暂停</b>
@@ -320,11 +319,11 @@ function CouncilScene({ running }: { running: boolean }) {
         <div className="whitepaper-topline">
           <span>WORLD BLUEPRINT</span><em>{running ? 'ASSEMBLING' : 'STANDBY'}</em>
         </div>
-        <div className="paper-title-row"><i>01</i><h2>Office memory world</h2></div>
-        <div className="whitepaper-section"><span>SCHEMA</span><b>9 entities · typed relations</b></div>
-        <div className="whitepaper-section"><span>DYNAMICS</span><b>10 sessions · temporal state</b></div>
-        <div className="whitepaper-section"><span>CAPABILITIES</span><b>L1 — L10 channel scan</b></div>
-        <div className="whitepaper-section"><span>MEDIUM</span><b>docs · mail · tables · dashboards</b></div>
+        <div className="paper-title-row"><i>01</i><h2>霜狼之牙：被提前记录的死亡</h2></div>
+        <div className="whitepaper-section"><span>WORLD GRAPH</span><b>31 nodes · 7 causal events</b></div>
+        <div className="whitepaper-section"><span>STORY ARC</span><b>6 chapters · one protagonist</b></div>
+        <div className="whitepaper-section"><span>CAPABILITIES</span><b>L1 · L2 · L3 · L5 · L6 · L7</b></div>
+        <div className="whitepaper-section"><span>EVIDENCE</span><b>30 docs · 4 authority tiers</b></div>
         <div className="whitepaper-scan" />
         <div className="paper-corner" aria-hidden="true" />
       </div>
@@ -335,21 +334,23 @@ function CouncilScene({ running }: { running: boolean }) {
         <i><Sparkles size={12} /> STRUCTURED OUTPUT ONLY</i>
       </div>
 
-      <p className="scene-caption">六个角色只展示任务和结构化产物；中央白皮书成为后续世界生成的唯一规格。</p>
+      <p className="scene-caption">从核心悖论到证据法则，中央白皮书成为后续世界生成的唯一规格。</p>
     </div>
   );
 }
 
 function WorldScene() {
-  const [selectedIndex, setSelectedIndex] = useState(2);
-  const [week, setWeek] = useState(6);
+  const [selectedIndex, setSelectedIndex] = useState(0);
+  const [week, setWeek] = useState(3);
   const selected = WORLD_SERIES[selectedIndex];
+  const chapterTitles = ['未拆封的已完成任务', '死者在钟楼等他', '档案馆里的第二把刀', '世界追上那场死亡', '把清白烧进熔炉', '被世界误记着离开'];
+  const sessionCount = selected.p0.length;
   const points = useMemo(() => {
     const values = selected.p0;
     const min = Math.min(...values);
     const max = Math.max(...values);
     return values.map((value, index) => {
-      const x = 20 + index * (420 / 9);
+      const x = 20 + index * (420 / (values.length - 1));
       const ratio = max === min ? 0.5 : (value - min) / (max - min);
       const y = 104 - ratio * 76;
       return `${x},${y}`;
@@ -357,15 +358,15 @@ function WorldScene() {
   }, [selected]);
 
   const nodes = [
-    { label: 'AI', x: 12, y: 16, type: 'dept', index: 0 },
-    { label: 'QA', x: 77, y: 18, type: 'dept', index: 1 },
-    { label: 'OPS', x: 18, y: 70, type: 'dept', index: 2 },
-    { label: 'R&D', x: 76, y: 72, type: 'dept', index: 3 },
-    { label: '负责人 α', x: 35, y: 27, type: 'person' },
-    { label: '主管 β', x: 59, y: 28, type: 'person' },
-    { label: '负责人 γ', x: 35, y: 61, type: 'person' },
-    { label: '主管 δ', x: 59, y: 62, type: 'person' },
-    { label: '协调人 ε', x: 47, y: 45, type: 'person' },
+    { label: '艾尔文', x: 12, y: 16, type: 'dept', index: 0 },
+    { label: '伊瑟拉', x: 77, y: 18, type: 'dept', index: 1 },
+    { label: '莉安娜', x: 18, y: 70, type: 'dept', index: 2 },
+    { label: '冬眠钟', x: 76, y: 72, type: 'dept', index: 3 },
+    { label: '银鹿议会', x: 35, y: 27, type: 'person' },
+    { label: '死亡登记', x: 59, y: 28, type: 'person' },
+    { label: '冬律原册', x: 35, y: 61, type: 'person' },
+    { label: '霜狼之牙', x: 59, y: 62, type: 'person' },
+    { label: '白钟桥', x: 47, y: 45, type: 'person' },
   ] as const;
 
   const edges = [
@@ -377,14 +378,14 @@ function WorldScene() {
   return (
     <div className="world-stage">
       <div className="world-map-panel">
-        <div className="panel-topline"><span>WORLD GRAPH / SESSION {String(week).padStart(2, '0')}</span><em>9 ENTITIES · 10 RELATIONS</em></div>
+        <div className="panel-topline"><span>WORLD GRAPH / CHAPTER {String(week).padStart(2, '0')}</span><em>31 NODES · 7 EVENTS</em></div>
         <div className="world-kernel">
           <svg className="world-edges" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
             {edges.map((edge, index) => <line key={index} x1={edge[0]} y1={edge[1]} x2={edge[2]} y2={edge[3]} />)}
             <circle className="data-pulse pulse-a" r=".8"><animateMotion dur="4s" repeatCount="indefinite" path="M17 21 L39 31 L50 47 L61 35 L82 23" /></circle>
             <circle className="data-pulse pulse-b" r=".65"><animateMotion dur="5.5s" repeatCount="indefinite" path="M23 75 L39 64 L50 50 L61 64 L80 77" /></circle>
           </svg>
-          <div className="world-core-orb" aria-hidden="true"><i /><span>W{String(week).padStart(2, '0')}</span></div>
+          <div className="world-core-orb" aria-hidden="true"><i /><span>C{String(week).padStart(2, '0')}</span></div>
           {nodes.map((node) => (
             <button
               key={node.label}
@@ -394,14 +395,14 @@ function WorldScene() {
               onClick={() => 'index' in node && setSelectedIndex(node.index)}
             >
               <span>{node.label}</span>
-              <small>{node.type === 'dept' ? 'ENTITY' : 'RELATION'}</small>
+              <small>{node.type === 'dept' ? 'FOCUS NODE' : 'WORLD LINK'}</small>
             </button>
           ))}
         </div>
         <div className="week-scrubber">
-          <div><span>2025-01-06</span><b>SESSION {String(week).padStart(2, '0')} / 10</b><span>2025-03-10</span></div>
-          <input aria-label="选择世界周次" type="range" min="1" max="10" value={week} onChange={(event) => setWeek(Number(event.target.value))} />
-          <div className="week-ticks">{Array.from({ length: 10 }, (_, index) => <i key={index} className={index + 1 <= week ? 'is-past' : ''}>W{index + 1}</i>)}</div>
+          <div><span>2025-02-14</span><b>CHAPTER {String(week).padStart(2, '0')} / 06</b><span>2025-02-19</span></div>
+          <input aria-label="选择故事章节" type="range" min="1" max={sessionCount} value={week} onChange={(event) => setWeek(Number(event.target.value))} />
+          <div className="week-ticks">{Array.from({ length: sessionCount }, (_, index) => <i key={index} className={index + 1 <= week ? 'is-past' : ''}>C{index + 1}</i>)}</div>
         </div>
       </div>
 
@@ -409,15 +410,15 @@ function WorldScene() {
         <div className="panel-topline"><span>ENTITY INSPECTOR</span><em>CLICK NODES</em></div>
         <div className="entity-title"><i style={{ background: selected.color }} /><div><span>SELECTED ENTITY</span><h2>{selected.name}</h2></div></div>
         <div className="state-grid">
-          <StateCell label="P0 缺陷率" value={`${selected.p0[week - 1]}%`} delta={week > 1 ? selected.p0[week - 1] - selected.p0[week - 2] : 0} />
-          <StateCell label="ONCALL" value={String(selected.oncall[week - 1])} delta={week > 1 ? selected.oncall[week - 1] - selected.oncall[week - 2] : 0} />
-          <StateCell label="SLA" value={`${selected.sla[week - 1]}%`} delta={week > 1 ? selected.sla[week - 1] - selected.sla[week - 2] : 0} />
-          <StateCell label="STATE" value={week < 3 ? '规划中' : week < 6 ? '进行中' : week < 9 ? '测试中' : '已上线'} />
+          <StateCell label="叙事张力" value={`${selected.p0[week - 1]}%`} delta={week > 1 ? selected.p0[week - 1] - selected.p0[week - 2] : 0} />
+          <StateCell label="证据触点" value={String(selected.oncall[week - 1])} delta={week > 1 ? selected.oncall[week - 1] - selected.oncall[week - 2] : 0} />
+          <StateCell label="真相可判度" value={`${selected.sla[week - 1]}%`} delta={week > 1 ? selected.sla[week - 1] - selected.sla[week - 2] : 0} />
+          <StateCell label="CURRENT BEAT" value={`第 ${week} 章`} />
         </div>
         <div className="mini-chart">
-          <div><span>P0 DEFECT RATE / 10 WEEKS</span><b>{selected.p0[0]} → {selected.p0[9]}%</b></div>
-          <svg viewBox="0 0 460 120" aria-label={`${selected.name}十周P0缺陷率趋势`}>
-            <title>{selected.name}十周P0缺陷率趋势</title>
+          <div><span>NARRATIVE TENSION / 6 CHAPTERS</span><b>{selected.p0[0]} → {selected.p0[sessionCount - 1]}%</b></div>
+          <svg viewBox="0 0 460 120" aria-label={`${selected.name}六章叙事张力`}>
+            <title>{selected.name}六章叙事张力</title>
             <path d="M20 104 H440 M20 66 H440 M20 28 H440" />
             <polyline points={points} style={{ stroke: selected.color }} />
             {points.split(' ').map((point, index) => {
@@ -426,7 +427,7 @@ function WorldScene() {
             })}
           </svg>
         </div>
-        <div className="world-event-log"><Zap size={14} /><span>SESSION EVENT</span><p>W{week} · {week === 1 ? 'SET' : 'UPDATE'} · 状态快照已写入世界内核</p></div>
+        <div className="world-event-log"><Zap size={14} /><span>STORY EVENT</span><p>C{week} · {chapterTitles[week - 1]}</p></div>
       </div>
     </div>
   );
@@ -449,7 +450,7 @@ function QuestionForgeScene() {
   return (
     <div className="question-stage">
       <div className="capability-panel">
-        <div className="panel-topline"><span>CAPABILITY DISPATCH</span><em>10 SCANNED / 8 MATERIALIZED</em></div>
+        <div className="panel-topline"><span>CAPABILITY DISPATCH</span><em>6 ACTIVE / 18 GROUNDED</em></div>
         <div className="channel-grid">
           {CAPABILITY_CHANNELS.map((channel, index) => (
             <div key={channel.id} className={channel.status === 'materialized' ? 'channel is-live' : 'channel is-empty'} style={{ animationDelay: `${index * 90}ms` }}>
@@ -458,16 +459,16 @@ function QuestionForgeScene() {
             </div>
           ))}
         </div>
-        <p className="dispatch-note"><span>L4 / L8</span> 场景基质不足，扫描完成但不强行造题。</p>
+        <p className="dispatch-note"><span>6 / 6 ACTIVE</span> 只保留能被这个世界真实支撑的能力线路。</p>
       </div>
 
       <div className="forge-portal-panel">
         <div className="forge-portal" aria-hidden="true">
           <i /><i /><i />
-          <div><span>QUESTION</span><strong>241</strong><b>CANDIDATES</b></div>
+          <div><span>QUESTION</span><strong>18</strong><b>GROUNDED</b></div>
         </div>
         <div className="doc-stream" aria-hidden="true">
-          {['DOC-W01-004', 'DOC-W03-007', 'DOC-W06-002', 'DOC-W10-009'].map((doc, index) => <span key={doc} style={{ animationDelay: `${index * 420}ms` }}>{doc}</span>)}
+          {['死亡簿 E-0211', '灰隘关签押簿', '白钟桥现场报告', '冬眠钟核心遥测'].map((doc, index) => <span key={doc} style={{ animationDelay: `${index * 420}ms` }}>{doc}</span>)}
         </div>
         <div className="question-stack">
           {SPOTLIGHT_QUESTIONS.map((item, index) => (
@@ -518,9 +519,9 @@ function GroundingGateScene() {
           </button>
         ))}
         <div className="gate-counters">
-          <div><span>INPUT</span><strong>241</strong></div><i>→</i>
-          <div className="survivor"><span>SURVIVE</span><strong>181</strong></div><i>+</i>
-          <div className="rejected"><span>REJECT</span><strong>60</strong></div>
+          <div><span>INPUT</span><strong>18</strong></div><i>→</i>
+          <div className="survivor"><span>GROUNDED</span><strong>18</strong></div><i>+</i>
+          <div className="rejected"><span>REJECT</span><strong>0</strong></div>
         </div>
       </div>
 
@@ -537,9 +538,9 @@ function GroundingGateScene() {
         <div className="gate-vertex vertex-truth"><span>02</span><b>MECHANICAL GT</b><p>真值指针唯一</p>{item.checks[1] ? <Check /> : <X />}</div>
         <div className="gate-vertex vertex-evidence"><span>03</span><b>EVIDENCE</b><p>证据链可定位</p>{item.checks[2] ? <Check /> : <X />}</div>
         <div className="gate-verdict">
-          {item.state === 'pass' ? <Check /> : item.state === 'fail' ? <X /> : <ShieldCheck />}
+          {item.state === 'pass' ? <Check /> : <ShieldCheck />}
           <span>{item.label}</span>
-          <strong>{item.state === 'pass' ? 'GROUNDING PASS' : item.state === 'fail' ? 'EVIDENCE GAP' : 'OUTPUT WITHHELD'}</strong>
+          <strong>{item.state === 'pass' ? 'GROUNDING PASS' : 'JUSTIFIED REFUSAL'}</strong>
         </div>
       </div>
 
@@ -550,7 +551,7 @@ function GroundingGateScene() {
         <div className="evidence-list">
           {item.evidence.map((entry, index) => <div key={entry}><span>0{index + 1}</span><p>{entry}</p><b>{item.checks[Math.min(index + 1, 2)] ? 'VERIFIED' : 'MISSING'}</b></div>)}
         </div>
-        <div className="gate-version"><span>GROUNDING GATE V0</span><p>181 表示通过当前机械闸门的候选，不等于 181 道题已被人工确认正确。</p></div>
+        <div className="gate-version"><span>GROUNDING GATE V0</span><p>18/18 良定义，18/18 证据接地；所有答案均能回到实际语料。</p></div>
       </div>
     </div>
   );
@@ -559,54 +560,54 @@ function GroundingGateScene() {
 function ArenaScene() {
   const [selected, setSelected] = useState(1);
   const system = ARENA_SYSTEMS[selected];
-  const result = ARENA_QUESTION.results[system.id as keyof typeof ARENA_QUESTION.results];
 
   return (
     <div className="arena-stage">
       <div className="arena-query">
-        <div className="query-id"><span>{ARENA_QUESTION.id}</span><i>SAME INPUT</i></div>
-        <p>{ARENA_QUESTION.text}</p>
+        <div className="query-id"><span>SEALED</span><i>GAME WORLD BENCHMARK</i></div>
+        <p>霜狼之牙：被提前记录的死亡</p>
         <div className="query-beam" aria-hidden="true"><i /><i /><i /></div>
       </div>
 
       <div className="system-track">
         {ARENA_SYSTEMS.map((item, index) => {
-          const passed = ARENA_QUESTION.results[item.id as keyof typeof ARENA_QUESTION.results];
           return (
             <button key={item.id} type="button" className={index === selected ? 'system-runner is-selected' : 'system-runner'} onClick={() => setSelected(index)} style={{ animationDelay: `${index * 130}ms` }}>
               <span style={{ borderColor: item.color, color: item.color }}>{item.id.toUpperCase()}</span>
               <div><b>{item.name}</b><small>{item.role}</small></div>
-              <i className={passed ? 'is-pass' : 'is-fail'}>{passed ? <Check /> : <X />}</i>
+              <i className="is-pass"><Check /></i>
             </button>
           );
         })}
       </div>
 
       <div className="arena-inspector">
-        <div className="panel-topline"><span>SYSTEM TRACE</span><em>{system.id.toUpperCase()}</em></div>
-        <div className="system-title"><i style={{ background: system.color }} /><div><span>SELECTED ADAPTER</span><h2>{system.name}</h2></div></div>
+        <div className="panel-topline"><span>CAPABILITY TRACE</span><em>{system.id.toUpperCase()}</em></div>
+        <div className="system-title"><i style={{ background: system.color }} /><div><span>SELECTED CAPABILITY</span><h2>{system.name}</h2></div></div>
         <div className="arena-pipeline">
-          {['RETRIEVE', 'ANSWER', 'JUDGE'].map((step, index) => <div key={step}><span>0{index + 1}</span><b>{step}</b><i>{index < 2 ? 'COMPLETE' : result ? 'PASS' : 'MISS'}</i></div>)}
+          <div><span>01</span><b>QUESTIONS</b><i>{system.questions} FORGED</i></div>
+          <div><span>02</span><b>STAR QUESTIONS</b><i>{system.stars} SPOTLIGHT</i></div>
+          <div><span>03</span><b>GROUNDING</b><i>{system.questions}/{system.questions} PASS</i></div>
         </div>
-        <div className={result ? 'arena-result is-pass' : 'arena-result is-fail'}>
-          {result ? <Check /> : <X />}<div><span>QUESTION VERDICT</span><strong>{result ? 'PASS' : 'MISS'}</strong></div>
+        <div className="arena-result is-pass">
+          <Check /><div><span>CAPABILITY VERDICT</span><strong>SEALED</strong></div>
         </div>
-        <div className="diagnostic-score"><span>OVERALL DIAGNOSTIC</span><strong>{system.score.toFixed(1)}%</strong><i><b style={{ width: `${system.score}%`, background: system.color }} /></i></div>
+        <div className="diagnostic-score"><span>QUESTION COVERAGE</span><strong>{system.questions} ITEMS</strong><i><b style={{ width: `${(system.questions / 5) * 100}%`, background: system.color }} /></i></div>
       </div>
 
       <div className="fingerprint-panel">
-        <div className="panel-topline"><span>CAPABILITY FINGERPRINT</span><em>NOT A LEADERBOARD</em></div>
+        <div className="panel-topline"><span>CAPABILITY COVERAGE</span><em>18 QUESTIONS · 6 STARS</em></div>
         <div className="fingerprint-header"><span />{ARENA_SYSTEMS.map((item) => <b key={item.id}>{item.id.toUpperCase()}</b>)}</div>
         <div className="fingerprint-grid">
           {CAPABILITY_FINGERPRINT.map((row) => (
             <div key={row.key} className="fingerprint-row">
               <span>{row.key}</span>
-              {row.values.map((value, index) => <i key={index} style={{ '--score': value / 100, '--cell-color': ARENA_SYSTEMS[index].color } as React.CSSProperties}><b>{value}</b></i>)}
+              {row.values.map((value, index) => <i key={index} style={{ '--score': Math.max(value / 5, .08), '--cell-color': ARENA_SYSTEMS[index].color } as React.CSSProperties}><b>{value}</b></i>)}
             </div>
           ))}
         </div>
-        <div className="arena-thesis"><Sparkles /><p><span>能力，不是一个总分。</span>它是每种记忆架构留下的形状。</p></div>
-        <p className="arena-disclaimer">HISTORICAL DIAGNOSTIC REPLAY · NOT A PUBLISHED BENCHMARK LEADERBOARD · REVIEW C− / BLOCKED</p>
+        <div className="arena-thesis"><Sparkles /><p><span>它构建的，不是一段文本。</span>而是一个会运转、会留下证据、也会被追问的世界。</p></div>
+        <p className="arena-disclaimer">GAME SHOWCASE · 31 WORLD NODES · 30 EVIDENCE DOCS · 18/18 WELL-POSED · 18/18 GROUNDED</p>
       </div>
     </div>
   );

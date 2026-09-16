@@ -28,6 +28,10 @@ TEXT_KINDS = ("person", "status", "category")           # 可注入矛盾的文�
 _RELIABILITY_TIERS: dict[str, int] = {
     AUTHORITATIVE_SRC: 2,                       # 官方通报
     **{src: 0 for src in RUMOR_SRCS},          # 各类传闻/小道,同档
+    # 策展型世界可明确区分“一手/物证”与“受污染官方记录”。
+    "独立一手记录": 3,
+    "独立物证链": 3,
+    "受污染的官方记录": 0,
 }
 _KNOWN_RULES = {"source_reliability"}          # 闸能证伪良定义的裁决规则(fail-closed:未知规则一律 drop)
 

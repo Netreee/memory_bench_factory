@@ -17,6 +17,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import config
 from pipeline.world_blueprint import (
     WorldBlueprintError,
     normalize_world_blueprint,
@@ -26,7 +27,8 @@ from pipeline.world_blueprint import (
     structure_signature,
     validate_world_blueprint,
 )
-from pipeline.central_office import (_assemble_whitepaper, _observed_blueprint_issues,
+from pipeline.central_office import (_assemble_whitepaper, _map_issues, _observed_blueprint_issues,
+                                     _remove_inferred_identity_fields,
                                      _repair_candidate_blueprint,
                                      _separate_observed_relation_fields, central_office)
 from pipeline.lines import prepare_lines
@@ -34,10 +36,15 @@ from pipeline.lines.L2_relational import RelationalLine
 from pipeline.lines.L4_preference import PreferenceLine
 from pipeline.prompts import render as render_prompt
 from pipeline.render import (_corpus_system, _filler_system,
-                             _missing_event_narratives, _session_facts)
-from pipeline.world_gen import (_canonicalize_generated_field_names,
-                                _wire_declared_causality, build_world)
-from pipeline.world_state import WorldState, assemble_world, _date_of
+                             _missing_event_narratives, _session_facts,
+                             _tracked_blocklist)
+from pipeline.world_gen import (WORLD_JSON_MAX_TOKENS,
+                                _canonicalize_generated_field_names,
+                                _partition_structure_driven_defects,
+                                _wire_declared_causality, build_world,
+                                imprint_structure)
+from pipeline.world_state import (WorldState, Timeline, Op, SET, UPDATE, EXPIRE,
+                                  assemble_world, _date_of)
 
 
 checks: list[tuple[bool, str]] = []
@@ -45,6 +52,10 @@ checks: list[tuple[bool, str]] = []
 
 def ck(name: str, cond) -> None:
     checks.append((bool(cond), name))
+
+
+ck("复杂世界 JSON 调用预算覆盖真实 reasoning 截断阈值",
+   WORLD_JSON_MAX_TOKENS == 16_384)
 
 
 def _game_whitepaper() -> dict:
@@ -279,6 +290,13 @@ ck("① observe 半空 range 仍 fail-closed",
 ck("① observe 畸形字段行返回明确 schema 问题而不崩溃",
    _observed_blueprint_issues(game, {"observed_fields": [42]})
    == ["observe.observed_fields[0] 必须是 object"])
+blank_evidence = _game_whitepaper()["world_blueprint"]
+blank_evidence["evidence_channels"] = ["", "无"]
+repaired_evidence, evidence_repairs = _repair_candidate_blueprint(
+    {"world_blueprint": blank_evidence}, {}, ["任务日志", "战斗记录"])
+ck("① evidence 由 medium 单一真源投影，不为同一空字段反复调用架构师",
+   repaired_evidence["world_blueprint"]["evidence_channels"] == ["任务日志", "战斗记录"]
+   and any("单一真源投影" in item for item in evidence_repairs))
 clean_media_views = _views_with_blueprint(_game_whitepaper())
 clean_media_views["observe"].update({
     "observed_media": ["", "无", "任务日志"],
@@ -351,6 +369,40 @@ same_field_bp = {
 }
 ck("② 跨类型同名字段约束一致则允许", validate_world_blueprint(
     normalize_world_blueprint(same_field_bp)) == [])
+
+reference_only_bp = deepcopy(same_field_bp)
+reference_only_bp["entity_types"][1]["fields"] = []
+reference_only_bp["event_types"][0] = {
+    "id": "changes", "label": "状态变更", "roles": {"subject": "a"},
+    "effect_fields": [{"role": "subject", "field": "状态"}], "min_count": 1,
+}
+ck("② 只作为关系目标的类型允许零领域字段",
+   validate_world_blueprint(normalize_world_blueprint(reference_only_bp)) == [])
+
+orphan_zero_field_bp = deepcopy(reference_only_bp)
+orphan_zero_field_bp["relation_types"] = []
+ck("② 零字段且不参与关系的孤立类型仍 fail-closed",
+   any("零字段时必须是 relation endpoint" in issue
+       for issue in validate_world_blueprint(orphan_zero_field_bp)))
+
+identity_wrapper = {"world_blueprint": deepcopy(same_field_bp)}
+identity_wrapper["world_blueprint"]["entity_types"][1]["fields"].append(
+    {"name": "名称", "kind": "text"})
+identity_repairs = _remove_inferred_identity_fields(identity_wrapper, {"observed_fields": []})
+ck("② 未观察且未引用的名称字段由 canonical name 去重",
+   bool(identity_repairs)
+   and not any(field.get("name") == "名称"
+               for field in identity_wrapper["world_blueprint"]["entity_types"][1]["fields"]))
+
+observed_identity_wrapper = {"world_blueprint": deepcopy(same_field_bp)}
+observed_identity_wrapper["world_blueprint"]["entity_types"][1]["fields"].append(
+    {"name": "名称", "kind": "text"})
+observed_identity_repairs = _remove_inferred_identity_fields(
+    observed_identity_wrapper, {"observed_fields": [{"name": "名称", "kind": "text"}]})
+ck("② few-shot 明示的身份字段仍是硬事实",
+   not observed_identity_repairs
+   and any(field.get("name") == "名称"
+           for field in observed_identity_wrapper["world_blueprint"]["entity_types"][1]["fields"]))
 
 reverse_owner_bp = deepcopy(same_field_bp)
 reverse_owner_bp["entity_types"][1]["fields"].append(
@@ -484,6 +536,17 @@ ck("② 真实 smoke 的跨类型悬空 reference 被清除且声明不丢失",
 idempotent_fixed, idempotent_repairs = repair_blueprint_candidate(none_owner_fixed)
 ck("② FK/min_count 归一幂等",
    idempotent_fixed == none_owner_fixed and idempotent_repairs == [])
+
+multi_role_bp = deepcopy(same_field_bp)
+multi_role_bp["event_types"][0].update({
+    "roles": {"old_subject": "b", "new_subject": "b"},
+    "effect_fields": [{"role": "new_subject", "field": "状态"}],
+})
+multi_role_fixed, multi_role_repairs = repair_blueprint_candidate(multi_role_bp)
+ck("② 同类型多事件角色确定性扩容到互异实体容量",
+   next(item for item in multi_role_fixed["entity_types"] if item["id"] == "b")["count"] == 2
+   and any("event 角色互异容量" in item for item in multi_role_repairs)
+   and validate_world_blueprint(normalize_world_blueprint(multi_role_fixed)) == [])
 
 reused_reference_bp = deepcopy(same_field_bp)
 reused_reference_bp["relation_types"].append({
@@ -757,10 +820,12 @@ class _BlueprintTracer:
 
     def __init__(self) -> None:
         self.calls: list[tuple[str, str]] = []
+        self.kwargs: list[tuple[str, dict]] = []
 
     def chat_json(self, tag, messages, **_kw):
         text = "\n".join(str(m.get("content", "")) for m in messages)
         self.calls.append((tag, text))
+        self.kwargs.append((tag, dict(_kw)))
         if tag.startswith("world.repair"):
             return {"fields": {}}
         return _typed_table()
@@ -772,6 +837,13 @@ prompt_text = "\n".join(text for tag, text in tracer.calls if tag.startswith("wo
 ck("③ prompt 消费全部 entity type", all(x in prompt_text for x in ("player", "boss", "equipment")))
 ck("③ prompt 消费 relation type", "equips" in prompt_text)
 ck("③ prompt 消费 event type", "defeat_boss" in prompt_text and "acquire_loot" in prompt_text)
+ck("③ event-owned 字段不从 entity batch 泄入 structure 初态",
+   '{"name": "熔岩巨兽", "type": "boss", "initial_state": {}}' in prompt_text)
+structure_kwargs = next(kwargs for tag, kwargs in tracer.kwargs if tag == "world.structure")
+ck("③ structure 固定模型、严格 JSON 且无内部重试",
+   structure_kwargs.get("model") == config.STRUCTURE_MODEL
+   and structure_kwargs.get("retries") == 1
+   and structure_kwargs.get("strict_json") is True)
 ck("③ prompt 消费 temporal cadence", "per_chapter" in prompt_text and "chapter" in prompt_text)
 ck("③ blueprint 的 session 数覆盖旧 shared_world_spec", ws.n_sessions == 4)
 ck("③ 每种声明类型达到 count", getattr(ws, "entity_types", {}) == {
@@ -781,6 +853,28 @@ ck("③ relation 编译进 source timeline", ws.timeline("旅者", "equipped_ite
 ck("③ event effect 编译进 target timeline", ws.timeline("熔岩巨兽", "defeat_status") is not None
    and ws.timeline("熔岩巨兽", "defeat_status").value_at_session(2) == "defeated")
 ck("③ event 实例留存在世界真源", any(e.get("id") == "evt-1" for e in getattr(ws, "events", [])))
+
+
+class _BatchErrorTracer:
+    """模拟内层三次重试已经耗尽后的显式调用失败。"""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def chat_json(self, tag, _messages, **_kw):
+        self.calls += 1
+        return {"__error__": "inner retries exhausted"}
+
+
+batch_error_tracer = _BatchErrorTracer()
+try:
+    build_world(build_wp, batch_error_tracer, log=lambda *_args: None)
+except WorldBlueprintError as exc:
+    batch_error_closed = "world.batch[player] 调用失败" in str(exc)
+else:
+    batch_error_closed = False
+ck("③ world.batch 内层失败后立即 fail-closed，不进入四轮外层重复",
+   batch_error_closed and batch_error_tracer.calls == 1)
 
 
 class _InvalidRepairTracer(_BlueprintTracer):
@@ -980,6 +1074,11 @@ ck("⑥ filler prompt 携带冻结世界的类型、事件和证据渠道",
 ck("⑥ filler 被约束为同世界旁支且禁止非办公场景套 OA 模板",
    "同一领域、同一叙事世界" in game_filler_system
    and "不得出现公司员工、OA、办公区、食堂培训" in game_filler_system)
+blocked_terms = _tracked_blocklist(compiled, {"field_schema": []})
+ck("⑥ filler 只禁被追踪专名，不禁同领域通用字段词",
+   set(compiled.entities) <= blocked_terms
+   and not ({field for fields in compiled.entities.values() for field in fields}
+            & blocked_terms))
 
 
 # ═══════ ⑦ central_office 先冻结世界，再映射能力 ═══════
@@ -994,10 +1093,12 @@ class _WorldFirstTracer:
 
     def __init__(self) -> None:
         self.calls: list[tuple[str, str]] = []
+        self.kwargs: list[tuple[str, dict]] = []
 
     def chat_json(self, tag, messages, **_kw):
         text = "\n".join(str(message.get("content", "")) for message in messages)
         self.calls.append((tag, text))
+        self.kwargs.append((tag, dict(_kw)))
         if tag == "council.observe":
             return {"observed_media": [], "observed_entities": [], "observed_fields": []}
         if tag == "council.skeptic":
@@ -1011,20 +1112,15 @@ class _WorldFirstTracer:
         if tag == "council.world":
             return {"world_blueprint": deepcopy(architect_blueprint)}
         if tag == "council.map":
-            return {"per_line": [{
-                "line": "L1_timeline", "applicable": True,
-                "instantiation": "只读已冻结的事件时序", "weight_hint": 0.5,
-            }]}
-        if tag == "council.critique":
-            return {
-                "active_lines": [
-                    {"line": "L1_timeline", "weight": 0.9, "why": "critic"},
-                    {"line": "L10_admission", "weight": 0, "why": "不适用但被错误塞回"},
-                ],
-                "domain_profile": {"entity_noun": "篡改主体", "field_schema": []},
-                "world_blueprint": deepcopy(critic_rewrite),
-                "shared_world_spec": {"entities": {"count": 999}},
-            }
+            return {"per_line": [
+                {"line": line_id, "applicable": line_id == "L1_timeline",
+                 "instantiation": "只读已冻结的事件时序" if line_id == "L1_timeline" else "",
+                 "gt_feasible": line_id == "L1_timeline",
+                 "weight_hint": 0.5 if line_id == "L1_timeline" else 0}
+                for line_id in (
+                    "L1_timeline", "L2_relational", "L3_process", "L4_preference",
+                    "L5_conflict", "L6_refusal", "L7_consolidation")
+            ]}
         raise AssertionError(f"未预期的 council tracer 调用:{tag}")
 
 
@@ -1039,18 +1135,37 @@ ck("⑦ world 严格先于 map",
    world_first_tags.index("council.world") < world_first_tags.index("council.map"))
 ck("⑦ 已删无执行效果的 world_review 调用",
    "council.world_review" not in world_first_tags)
+traps_kwargs = next(kwargs for tag, kwargs in world_first_tracer.kwargs
+                    if tag == "council.traps")
+ck("⑦ 可选 traps 视角只调用一次且严格 JSON",
+   traps_kwargs.get("retries") == 1 and traps_kwargs.get("strict_json") is True)
+ck("⑦ 已删可选全文 critic 重写，通过契约的草案直接定稿",
+   "council.critique" not in world_first_tags)
 ck("⑦ map prompt 收到架构师已冻结 blueprint，反方无权改写",
    "architect-draft-channel" in world_map_prompt
    and '"type": "defeat_boss"' not in world_map_prompt
    and '"id": "defeat_boss"' in world_map_prompt)
-ck("⑦ critic 无法改写已冻结 blueprint",
+ck("⑦ 定稿保留已冻结 blueprint",
    structure_signature(world_first_wp["world_blueprint"])
    == structure_signature(expected_frozen_blueprint)
    and "architect-draft-channel" in world_first_wp["world_blueprint"]["evidence_channels"]
    and "critic-illegal-rewrite" not in world_first_wp["world_blueprint"]["evidence_channels"]
    and world_first_wp["domain_profile"]["entity_noun"] == "玩家")
-ck("⑦ critic 不能把 line_mapping 的不适用零权重线塞回 active_lines",
+ck("⑦ line_mapping 的不适用零权重线不进 active_lines",
    [item["line"] for item in world_first_wp["active_lines"]] == ["L1_timeline"])
+world_architect_prompt = render_prompt("council.world")
+world_repair_prompt = render_prompt("council.world_repair")
+narrative_review_prompt = render_prompt("narrative.review")
+ck("⑦ states 只表达不可逆生命周期，可循环运行状态必须省略",
+   "不可逆" in world_architect_prompt and "必须省略 states" in world_architect_prompt
+   and "可循环运行状态必须删除 states" in world_repair_prompt)
+ck("⑦ 叙事审阅承认 CANON 文档日期与纯载体动作",
+   "period_label/document_date" in narrative_review_prompt and "文档载体动词" in narrative_review_prompt)
+complete_map = _WorldFirstTracer().chat_json("council.map", [])
+ck("⑦ map 完整性契约接受 L1–L7 各一次", _map_issues(complete_map) == [])
+ck("⑦ map 完整性契约拒绝缺 L6/L7",
+   any("缺失产线" in issue for issue in _map_issues(
+       {"per_line": complete_map["per_line"][:5]})))
 # 模型常把 schema 的 kind 注解误抄进 JSON key；只允许受蓝图白名单约束的安全归一。
 decorated_fields = _canonicalize_generated_field_names(
     {"当前任务(text)": {"type": "stable", "value": "调查"},
@@ -1061,6 +1176,79 @@ decorated_fields = _canonicalize_generated_field_names(
 ck("⑷ 已知 kind 后缀归一为蓝图字段",
    set(decorated_fields) >= {"当前任务", "任务状态"})
 ck("⑷ 未知字段不被冒充成合法字段", "未知字段" not in decorated_fields)
+
+# 模型也会直接把唯一的 kind 当作字段键；唯一映射可安全归一，多义映射必须拒绝。
+kind_alias_fields = _canonicalize_generated_field_names(
+    {"person": {"type": "stable", "value": "白泽"},
+     "status": {"type": "stable", "value": "空闲"},
+     "text": {"type": "stable", "value": "不可猜"}},
+    {"执行体名", "可用状态", "备注一", "备注二"},
+    [{"name": "执行体名", "kind": "person"},
+     {"name": "可用状态", "kind": "status"},
+     {"name": "备注一", "kind": "text"},
+     {"name": "备注二", "kind": "text"}],
+)
+ck("⑷ 唯一 kind 键归一为蓝图字段",
+   set(kind_alias_fields) >= {"执行体名", "可用状态"})
+ck("⑷ 多义 kind 键不猜测字段", "text" in kind_alias_fields)
+
+structural_defects, intrinsic_defects = _partition_structure_driven_defects(
+    [{"entity": "调用一", "field": "调用状态", "type": "illegal_transition"},
+     {"entity": "调用一", "field": "备注", "type": "fake_evolving"}],
+    {"调用一": "tool_call"},
+    {"tool_call": {"负责执行体"}},
+    {"tool_call": {"调用状态"}},
+)
+ck("⑷ 结构驱动字段缺陷只回到 structure 修复",
+   [item["field"] for item in structural_defects] == ["调用状态"])
+ck("⑷ 普通字段缺陷仍交字段 critic",
+   [item["field"] for item in intrinsic_defects] == ["备注"])
+
+def _numeric_timeline(values: list[str]) -> Timeline:
+    """构造可重现的数值时间线。"""
+    return Timeline([
+        Op(session=i, date=f"2025-01-{i + 1:02d}", op=SET if i == 0 else UPDATE,
+           value=value, prev=None if i == 0 else values[i - 1])
+        for i, value in enumerate(values)
+    ])
+
+
+typed_trend_blueprint = {
+    "entity_types": [{
+        "id": "report", "noun": "报告", "count": 4, "primary": True,
+        "fields": [{"name": "置信度", "kind": "numeric"},
+                   {"name": "事件分数", "kind": "numeric"}],
+    }],
+    "relation_types": [],
+    "event_types": [{
+        "id": "score", "roles": {"report": "report"},
+        "effect_fields": [{"role": "report", "field": "事件分数"}], "min_count": 1,
+    }],
+}
+typed_trend_world = WorldState(
+    entities={f"报告{i}": {
+        "置信度": _numeric_timeline(["0.2", "0.5", "0.3", "0.7", "0.4", "0.6"]),
+        "事件分数": _numeric_timeline(["1", "4", "2", "5", "3", "6"]),
+    } for i in range(4)},
+    n_sessions=6,
+    entity_types={f"报告{i}": "report" for i in range(4)},
+    world_blueprint=typed_trend_blueprint,
+)
+typed_trend_world.entities["报告0"]["置信度"].ops.append(
+    Op(session=6, date="2025-01-07", op=EXPIRE, value=None, prev="0.6"))
+event_before = [op.value for op in typed_trend_world.entities["报告0"]["事件分数"].ops]
+typed_planted = imprint_structure(
+    typed_trend_world, log=lambda *_args: None,
+    profile={"field_schema": [{"name": "置信度", "kind": "numeric"}],
+             "l7_max_trends": 4}, seed=7)
+ck("⑷ typed L7 只在内在 numeric 字段种足 4 条基质",
+   typed_planted == 4 and len(typed_trend_world._trended_fields) == 4
+   and {field for _entity, field in typed_trend_world._trended_fields} == {"置信度"})
+ck("⑷ typed L7 不改事件单一真源字段",
+   [op.value for op in typed_trend_world.entities["报告0"]["事件分数"].ops]
+   == event_before)
+ck("⑷ typed L7 保留停统操作供 L6 复用",
+   typed_trend_world.entities["报告0"]["置信度"].ops[-1].op == EXPIRE)
 
 npass = sum(1 for ok, _ in checks if ok)
 for ok, name in checks:

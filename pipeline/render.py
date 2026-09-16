@@ -3,7 +3,7 @@ pipeline.render —— 文本渲染层(从 run_factory_v2 拆出,行为不变)�
 把结构化产物渲染成自然语言文本:世界事实→语料文档(render_corpus + 助手),订单意图→题面(phrase_questions)。
 """
 from __future__ import annotations
-import json, threading, sys
+import json, re, threading, sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))   # 允许 `python pipeline/render.py` 直跑(找到根目录 config)
@@ -16,6 +16,15 @@ from pipeline.story import replay_story_ledger, review_narrative_supportedness
 
 LEAK_BANNED = ["当前", "现在", "最新", "目前", "截至目前", "迄今", "至今", "一直", "历来",
                "维持", "保持不变", "累计", "现任", "如今", "始终", "仍为", "仍是", "依旧"]
+
+# 单篇正文不需要 JSON 容器；保留 16384 预算以避免 reasoning 挤空正文。
+FILLER_TEXT_MAX_TOKENS = 16_384
+
+# filler 是无关草堆，没有生成凭据形态 token 的业务理由。这里只拦常见、足够长的
+# 机器凭据前缀，不尝试做复杂“秘密检测”，避免把普通连字符文本误判。
+_CREDENTIAL_TOKEN_RE = re.compile(
+    r"(?<![A-Za-z0-9_-])(?:sk-[A-Za-z0-9_-]{16,}|AKIA[A-Z0-9]{16}|"
+    r"gh[pousr]_[A-Za-z0-9]{20,})(?![A-Za-z0-9_-])")
 
 # 盲判别器"不确定/读不出"措辞(判别器明确表达"读不出"→ 该 atom 未忠实渲染)。
 _DISC_UNSURE = ["不确定", "无法确定", "读不出", "读不到", "不清楚", "未提及", "未提到",
@@ -55,22 +64,38 @@ def _strict_eq(read: str, gt: str) -> bool:
     return _dim_norm(read) == _dim_norm(gt)
 
 
-def _discriminate_one(docs, entity, field, tracer):
-    """派一个【盲读者 agent】只读 docs、答 (entity,field) 的值。
-    ★死钉①③:输入只有 docs(渲染正文)+ (entity,field),绝不喂 true_value/gt/fact_refs。
-    返回判别器读出的 answer 字符串(读不出/异常 → 返回 ''=不确定,绝不 fail-open 放行)。"""
-    try:
-        out = tracer.chat_json("render.discriminate",
-            [{"role": "system", "content": render("discriminate.system")},
-             {"role": "user", "content": render("discriminate.user",
-                                                docs="\n\n".join(d for d in docs if d),
-                                                entity=entity, field=field)}],
-            temperature=0.0, max_tokens=1024)
-    except Exception as e:                                # 调用/解析异常 → 当作读不出(参 judge.py:57-59),宁可重渲
-        print(f"[discriminate] 调用失败(计为读不出): {type(e).__name__}: {str(e)[:80]}")
-        return ""
-    ans = out.get("answer") if isinstance(out, dict) else None
-    return str(ans) if ans is not None else ""
+def _discriminate_many(docs, queries: list[dict], tracer) -> dict[str, str]:
+    """派一个盲读者一次回答同组文档的全部 ``entity/field`` 查询。
+
+    查询不含真值；返回值只在调用方与冻结真值逐项严格对账。调用层已经耗尽
+    网络/解析重试时立即失败，不能把服务错误伪装成“读不出”后重新渲染正文。
+    """
+    if not queries:
+        return {}
+    out = tracer.chat_json(
+        "render.discriminate",
+        [{"role": "system", "content": render("discriminate.system")},
+         {"role": "user", "content": render(
+             "discriminate.user",
+             docs="\n\n".join(d for d in docs if d),
+             queries=json.dumps(queries, ensure_ascii=False))}],
+        temperature=0.0, max_tokens=2048, model=config.DISCRIMINATOR_MODEL)
+    if not isinstance(out, dict) or "__error__" in out:
+        detail = out.get("__error__", "非 JSON object") if isinstance(out, dict) else "非 JSON object"
+        raise RuntimeError(f"render.discriminate 调用失败:{detail}")
+    rows = out.get("answers")
+    expected = [str(query.get("key")) for query in queries]
+    if not isinstance(rows, list) or any(
+            not isinstance(row, dict)
+            or row.get("key") is None
+            or row.get("answer") is None
+            for row in (rows if isinstance(rows, list) else [])):
+        raise RuntimeError("render.discriminate 协议失败:answers 必须是完整对象数组")
+    keys = [str(row["key"]) for row in rows]
+    if len(keys) != len(set(keys)) or set(keys) != set(expected):
+        raise RuntimeError(
+            f"render.discriminate 协议失败:期望 keys={expected},实际 keys={keys}")
+    return {str(row["key"]): str(row["answer"]) for row in rows}
 
 
 def _discriminator_recovers(docs, entity, field, true_value, tracer):
@@ -79,7 +104,8 @@ def _discriminator_recovers(docs, entity, field, true_value, tracer):
     - recovered=True  ⟺ 判别器读出的值与 true_value【量纲严格相等】(_strict_eq)= 忠实渲染。
     - recovered=False ⟺ 读不出/读成"不确定"/对不上(含双量纲 78%↔0.78、多跳歧义)= 未忠实渲染 → 进 missing。
     ★死钉①③:true_value 只在【本函数代码侧】用于对账,绝不进判别器 messages(判别器只收 docs+实体+字段)。"""
-    ans = _discriminate_one(docs, entity, field, tracer)
+    ans = _discriminate_many(
+        docs, [{"key": "q0", "entity": entity, "field": field}], tracer).get("q0", "")
     return (_strict_eq(ans, str(true_value)), ans)
 
 
@@ -176,10 +202,13 @@ def _missing_event_narratives(events, contents) -> list[str]:
 
 
 def _tracked_blocklist(ws, profile=None):
-    """草堆禁词表 = 实体名 + 字段名 + 所有【人名类字段】的取值(防 filler 撞被追踪的人名)。
+    """草堆禁词表 = 实体专名 + 所有【人名类字段】的取值。
+
+    通用字段词（如“状态”“工具”）不是答案泄漏：没有对应实体专名时无法指向
+    benchmark 事实。把它们列为禁词会与“保持同领域”形成不可满足约束。
     ★人名字段从白皮书 `field_schema.kind=="person"` 取(审计 ★1:删掉 '负责/汇报/经理' 中文子串启发式
     —— 那是 office 味、对非 office 域不可靠:medical 的「主治医师/会诊上级」一个 hint 都不匹配)。域知识只从白皮书来。"""
-    out = set(ws.entities) | {f for flds in ws.entities.values() for f in flds}
+    out = set(ws.entities)
     person_fields = {f.get("name") for f in _dicts((profile or {}).get("field_schema", [])) if f.get("kind") == "person"}
     for flds in ws.entities.values():
         for fname, tl in flds.items():
@@ -190,20 +219,53 @@ def _tracked_blocklist(ws, profile=None):
     return out
 
 
+def _accept_filler_text(out, blocked) -> list[dict]:
+    """验收单篇 filler 正文；空响应或撞冻结专名时直接失败。"""
+    if not isinstance(out, str) or not out.strip():
+        detail = (out.get("__error__", f"类型={type(out).__name__}")
+                  if isinstance(out, dict) else f"类型={type(out).__name__}")
+        raise RuntimeError(f"render.filler 调用/协议失败:{detail}")
+    content = out.strip()
+    leaks = sorted({str(term) for term in blocked if term and str(term) in content})
+    if leaks:
+        raise RuntimeError(f"render.filler 命中冻结专名:{leaks}")
+    if _CREDENTIAL_TOKEN_RE.search(content):
+        raise RuntimeError("render.filler 命中凭据形态 token")
+    return [{"type": "背景干扰文档", "content": content}]
+
+
+def _canonical_fact_refs(content: str, facts: list[dict], events: list[dict]) -> list[str]:
+    """从正文与冻结世界反推规范 ``entity.field`` / event-id 引用。"""
+    refs: list[str] = []
+    for fact in facts:
+        entity = str(fact.get("entity") or "")
+        field = str(fact.get("field") or "")
+        value = fact.get("value")
+        value_visible = value not in (None, "") and str(value) in content
+        stopped_visible = (fact.get("stopped")
+                           and any(word in content for word in ("停止", "不再", "终止", "暂停")))
+        if entity and field and entity in content and (value_visible or stopped_visible):
+            refs.append(f"{entity}.{field}")
+    refs.extend(
+        event.get("id") for event in events
+        if event.get("id") and _event_is_narrated(event, content)
+    )
+    return list(dict.fromkeys(ref for ref in refs if ref))
+
+
 def _sanitize_corpus(corpus: dict, ws, profile=None) -> dict:
     """收口语料元数据，尤其处理扩世界后的增量一致性。
 
-    - 信号文档若模型漏了 fact_refs，只从同 session 中在正文里逐字出现的
-      实体+真值（或完整事件参与者）反推；无法反推则删掉该文档。
+    - 所有信号文档的 fact_refs 都从同 session 冻结事实与正文重算；模型自报引用
+      不是真源。无法反推则删掉该文档。
     - 扩容后新实体名可能撞上旧 filler，此时删掉撞词 filler，不让草堆变证据。
     """
     blocked = {str(x) for x in _tracked_blocklist(ws, profile) if x}
-    blueprint = getattr(ws, "world_blueprint", None) or {}
-    event_labels = {item.get("id"): item.get("label") for item in blueprint.get("event_types", [])}
     events_by_session = {}
     for event in getattr(ws, "events", None) or []:
         events_by_session.setdefault(event.get("session"), []).append(event)
-    stats = {"inferred_refs": 0, "dropped_unref": 0, "dropped_filler_leaks": 0}
+    stats = {"canonicalized_refs": 0, "dropped_unref": 0,
+             "dropped_filler_leaks": 0, "dropped_filler_credentials": 0}
     for session in corpus.get("sessions", []):
         sid = session.get("session_id")
         facts = _session_facts(ws, sid)
@@ -211,50 +273,43 @@ def _sanitize_corpus(corpus: dict, ws, profile=None) -> dict:
         for doc in session.get("docs", []):
             content = str(doc.get("content") or "")
             if doc.get("is_filler") is True:
+                if _CREDENTIAL_TOKEN_RE.search(content):
+                    stats["dropped_filler_credentials"] += 1
+                    continue
                 if any(term in content for term in blocked):
                     stats["dropped_filler_leaks"] += 1
                     continue
                 doc["fact_refs"] = []
-            elif "_sig_" in str(doc.get("doc_id", "")) and not doc.get("fact_refs"):
-                refs = []
-                for fact in facts:
-                    entity, field, value = str(fact.get("entity") or ""), str(fact.get("field") or ""), fact.get("value")
-                    if entity and entity in content and ((value not in (None, "") and str(value) in content)
-                                                         or (fact.get("stopped") and any(x in content for x in ("停止", "不再", "终止", "暂停")))):
-                        refs.append(f"{entity}.{field}")
-                for event in events_by_session.get(sid, []):
-                    label = event_labels.get(event.get("type")) or event.get("label")
-                    participants = [str(x) for x in (event.get("participants") or {}).values() if x]
-                    if label and label in content and participants and all(x in content for x in participants):
-                        refs.append(f"{event.get('id')}.label")
-                doc["fact_refs"] = list(dict.fromkeys(refs))
+            elif "_sig_" in str(doc.get("doc_id", "")):
+                doc["fact_refs"] = _canonical_fact_refs(
+                    content, facts, events_by_session.get(sid, []))
                 if not doc["fact_refs"]:
                     stats["dropped_unref"] += 1
                     continue
-                stats["inferred_refs"] += 1
+                stats["canonicalized_refs"] += 1
             kept.append(doc)
         session["docs"] = kept
     return stats
 
 
-def _render_conflict_docs(ws, s, date, tracer):
-    """★L5:把 session==s 的小道矛盾值渲染成【低可信来源】文档(权威值由正常信号路径已渲,二者同周并存=语料真出现矛盾)。
-    无 ws.conflicts(非 L5 场景)→ 返回 [],对其它场景零副作用。"""
+def _render_conflict_docs(ws, s, date, _tracer):
+    """把冻结的 L5 小道值直接写成低可信文档，确保实体和值逐字可验。"""
     out = []
     for c in (getattr(ws, "conflicts", None) or []):
         if c.get("session") != s or not c.get("rumor_value"):
             continue
-        o = tracer.chat_json("render.conflict",
-            [{"role": "system", "content": render("conflict.system")},
-             {"role": "user", "content": render("conflict.user", s=week_label(s), date=date, entity=c["entity"],
-                                                time_unit=ws.period_unit(), field=c["field"], value=c["rumor_value"],
-                                                source=c.get("rumor_source", "小道消息"))}],
-            temperature=0.7, max_tokens=8192)
-        # ★不套 LEAK_BANNED:矛盾文档天然是"据传【现在/目前】X 是 Y"的当期传闻,撞防剧透词表会被全滤。
-        #   (LEAK_BANNED 是给【信号文档】防 KU 剧透的;小道文档是另一类——该说"现在"就说,正是冲突设定。)
-        for d in _dicts(o.get("docs") if isinstance(o, dict) else []):
-            if d.get("content"):
-                out.append(d)
+        entity = str(c["entity"])
+        field = str(c["field"])
+        rumor = str(c["rumor_value"])
+        source = str(c.get("rumor_source") or "小道消息")
+        authority = str(c.get("authoritative_source") or "官方记录")
+        content = (
+            f"【{source}·未经核实】{date}（第{week_label(s)}{ws.period_unit()}），"
+            f"有人声称“{entity}”的“{field}”是“{rumor}”。"
+            f"这条说法没有可核验的正式记录，也尚未得到{authority}确认；"
+            "现仅按待核实传闻留存，不应当作正式结论。"
+        )
+        out.append({"type": "待核实传闻", "content": content})
     return out
 
 
@@ -387,7 +442,9 @@ def render_corpus(wp, ws, target_tokens, tracer, corpus, done_weeks, save_cb, lo
     profile = wp.get("domain_profile", {})
     blueprint = getattr(ws, "world_blueprint", None) or wp.get("world_blueprint") or {}
     temporal = blueprint.get("temporal_model") or {}
-    time_unit = temporal.get("unit", "week")
+    # blueprint 保存稳定机器枚举（chapter/week），正文、日志和 reviewer 必须共享
+    # 同一个人类可读单位（章/周）；否则会生成“第5章”却授权“第5chapter”。
+    time_unit = ws.period_unit()
     step_days = int(temporal.get("step_days", 7) or 7)
     sys_sig = _corpus_system(profile, blueprint, wp.get("style_spec"))
     sys_fil = _filler_system(profile, blueprint)
@@ -426,7 +483,7 @@ def render_corpus(wp, ws, target_tokens, tracer, corpus, done_weeks, save_cb, lo
             sig_groups = _story_signal_groups(bysku, session_events)
         else:
             sig_groups = list(_chunk(list(bysku.items()), 2))   # 非剧情场景保持原两实体一组
-        n_batches = (filler_per_week + 5) // 6
+        n_batches = filler_per_week
 
         def _render_sig(grp):                             # ★信号块:渲全 + 渲对 —— 盲判别器据渲文能否唯一还原 (实体,字段) 才算渲到
             from pipeline.grounding import STOP_MARKERS    # ★只借停用标记(STOP_MARKERS);忠实检不再用 §G 的 attributed(死钉②不同尺)
@@ -452,15 +509,21 @@ def render_corpus(wp, ws, target_tokens, tracer, corpus, done_weeks, save_cb, lo
                 """★盲判别器忠实检(死钉①③):对每个 want_val atom 派一个盲读者只读 contents 答值,
                 代码量纲严格对账;对每个 want_stop atom 验停用标记同篇。
                 返回 (miss_val, miss_stop, miss_event)，供 missing/hint 管道复用。"""
-                # value atom:判别器并发(各 atom 独立),true_value 只在代码对账侧用,绝不进 prompt
-                def _one(item):
-                    e, fl, v = item
-                    ok, ans = _discriminator_recovers(contents, e, fl, v, tracer)
-                    if ok:
-                        return None
-                    read = "不确定" if (ans is None or _is_unsure(ans)) else ans
-                    return f"{e}的「{fl}」(应承载值={v}):盲读者据文档读出的是『{read}』,与应承载的值不一致/读不出"
-                miss_val = [m for m in config.pmap(_one, want_val, workers=8) if m]
+                # 同一组文档只让盲读者读一次；true_value 仍只在代码对账侧，绝不进 prompt。
+                queries = [
+                    {"key": f"q{index}", "entity": entity, "field": field}
+                    for index, (entity, field, _value) in enumerate(want_val)
+                ]
+                answers = _discriminate_many(contents, queries, tracer)
+                miss_val = []
+                for index, (entity, field, value) in enumerate(want_val):
+                    answer = answers.get(f"q{index}", "")
+                    if _strict_eq(answer, str(value)):
+                        continue
+                    read = "不确定" if _is_unsure(answer) else answer
+                    miss_val.append(
+                        f"{entity}的「{field}」(应承载值={value}):"
+                        f"盲读者据文档读出的是『{read}』,与应承载的值不一致/读不出")
                 # stopped atom:期望判别器读出"停止/不再统计"语义;此处复用 §G 停用标记同篇检(refusal 语义,非 _strict_eq)
                 miss_stop = [f"{e}的「{fl}」应让读者读出『自本期停止统计』,但文档未表达停用"
                              for (e, fl) in want_stop
@@ -512,6 +575,9 @@ def render_corpus(wp, ws, target_tokens, tracer, corpus, done_weeks, save_cb, lo
                     unsupported = review_narrative_supportedness(
                         tracer,
                         canon={"session": s, "facts": gf, "domain_events": group_events,
+                               "period_label": f"第{week_label(s)}{time_unit}",
+                               "document_date": date, "time_unit": time_unit,
+                               "allowed_document_scaffolding": ["日志记录", "档案登记", "通报提及"],
                                "allowed_past_context": story_context},
                         candidate=cand,
                         scope=f"game corpus session {s}")
@@ -544,7 +610,7 @@ def render_corpus(wp, ws, target_tokens, tracer, corpus, done_weeks, save_cb, lo
                 fallback_count.append(len(left))          # ★机械验收落点(语义改为"弃段计数"):汇总进末尾日志
                 ents = sorted({m.split("的「")[0] for m in left})
                 log(f"  ⚠fail-loud弃段[{time_unit}{week_label(s)}]:{len(left)} 个 atom 多轮重渲后盲读者仍不可还原,弃段不入库({ents})")
-                if group_events:
+                if story_ledger and group_events:
                     raise RuntimeError(
                         f"game narrative 渲染失败:{time_unit}{week_label(s)} 仍有 {len(left)} 个未通过项")
                 return []
@@ -552,17 +618,21 @@ def render_corpus(wp, ws, target_tokens, tracer, corpus, done_weeks, save_cb, lo
                 _attach_story_provenance(grp_docs, group_events, story_scenes)
             return grp_docs
 
-        def _render_fil(ci):                              # 一个草堆批
-            want = min(6, filler_per_week - ci * 6)
-            if want <= 0:
-                return []
-            out = tracer.chat_json("render.filler",
+        filler_failures: list[str] = []
+
+        def _render_fil(_ci):                             # 一次只生成一篇纯正文
+            out = tracer.chat_text("render.filler",
                 [{"role": "system", "content": sys_fil},
                  {"role": "user", "content": render("filler.user", s=week_label(s), time_unit=time_unit,
-                                                      date=date, want=want, blocked=sorted(blocked)[:30])}],
-                temperature=0.9, max_tokens=8192)
-            return [d for d in _dicts(out.get("docs") if isinstance(out, dict) else [])
-                    if d.get("content") and not any(b in d.get("content", "") for b in blocked)]
+                                                      date=date)}],
+                temperature=0.9, max_tokens=FILLER_TEXT_MAX_TOKENS)
+            try:
+                return _accept_filler_text(out, blocked)
+            except RuntimeError as error:
+                # filler 只提供草堆密度，不承载任何 gold。单篇协议失败显式记账并跳过；
+                # 最终仍以总语料字符下限 fail-closed，不重试也不伪造替代正文。
+                filler_failures.append(str(error))
+                return []
 
         sig_lists = config.pmap(_render_sig, sig_groups, workers=8)              # 周内并发(全局信号量才是真上限)
         with lock:                                         # 周乱序完成 → 锁内更新+逐周存盘(断点续渲不丢)
@@ -575,6 +645,9 @@ def render_corpus(wp, ws, target_tokens, tracer, corpus, done_weeks, save_cb, lo
                 by_id[s] = {"session_id": s, "date": date, "docs": docs}   # 旧 docs 原样保留,只增量
             else:                                          # 全量:本周 signal + filler + 小道矛盾,整周写入
                 fil_lists = config.pmap(_render_fil, list(range(n_batches)), workers=8)
+                if filler_failures:
+                    log(f"  ⚠{time_unit}{week_label(s)} filler 缺失 {len(filler_failures)}/{n_batches}:"
+                        f"{filler_failures[:2]}")
                 docs = []                                  # 周内顺序编号,避免 race(doc_id 含 s,跨周不撞)
                 for gl in sig_lists:
                     for d in gl:
@@ -594,7 +667,7 @@ def render_corpus(wp, ws, target_tokens, tracer, corpus, done_weeks, save_cb, lo
             save_cb()
             ch = sum(len(dd.get("content", "")) for x in corpus["sessions"] for dd in x["docs"])
             tag = "delta+" if delta_mode else ""
-            log(f"  [{time_unit} {s} ✓{tag} {len(done_weeks)}/{n_sessions}] 累计 {sum(len(x['docs']) for x in corpus['sessions'])} 篇 / {ch/1e6:.2f}M 字")
+            log(f"  [{time_unit} {week_label(s)} ✓{tag} {len(done_weeks)}/{n_sessions}] 累计 {sum(len(x['docs']) for x in corpus['sessions'])} 篇 / {ch/1e6:.2f}M 字")
         return s
 
     config.pmap(_render_week, weeks, workers=max(1, len(weeks)))   # ★周并行;在飞 API 由全局 LLM_CONCURRENCY 兜住
@@ -623,10 +696,15 @@ def render_corpus(wp, ws, target_tokens, tracer, corpus, done_weeks, save_cb, lo
             raise RuntimeError(f"game narrative 缺 canonical event 正文证据:{missing_events}")
     if any(sanitized.values()):
         save_cb()
-        log(f"  ✓ 语料收口:补 fact_refs {sanitized['inferred_refs']} 篇 / "
+        log(f"  ✓ 语料收口:规范化 fact_refs {sanitized['canonicalized_refs']} 篇 / "
             f"弃无引用信号 {sanitized['dropped_unref']} 篇 / "
-            f"清理扩容后撞词 filler {sanitized['dropped_filler_leaks']} 篇")
+            f"清理扩容后撞词 filler {sanitized['dropped_filler_leaks']} 篇 / "
+            f"清理凭据形态 filler {sanitized['dropped_filler_credentials']} 篇")
     ch = sum(len(dd.get("content", "")) for x in corpus["sessions"] for dd in x["docs"])
+    if ch < target_tokens:
+        save_cb()
+        raise RuntimeError(
+            f"语料字符不足:{ch}/{target_tokens}；filler 可单篇缺失，但总规模合同不允许欠账")
     fb = f";⚠fail-loud弃段 {len(fallback_count)} 处/{sum(fallback_count)} 个 atom 未忠实渲染(验收要求趋零)" if fallback_count else ";弃段 0(✓)"
     log(f"  ✓ 渲染完成:{sum(len(x['docs']) for x in corpus['sessions'])} 篇 / {ch/1e6:.2f}M 字(目标 {target_tokens/1e6:.1f}M){fb}")
 
@@ -638,31 +716,38 @@ def phrase_questions(orders, wp, tracer, log=print) -> list[dict]:
     def _ph(o):                                           # 每条订单独立 → 并发出题
         line = line_for(o.get("line", ""))                # 出题意图/须隐藏 = 各产线自己的 intent()
         if line is None:                                  # 兜底(订单都来自已建线,理论不触发)
-            return {**o, "question": ""}
+            return {**o, "question": "", "_phrase_fallback": False}
         intent, hide = line.intent(o)
         # ★确定性出题 bypass(L9 闭选项 MC):选项串必须逐字保真、LLM 润色会打乱选项/丢 gold → 破坏纯代码 EM。
         #   直接用 intent 原文作题面(它已是完整可答的 MC 题,含 held-out x* + 全部选项)。
         if getattr(line, "deterministic_phrasing", False):
-            return {**o, "question": intent}
+            return {**o, "question": intent, "_phrase_fallback": False}
         out = tracer.chat_json("phrase",
             [{"role": "system", "content": PHRASE_SYS},
              {"role": "user", "content": render("phrase.user", intent=intent, hide=hide)}],
             temperature=0.5, max_tokens=2048)
         q = out.get("question", "") if isinstance(out, dict) else ""
         q = q if isinstance(q, str) else ""
+        fell_back = not q.strip()
+        if fell_back:
+            # intent 是产线代码生成、已被良定义闸验证过的完整可答题面；润色模型只负责
+            # 表达，不拥有订单生杀权。协议失败时直接保留真源，不丢掉已验证的供给。
+            q = intent
         # ★主语保真兜底(Q49 悬空代词根治):phrase 偶尔把主语专名改成"他/该案"丢了指代。实体名核(前4字)
         #   若整个没在题面出现 → 退回 intent 原文(它必含实体名、是完整可答问题)。比"禁代词"软规则多一道硬保证。
         ent = (o.get("entity") or "").strip()
         if q and ent and ent[:4] not in q:
             q = intent
-        return {**o, "question": q}
+            fell_back = True
+        return {**o, "question": q, "_phrase_fallback": fell_back}
     raw = config.pmap(_ph, orders, workers=8)
+    fallback_count = sum(bool(q.pop("_phrase_fallback", False)) for q in raw)
     qs = [q for q in raw if q.get("question", "").strip()]    # 丢并发下偶发的空题面
     dropped = len(raw) - len(qs)
     by_line = {}
     for q in qs:
         by_line[q.get("line", "?")] = by_line.get(q.get("line", "?"), 0) + 1
-    log(f"  ④ 出题:{len(qs)} 题已润色(丢空 {dropped};桥实体/答案不进题面);by_line {by_line}")
+    log(f"  ④ 出题:{len(qs)} 题完成(原意图保真 {fallback_count};丢空 {dropped};桥实体/答案不进题面);by_line {by_line}")
     return qs
 
 
@@ -702,18 +787,18 @@ def _self_test() -> bool:
                 if "命中率" in docs:
                     m = _re.search(r"命中率[为是:]?\s*([0-9.]+%?)", docs)
                     if m:
-                        return {"answer": m.group(1)}
+                        return {"answers": [{"key": "q0", "answer": m.group(1)}]}
                 # 负责人歧义:文档里出现两个不同负责人 → 盲读者答"不确定"
                 if "负责人" in docs:
                     names = set(_re.findall(r"负责人[为是:]?\s*([一-龥]{2,3})", docs))
                     if len(names) == 1:
-                        return {"answer": names.pop()}
-                    return {"answer": "不确定"}    # 多负责人歧义 / 读不出
+                        return {"answers": [{"key": "q0", "answer": names.pop()}]}
+                    return {"answers": [{"key": "q0", "answer": "不确定"}]}    # 多负责人歧义 / 读不出
                 # K=V 句 "X本期「Y」为Z":抠 Z
                 m = _re.search(r"为([0-9.]+%?)", docs)
                 if m:
-                    return {"answer": m.group(1)}
-                return {"answer": "不确定"}
+                    return {"answers": [{"key": "q0", "answer": m.group(1)}]}
+                return {"answers": [{"key": "q0", "answer": "不确定"}]}
         return _T()
 
     # (a) 干净自然句:命中率0.78 → 判别器还原 0.78 → pass
@@ -747,9 +832,87 @@ def _self_test() -> bool:
     leaked = any(kw in p for p in (_fake_tracer_factory().seen_prompts or [""]) for kw in ("真值", "gt", "应承载", "true_value"))
     ck("死钉③:判别器 prompt 不含 gt/真值字样", not leaked)
     # 直接验 prompt 构造:user 模板只含 docs+entity+field,不含我们传的 true_value 关键标记
-    sample_user = render("discriminate.user", docs="文档正文", entity="某实体", field="某字段")
+    sample_user = render("discriminate.user", docs="文档正文",
+                         queries='[{"key":"q0","entity":"某实体","field":"某字段"}]')
     ck("死钉③:user 模板只含 docs/entity/field", "某实体" in sample_user and "某字段" in sample_user
        and "真值" not in sample_user and "gt" not in sample_user.lower())
+
+    class _BulkTracer:
+        def __init__(self):
+            self.calls = 0
+            self.models = []
+
+        def chat_json(self, _step, _messages, **_kw):
+            self.calls += 1
+            self.models.append(_kw.get("model"))
+            return {"answers": [{"key": "q0", "answer": "甲"},
+                                  {"key": "q1", "answer": "乙"}]}
+
+    bulk_tracer = _BulkTracer()
+    bulk_answers = _discriminate_many(
+        ["一篇同时承载多个字段的文档"],
+        [{"key": "q0", "entity": "实体A", "field": "字段A"},
+         {"key": "q1", "entity": "实体B", "field": "字段B"}],
+        bulk_tracer)
+    ck("同组多字段只调用一次盲读者", bulk_tracer.calls == 1
+       and bulk_answers == {"q0": "甲", "q1": "乙"}
+       and bulk_tracer.models == [config.DISCRIMINATOR_MODEL])
+
+    class _DuplicateKeyTracer:
+        def chat_json(self, _step, _messages, **_kw):
+            return {"answers": [{"key": "q0", "answer": "甲"},
+                                  {"key": "q0", "answer": "乙"}]}
+
+    try:
+        _discriminate_many(
+            ["正文"],
+            [{"key": "q0", "entity": "实体A", "field": "字段A"},
+             {"key": "q1", "entity": "实体B", "field": "字段B"}],
+            _DuplicateKeyTracer())
+        duplicate_rejected = False
+    except RuntimeError:
+        duplicate_rejected = True
+    ck("批量盲读严格拒绝重复或缺失 key", duplicate_rejected)
+
+    class _NoConflictLLM:
+        def chat_json(self, *_args, **_kwargs):
+            raise AssertionError("L5 传闻不应调用模型")
+
+    class _ConflictWorld:
+        conflicts = [{
+            "entity": "旧地址解析工件核对",
+            "field": "调用状态",
+            "session": 2,
+            "rumor_value": "执行中",
+            "rumor_source": "内部群聊转述",
+            "authoritative_source": "官方通报",
+        }]
+
+        @staticmethod
+        def period_unit():
+            return "轮"
+
+    conflict_docs = _render_conflict_docs(_ConflictWorld(), 2, "2025-01-08", _NoConflictLLM())
+    ck("L5 传闻由冻结合同确定性渲染且不调模型", len(conflict_docs) == 1)
+    ck("L5 传闻逐字承载实体和值并标明低可信",
+       all(token in conflict_docs[0]["content"] for token in
+           ("旧地址解析工件核对", "调用状态", "执行中", "未经核实", "官方通报")))
+
+    ck("filler 单篇纯正文通过且由代码固定类型",
+       _accept_filler_text("外围执行体完成无关归档任务。", {"冻结实体"})
+       == [{"type": "背景干扰文档", "content": "外围执行体完成无关归档任务。"}])
+    for name, bad, blocked in (
+        ("filler 拒绝 JSON 对象壳", {"content": "外围记录"}, set()),
+        ("filler 拒绝空正文", "  ", set()),
+        ("filler 拒绝冻结专名泄漏", "冻结实体的状态", {"冻结实体"}),
+        ("filler 拒绝凭据形态 token", "外围日志记录 sk-exampleToken123456后轮转", set()),
+    ):
+        try:
+            _accept_filler_text(bad, blocked)
+            rejected = False
+        except RuntimeError:
+            rejected = True
+        ck(name, rejected)
 
     npass = sum(1 for ok, _ in checks if ok)
     for ok, name in checks:

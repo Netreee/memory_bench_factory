@@ -155,12 +155,29 @@ def relation_owner_side(blueprint: dict, relation: dict) -> str | None:
     return "from" if source_owns else "to"
 
 
+def event_role_requirements(blueprint: dict) -> dict[str, int]:
+    """返回一次事件实例为保持角色互异，各实体类型至少需要的实例数。"""
+    required: dict[str, int] = {}
+    for event in blueprint.get("event_types") or []:
+        if not isinstance(event, dict):
+            continue
+        multiplicity = Counter(
+            type_id for type_id in (event.get("roles") or {}).values()
+            if isinstance(type_id, str) and type_id
+        )
+        for type_id, count in multiplicity.items():
+            required[type_id] = max(required.get(type_id, 0), count)
+    return required
+
+
 def repair_blueprint_candidate(value: dict) -> tuple[dict, list[str]]:
     """纯函数修复模型候选中可确定的 FK 归属与最小实例数。
 
     标量 FK 放在实体数更多的一端（并列稳定选 ``from``）；如果字段已经只在
     一个端点声明，则尊重该端点。函数不删除关系或事件，只删除未被任何关系
-    使用的 ``reference`` 字段，并把非法的 ``min_count`` 收敛到 1。
+    使用的 ``reference`` 字段，把非法的 ``min_count`` 收敛到 1，并为同类型
+    的多个事件角色提供足够的互异实体。声明为 exact 的类型不擅自扩容，留给
+    蓝图硬校验要求模型重设计事件。
     """
     repaired = deepcopy(value)
     if not isinstance(repaired, dict):
@@ -269,6 +286,14 @@ def repair_blueprint_candidate(value: dict) -> tuple[dict, list[str]]:
         if isinstance(minimum, bool) or not isinstance(minimum, int) or minimum < 1:
             event["min_count"] = 1
             repairs.append(f"event {event.get('id') or '?'}.min_count→1")
+
+    for type_id, required in event_role_requirements(blueprint).items():
+        entity_type = types.get(type_id)
+        if not entity_type or entity_type.get("cardinality_policy") == "exact":
+            continue
+        if _entity_count(entity_type) < required:
+            entity_type["count"] = required
+            repairs.append(f"entity {type_id}.count→{required}(event 角色互异容量)")
 
     bound_fields: set[tuple[str, str]] = set()
     for relation in raw_relations:
@@ -389,6 +414,12 @@ def validate_world_blueprint(bp: dict) -> list[str]:
     global_fields: dict[str, tuple[str, tuple]] = {}
     fields_by_type: dict[str, set[str]] = {}
     field_specs_by_type: dict[str, dict[str, dict]] = {}
+    relation_endpoints = {
+        endpoint
+        for relation in (bp.get("relation_types") or []) if isinstance(relation, dict)
+        for endpoint in (relation.get("from_type"), relation.get("to_type"))
+        if isinstance(endpoint, str)
+    }
     for t in entity_types:
         tid = t.get("id")
         if not isinstance(t.get("noun"), str) or not t.get("noun") or t.get("noun") != t.get("noun").strip():
@@ -400,9 +431,13 @@ def validate_world_blueprint(bp: dict) -> list[str]:
             issues.append(
                 f"entity type {tid or '?'} cardinality_policy 只允许 exact；可增长类型直接省略")
         fields = t.get("fields") or []
-        if not isinstance(fields, list) or (not fields and not bp.get("legacy_adapter")):
-            issues.append(f"entity type {tid or '?'} fields 至少一个")
+        if not isinstance(fields, list):
+            issues.append(f"entity type {tid or '?'} fields 必须是 list")
             fields = []
+        elif not fields and not bp.get("legacy_adapter") and tid not in relation_endpoints:
+            issues.append(
+                f"entity type {tid or '?'} 零字段时必须是 relation endpoint，"
+                "否则只是不可观察的孤立专名集合")
         names: list[str] = []
         for f in fields:
             if (not isinstance(f, dict) or not isinstance(f.get("name"), str)
@@ -560,6 +595,14 @@ def validate_world_blueprint(bp: dict) -> list[str]:
             if (not isinstance(role, str) or not role or role != role.strip()
                     or not isinstance(tid, str) or tid != tid.strip() or tid not in type_map):
                 issues.append(f"event {eid or '?'} role 引用不存在:{role}->{tid}")
+        for tid, required in Counter(roles.values()).items():
+            entity_type = type_map.get(tid) or {}
+            count = entity_type.get("count")
+            if (isinstance(count, int) and not isinstance(count, bool)
+                    and count < required):
+                issues.append(
+                    f"event {eid or '?'} 的 {required} 个 {tid} 角色必须由互异实体承担，"
+                    f"但该类型 count={count}")
         effects = event.get("effect_fields") or []
         if not isinstance(effects, list) or not effects:
             issues.append(f"event {eid or '?'} effect_fields 至少一个")
@@ -582,6 +625,12 @@ def validate_world_blueprint(bp: dict) -> list[str]:
                 issues.append(
                     f"event {eid or '?'} effect 不得写实体身份字段 {tid}.{fld};"
                     "事件必须改变状态/数值/可变属性，不能把实体专名重复 SET 给名称字段")
+        duplicate_effects = [pair for pair, count in Counter(
+            (effect.get("role"), effect.get("field"))
+            for effect in effects if isinstance(effect, dict)
+        ).items() if count > 1]
+        if duplicate_effects:
+            issues.append(f"event {eid or '?'} effect_fields 重复:{duplicate_effects}")
         minimum = 0 if bp.get("legacy_adapter") else 1
         if (isinstance(event.get("min_count"), bool) or not isinstance(event.get("min_count"), int)
                 or event.get("min_count", -1) < minimum):

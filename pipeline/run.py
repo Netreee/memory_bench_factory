@@ -12,7 +12,12 @@ from dataclasses import dataclass
 from typing import Callable
 from contextlib import contextmanager
 from copy import deepcopy
-import fcntl, json, os, time, threading, sys
+import errno, json, os, time, threading, sys
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))                       # 保证 config 可导入(Tracer 用)
@@ -50,7 +55,10 @@ def _env_snapshot() -> dict:
     而非读 config 此刻的 env(历史 run / 中途改过 env 都会失真)。★api_key 绝不入快照。"""
     try:
         import config
-        return {"model": config.MODEL, "llm_concurrency": config.LLM_CONCURRENCY,
+        return {"model": config.MODEL,
+                "discriminator_model": config.DISCRIMINATOR_MODEL,
+                "structure_model": config.STRUCTURE_MODEL,
+                "llm_concurrency": config.LLM_CONCURRENCY,
                 "base_url": config.BASE_URL or ""}
     except Exception:
         return {}
@@ -79,11 +87,27 @@ class Tracer:
             self._log(self.n, step, messages, out, kw, ok, latency_ms)
         return out
 
+    def chat_text(self, step, messages, **kw):
+        """记录一次只要求自然语言正文的调用；异常仍作为显式失败返回。"""
+        import config
+        t0 = time.time()
+        try:
+            out = config.chat(messages, **kw)
+            ok = isinstance(out, str) and bool(out.strip())
+        except Exception as e:
+            out, ok = {"__error__": str(e)[:120]}, False
+        latency_ms = int((time.time() - t0) * 1000)
+        with self._lock:
+            self.n += 1
+            self._log(self.n, step, messages, out, kw, ok, latency_ms)
+        return out
+
     def _log(self, i, step, messages, out, kw, ok=True, latency_ms=0):
         rec = {"i": i, "ts": time.time(), "latency_ms": latency_ms, "ok": ok, "step": step,
                "system": next((m["content"] for m in messages if m["role"] == "system"), ""),
                "user": next((m["content"] for m in messages if m["role"] == "user"), ""),
-               "params": {k: v for k, v in kw.items() if k in ("temperature", "max_tokens")},
+               "params": {k: v for k, v in kw.items()
+                          if k in ("temperature", "max_tokens", "model", "retries", "strict_json")},
                "out_preview": json.dumps(out, ensure_ascii=False)[:600] if isinstance(out, (dict, list)) else str(out)[:600]}
         with self.pfile.open("a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
@@ -134,20 +158,34 @@ class Run:
     @contextmanager
     def stage_write_lock(self, stage_name: str):
         """以非阻塞进程锁保证同一 Run 同时只有一个 stage 写入。"""
-        lock_file = (self.dir / ".run.lock").open("a+", encoding="utf-8")
+        lock_file = (self.dir / ".run.lock").open("a+b")
         acquired = False
         try:
             try:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                if os.name == "nt":
+                    lock_file.seek(0, os.SEEK_END)
+                    if lock_file.tell() == 0:
+                        lock_file.write(b"\0")
+                        lock_file.flush()
+                    lock_file.seek(0)
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
                 acquired = True
-            except BlockingIOError as exc:
+            except OSError as exc:
+                if exc.errno not in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
+                    raise
                 raise RuntimeError(
                     f"Run {self.run_id} 正由另一进程写入，拒绝并发执行 stage {stage_name}"
                 ) from exc
             yield
         finally:
             if acquired:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                if os.name == "nt":
+                    lock_file.seek(0)
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
             lock_file.close()
 
     # ── manifest(单一真相)──
@@ -344,6 +382,23 @@ def _update_run_metadata(run: Run, *, algo: dict | None = None,
         run._save_manifest()
 
 
+def _dependent_stage_names(stage_name: str, stages: list[Stage]) -> list[str]:
+    """按 ``needs`` 求一个 stage 的传递后继，并保持注册顺序。
+
+    线性位置不是依赖关系：questions 与 corpus 是两条并行分支，强制重出题只应
+    失效最终 grounding，不能把完全不读 questions 的昂贵 corpus 一并作废。
+    """
+    affected = {stage_name}
+    changed = True
+    while changed:
+        changed = False
+        for stage in stages:
+            if stage.name not in affected and any(need in affected for need in stage.needs):
+                affected.add(stage.name)
+                changed = True
+    return [stage.name for stage in stages if stage.name in affected]
+
+
 # ════════════════════════════════════════════════════════════════════════════
 # driver:按 stage 序列跑 [from,to] 区间(或 only 单步);幂等跳过已完成(除非 force)
 # ════════════════════════════════════════════════════════════════════════════
@@ -369,8 +424,8 @@ def drive(run: Run, stages: list, from_stage=None, to_stage=None, only=None, for
             if run.is_done(nm) and not force:
                 run.log(f"⏭  跳过 {nm}(已完成;--force 重跑)")
                 continue
-            _run_stage_locked(run, nm, st.fn, st.artifact,
-                              names if force else None)
+            invalidated = _dependent_stage_names(nm, stages) if force else None
+            _run_stage_locked(run, nm, st.fn, st.artifact, invalidated)
     _finalize_run(run, names)
 
 

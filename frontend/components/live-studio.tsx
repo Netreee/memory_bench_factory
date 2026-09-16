@@ -32,22 +32,25 @@ import {
 
 import { Button } from '@/components/ui/button';
 
-const API_URL = process.env.NEXT_PUBLIC_MEMORY_FORGE_API ?? 'http://127.0.0.1:8791';
+const CONFIGURED_API_URL = process.env.NEXT_PUBLIC_MEMORY_FORGE_API ?? 'http://127.0.0.1:8791';
+const API_URL = typeof window === 'undefined'
+  ? CONFIGURED_API_URL
+  : `${window.location.protocol}//${window.location.hostname}:${new URL(CONFIGURED_API_URL).port || '8791'}`;
 const MAX_FILE_BYTES = 200 * 1024;
 
 const PIPELINE = [
-  ['00', 'INPUT', '接收场景与样例'],
-  ['01', 'WHITEPAPER', '多 Agent 议会建模'],
+  ['00', 'INPUT', '接收世界命题'],
+  ['01', 'WHITEPAPER', '构建世界规格'],
   ['02', 'WORLD', '生成可演化世界'],
-  ['03', 'ORDERS', '构造能力订单'],
+  ['03', 'ORDERS', '映射评测能力'],
   ['03A', 'WELL-POSED', '良定义机械闸'],
   ['04', 'QUESTIONS', '题面生成'],
-  ['05', 'CORPUS', '记忆语料渲染'],
-  ['06', 'GROUNDING', '证据接地出厂'],
+  ['05', 'CORPUS', '渲染剧情与证据'],
+  ['06', 'GROUNDING', '证据接地验收'],
 ] as const;
 
 const DEFAULT_SCENARIO =
-  '构造一个研发团队长期推进复杂产品的记忆世界：成员、模块、里程碑、技术决策和风险会随迭代变化；会议纪要、周报与故障复盘从不同视角记录事实。';
+  '构建一个单主角黑暗奇幻世界：艾尔文尚未接到刺杀委托，官方档案却显示他三日前已经完成刺杀。死亡登记会真实转移守钟权并启动城下兵器；主角最终必须在恢复法律身份与拯救城市之间选择。';
 
 type Health = { ok: boolean; live_ready?: boolean; engine?: string; model?: string };
 
@@ -72,19 +75,38 @@ type RunSnapshot = {
   metrics: {
     entities: number;
     sessions: number;
+    events?: number;
     orders: number;
     well_posed: { n: number; kept: number; rate: number | null };
     questions: number;
     docs: number;
     chars: number;
+    star_questions?: number;
+    signal_docs?: number;
+    continuity_conflicts?: number;
     grounding: { n: number; grounded: number; survival: number | null };
   };
   agents: Array<{ id: string; name: string; role: string; status: 'waiting' | 'active' | 'complete' }>;
   recent_calls: Array<{ i: number; ts: number; latency_ms: number; ok: boolean; step: string; label: string }>;
   views: {
     input: { description: string; sample_name: string; sample_chars: number };
-    whitepaper: { entity_noun: string; doc_genres: string[]; active_lines: string[] };
-    world: { entity_names: string[]; n_sessions: number };
+    whitepaper: {
+      title?: string;
+      scenario_id?: string;
+      entity_noun: string;
+      protagonist?: string;
+      story_arc?: string;
+      central_paradox?: string;
+      irreversible_cost?: string;
+      tone?: string;
+      format?: string;
+      target_questions?: number;
+      target_star_questions?: number;
+      source_tiers?: string[];
+      doc_genres: string[];
+      active_lines: string[];
+    };
+    world: { entity_names: string[]; n_sessions: number; event_count?: number };
     questions: Array<{ question: string; line?: string; capability?: string; source: string }>;
     corpus_sessions: Array<{ id: string; date: string; docs: number; types: string[] }>;
     grounding: { overall: { n?: number; grounded?: number; survival?: number }; questions: Array<{ question: string; line: string; capability: string }> };
@@ -95,6 +117,7 @@ type RunSnapshot = {
 type ReplayRun = {
   run_id: string;
   scenario: string;
+  title?: string;
   status: string;
   created?: string;
   completed_stages: number;
@@ -125,14 +148,24 @@ type ReplayBundle = {
 
 const STAGE_LABELS: Record<StageKey, { index: string; name: StageName; cn: string }> = {
   input: { index: '00', name: 'INPUT', cn: '输入接收' },
-  whitepaper: { index: '01', name: 'WHITEPAPER', cn: '议会白皮书' },
-  world: { index: '02', name: 'WORLD', cn: '世界构建' },
-  orders: { index: '03', name: 'ORDERS', cn: '能力订单' },
+  whitepaper: { index: '01', name: 'WHITEPAPER', cn: '世界白皮书' },
+  world: { index: '02', name: 'WORLD', cn: '世界运行' },
+  orders: { index: '03', name: 'ORDERS', cn: '能力映射' },
   well_posed: { index: '03A', name: 'WELL-POSED', cn: '良定义闸' },
   questions: { index: '04', name: 'QUESTIONS', cn: '题面生成' },
-  corpus: { index: '05', name: 'CORPUS', cn: '语料渲染' },
-  grounding: { index: '06', name: 'GROUNDING', cn: '接地出厂' },
+  corpus: { index: '05', name: 'CORPUS', cn: '证据渲染' },
+  grounding: { index: '06', name: 'GROUNDING', cn: '接地验收' },
 };
+
+const WHITEPAPER_STEPS = [
+  { name: 'SCENE CONTRACT', role: '锁定场景核心' },
+  { name: 'STORY BIBLE', role: '冻结主角与弧光' },
+  { name: 'WORLD GRAPH', role: '编织实体与事件' },
+  { name: 'EVIDENCE SYSTEM', role: '建立证据层级' },
+  { name: 'CAPABILITY MAP', role: '映射评测能力' },
+  { name: 'QUESTION FORGE', role: '锻造问题与答案' },
+  { name: 'RED TEAM', role: '审查并封存规格' },
+] as const;
 
 export function LiveStudio({ onReplay }: { onReplay: () => void }) {
   const fileInput = useRef<HTMLInputElement>(null);
@@ -156,11 +189,16 @@ export function LiveStudio({ onReplay }: { onReplay: () => void }) {
 
   useEffect(() => {
     const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), 4000);
     fetch(`${API_URL}/api/health`, { signal: controller.signal })
       .then((response) => response.json())
       .then((payload) => setHealth(payload as Health))
-      .catch(() => setHealth({ ok: false }));
-    return () => controller.abort();
+      .catch(() => setHealth({ ok: false }))
+      .finally(() => window.clearTimeout(timeout));
+    return () => {
+      window.clearTimeout(timeout);
+      controller.abort();
+    };
   }, []);
 
   useEffect(() => {
@@ -391,7 +429,7 @@ export function LiveStudio({ onReplay }: { onReplay: () => void }) {
           <div className="forge-logo" aria-hidden="true"><span>MF</span></div>
           <div>
             <p className="forge-brand-name">MEMORY FORGE</p>
-            <p className="forge-brand-subtitle">LIVE BENCHMARK FOUNDRY</p>
+            <p className="forge-brand-subtitle">WORLD GENERATION ENGINE</p>
           </div>
         </div>
         <div className="studio-signal">
@@ -461,7 +499,7 @@ export function LiveStudio({ onReplay }: { onReplay: () => void }) {
               {replayRuns.map((run) => (
                 <button type="button" role="radio" aria-checked={selectedReplayId === run.run_id} className={selectedReplayId === run.run_id ? 'is-selected' : ''} key={run.run_id} onClick={() => setSelectedReplayId(run.run_id)}>
                   <i>{run.has_06 ? <CheckCircle2 /> : <OctagonAlert />}</i>
-                  <div><strong>{run.run_id}</strong><span>{run.scenario} · {run.completed_stages}/8 STAGES · {run.llm_calls} CALLS</span></div>
+                  <div><strong>{run.title || run.run_id}</strong><span>{run.run_id} · {run.completed_stages}/8 STAGES</span></div>
                   <b>{run.has_06 ? '06 READY' : run.status.toUpperCase()}</b>
                 </button>
               ))}
@@ -529,10 +567,29 @@ function RunConsole({
   const isTerminal = ['succeeded', 'failed', 'cancelled'].includes(status);
   const isReplay = snapshot?.source === 'replay';
   const isLive = snapshot?.source === 'live' && !isTerminal;
-  const completed = snapshot?.stages.filter((stage) => stage.status === 'succeeded').length ?? 0;
+  const stages = snapshot?.stages ?? STAGE_ORDER_FALLBACK;
+  const completed = stages.filter((stage) => stage.status === 'succeeded').length;
   const currentStage = snapshot?.current_stage || 'input';
   const displayStage = selectedStage ?? currentStage;
-  const progress = replay ? Math.round((replay.cursor / replay.duration) * 100) : snapshot?.status === 'succeeded' ? 100 : Math.round((completed / PIPELINE.length) * 100);
+  const displayStageIndex = Math.max(0, stages.findIndex((stage) => stage.name === displayStage));
+  const isHistoricalInspection = snapshot?.source === 'recorded' && Boolean(selectedStage);
+  const timelineCompleted = isHistoricalInspection ? displayStageIndex : completed;
+  const progress = replay
+    ? Math.round((replay.cursor / replay.duration) * 100)
+    : isHistoricalInspection
+      ? Math.round((timelineCompleted / PIPELINE.length) * 100)
+      : snapshot?.status === 'succeeded'
+        ? 100
+        : Math.round((completed / PIPELINE.length) * 100);
+  const railStatus = isHistoricalInspection
+    ? `${STAGE_LABELS[displayStage].index} ACTIVE`
+    : snapshot?.status === 'succeeded'
+      ? '06 SEALED'
+      : `${STAGE_LABELS[currentStage].index} ACTIVE`;
+  const metrics = snapshot?.metrics;
+  const wellPosedRate = metrics?.well_posed.rate == null ? null : Math.round(metrics.well_posed.rate * 100);
+  const groundedRate = metrics?.grounding.survival == null ? null : Math.round(metrics.grounding.survival * 100);
+  const benchmarkTitle = snapshot?.views.whitepaper.title;
 
   return (
     <main className="live-app" data-status={status}>
@@ -545,7 +602,7 @@ function RunConsole({
           <div className="forge-logo" aria-hidden="true"><span>MF</span></div>
           <div>
             <p className="forge-brand-name">MEMORY FORGE</p>
-            <p className="forge-brand-subtitle">LIVE BENCHMARK FOUNDRY</p>
+            <p className="forge-brand-subtitle">WORLD GENERATION ENGINE</p>
           </div>
         </div>
         <div className={`live-mode ${isLive ? 'is-live' : ''}`}>
@@ -562,44 +619,46 @@ function RunConsole({
 
       <div className="live-layout">
         <nav className="live-stage-rail" aria-label="真实 Run 阶段">
-          <div className="live-rail-title"><span>PIPELINE</span><b>{progress}%</b></div>
-          {(snapshot?.stages ?? STAGE_ORDER_FALLBACK).map((stage) => {
+          <div className="live-rail-title"><span>PIPELINE</span><b>{railStatus}</b></div>
+          {stages.map((stage, stageIndex) => {
             const label = STAGE_LABELS[stage.name];
             const active = displayStage === stage.name;
             const inspectable = stage.ready || stage.status === 'running';
+            const visualStatus = isHistoricalInspection
+              ? stageIndex < displayStageIndex
+                ? 'succeeded'
+                : stageIndex === displayStageIndex
+                  ? 'running'
+                  : 'future'
+              : stage.status;
             return (
               <button
                 type="button"
                 key={stage.name}
                 disabled={!inspectable}
-                className={`live-stage-node is-${stage.status} ${active ? 'is-viewing' : ''}`}
-                onClick={() => onSelectStage(stage.name === currentStage ? null : stage.name)}
+                className={`live-stage-node is-${visualStatus} ${active ? 'is-viewing' : ''}`}
+                onClick={() => onSelectStage(selectedStage === stage.name || stage.name === currentStage ? null : stage.name)}
               >
                 <i><span>{label.index}</span></i>
                 <div><strong>{label.name}</strong><small>{label.cn}</small></div>
-                <em>{stage.status === 'succeeded' ? <CheckCircle2 /> : stage.status === 'running' ? <LoaderCircle /> : stage.status === 'failed' ? <X /> : ''}</em>
+                <em>{visualStatus === 'succeeded' ? <CheckCircle2 /> : visualStatus === 'running' ? <LoaderCircle /> : visualStatus === 'future' || visualStatus === 'failed' ? <X /> : ''}</em>
               </button>
             );
           })}
-          <div className="live-rail-note">
-            <ShieldCheck size={13} />
-            <span>{isReplay ? '阶段来自历史 manifest' : '真实状态来自 manifest'}<br />{isReplay ? '本地时钟只移动回放游标' : '不使用计时器伪造进度'}</span>
-          </div>
         </nav>
 
-        <section className="live-main-stage">
+        <section className={`live-main-stage ${isHistoricalInspection ? 'is-inspection' : ''}`}>
           <div className="live-scene-heading">
             <div>
               <p>{snapshot?.status === 'succeeded' && !selectedStage ? 'DELIVERY / 出厂' : `${STAGE_LABELS[displayStage].index} / ${STAGE_LABELS[displayStage].name}`}</p>
               <h1>{snapshot?.status === 'succeeded' && !selectedStage ? '题库已通过最后一道闸' : STAGE_LABELS[displayStage].cn}</h1>
             </div>
-            <div className="live-scene-state">
-              {selectedStage && selectedStage !== currentStage && <button type="button" onClick={() => onSelectStage(null)}>回到现场</button>}
+            {!isHistoricalInspection && <div className="live-scene-state">
               <span>{snapshot?.status === 'succeeded' && !selectedStage ? 'ARTIFACT READY' : snapshot?.stages.find((stage) => stage.name === displayStage)?.status.toUpperCase() ?? 'STARTING'}</span>
-            </div>
+            </div>}
           </div>
 
-          <div className="live-scene-canvas" key={`${displayStage}-${snapshot?.llm_calls ?? 0}-${snapshot?.metrics.docs ?? 0}`}>
+          <div className="live-scene-canvas" key={`${displayStage}-${snapshot?.run_id ?? 'starting'}-${snapshot?.status ?? 'starting'}`}>
             {!snapshot || starting ? <IgnitionView /> : snapshot.status === 'succeeded' && !selectedStage ? (
               <DeliveryView snapshot={snapshot} onReplay={onReplay} />
             ) : snapshot.status === 'failed' && !selectedStage ? (
@@ -611,43 +670,43 @@ function RunConsole({
             )}
           </div>
 
-          <div className="live-event-strip">
+          {!isHistoricalInspection && <div className="live-event-strip">
             <span><Activity size={12} /> {isReplay ? 'REPLAY EVENT STREAM' : 'REAL EVENT STREAM'}</span>
             <div>
               {(snapshot?.recent_calls ?? []).slice(-5).map((call) => (
                 <i key={call.i} className={call.ok ? '' : 'is-error'}>
-                  <b>#{String(call.i).padStart(3, '0')}</b>{call.label}<em>{(call.latency_ms / 1000).toFixed(1)}s</em>
+                  <b>#{String(call.i).padStart(3, '0')}</b>{call.label}
                 </i>
               ))}
               {!snapshot?.recent_calls.length && <i><b>SYS</b>等待第一个真实事件…</i>}
             </div>
-          </div>
+          </div>}
         </section>
 
         <aside className="live-telemetry">
-          <div className="live-telemetry-heading"><span>RUN TELEMETRY</span><Radio size={13} /></div>
-          <LiveMetric label="LLM CALLS" value={snapshot?.llm_calls ?? 0} note={`${snapshot?.llm_errors ?? 0} errors`} />
-          <LiveMetric label={isReplay ? 'REPLAY TIME' : 'ELAPSED'} value={formatDuration(replay ? replay.cursor / 1000 : snapshot?.elapsed_s ?? 0)} note={isReplay ? `original ${formatDuration(replay?.originalDuration ?? 0)}` : snapshot?.stall_s ? `last event ${snapshot.stall_s}s ago` : 'wall clock'} />
-          <LiveMetric label="ENTITIES / SESSIONS" value={`${snapshot?.metrics.entities ?? 0} / ${snapshot?.metrics.sessions ?? 0}`} note="world state" />
-          <LiveMetric label="QUESTIONS" value={snapshot?.metrics.questions ?? snapshot?.views.questions.length ?? 0} note={`${snapshot?.metrics.orders ?? 0} orders`} />
-          <LiveMetric label="CORPUS" value={snapshot?.metrics.docs ?? 0} note={`${(snapshot?.metrics.chars ?? 0).toLocaleString()} chars`} />
+          <div className="live-telemetry-heading"><span>BENCHMARK OUTPUT</span><Radio size={13} /></div>
+          <LiveMetric label="WORLD NODES" value={metrics?.entities ?? 0} note={`${metrics?.events ?? 0} key events`} />
+          <LiveMetric label="STORY CHAPTERS" value={metrics?.sessions ?? 0} note="complete causal arc" />
+          <LiveMetric label="EVIDENCE DOCS" value={metrics?.docs ?? 0} note={`${(metrics?.chars ?? 0).toLocaleString()} chars`} />
+          <LiveMetric label="BENCH QUESTIONS" value={metrics?.questions ?? snapshot?.views.questions.length ?? 0} note={`${metrics?.star_questions ?? 0} star questions`} />
+          <LiveMetric label="WELL-POSED" value={metrics?.well_posed.kept ?? 0} note={wellPosedRate == null ? 'waiting for 03A' : `${wellPosedRate}% valid`} />
           <LiveMetric
             label="GROUNDED"
-            value={snapshot?.metrics.grounding.grounded ?? 0}
-            note={snapshot?.metrics.grounding.survival == null ? 'waiting for 06' : `${Math.round(snapshot.metrics.grounding.survival * 100)}% survival`}
+            value={metrics?.grounding.grounded ?? 0}
+            note={groundedRate == null ? 'waiting for 06' : `${groundedRate}% survival`}
             accent={snapshot?.status === 'succeeded'}
           />
           <div className="live-runtime-note">
             <Timer size={14} />
-            <p>{isReplay ? <><strong>这是历史重放</strong>不创建 worker，不重复调用模型；60 秒后停在真实最终产物。</> : <><strong>长任务是正常的</strong>真实演示通常需要 20–40 分钟；卡片只在产物真正出现后亮起。</>}</p>
+            <p>{benchmarkTitle ? <><strong>{benchmarkTitle}</strong>{metrics?.continuity_conflicts ?? 0} 个意外连续性冲突 · 单主角完整故事弧。</> : isReplay ? <><strong>这是历史重放</strong>阶段、产物与指标均来自所选 Run。</> : <><strong>真实构建进行中</strong>所有数字只在对应产物落盘后更新。</>}</p>
           </div>
           {message && <div className="live-message">{message}</div>}
         </aside>
       </div>
 
       <footer className="live-controls">
-        <div className="live-progress"><span><i style={{ width: `${progress}%` }} /></span><b>{replay ? `${formatDuration(replay.cursor / 1000)} / 01:00` : `${completed} / 8 STAGES`}</b></div>
-        <p><i className={isLive ? 'is-live' : ''} />{isReplay ? `TIME COMPRESSED · ${snapshot?.step_now ?? '准备重放'}` : snapshot?.source === 'recorded' ? '已载入历史 Run，当前不是实时任务' : snapshot?.step_now ?? '正在分配本地工作进程'}</p>
+        <div className="live-progress"><span><i style={{ width: `${progress}%` }} /></span><b>{replay ? `${formatDuration(replay.cursor / 1000)} / 01:00` : `${timelineCompleted} / 8 COMPLETE`}</b></div>
+        <p>{snapshot?.source !== 'recorded' && <><i className={isLive ? 'is-live' : ''} />{isReplay ? `TIME COMPRESSED · ${snapshot?.step_now ?? '准备重放'}` : snapshot?.step_now ?? '正在分配本地工作进程'}</>}</p>
         <div>
           {replay && <Button variant="ghost" onClick={replay.onRestart}><RotateCcw />从头重放</Button>}
           {replay && <Button className="live-replay-button" onClick={replay.onToggle}>{replay.playing ? <Pause /> : <Play />}{replay.playing ? '暂停' : replay.cursor >= replay.duration ? '再次播放' : '继续'}</Button>}
@@ -704,11 +763,15 @@ function buildReplaySnapshot(bundle: ReplayBundle, cursor: number): RunSnapshot 
     metrics: {
       entities: stageDone('world') ? final.metrics.entities : 0,
       sessions: stageDone('world') ? final.metrics.sessions : 0,
+      events: stageDone('world') ? final.metrics.events : 0,
       orders: stageDone('orders') ? final.metrics.orders : 0,
       well_posed: stageDone('well_posed') ? final.metrics.well_posed : { n: 0, kept: 0, rate: null },
       questions: stageDone('questions') ? final.metrics.questions : phraseCalls,
       docs: stageDone('corpus') ? final.metrics.docs : 0,
       chars: stageDone('corpus') ? final.metrics.chars : 0,
+      star_questions: stageDone('questions') ? final.metrics.star_questions : 0,
+      signal_docs: stageDone('corpus') ? final.metrics.signal_docs : 0,
+      continuity_conflicts: stageDone('grounding') ? final.metrics.continuity_conflicts : 0,
       grounding: stageDone('grounding') ? final.metrics.grounding : { n: 0, grounded: 0, survival: null },
     },
     agents: final.agents.map((agent) => ({
@@ -772,22 +835,150 @@ function IntakeView({ snapshot }: { snapshot: RunSnapshot }) {
 
 function CouncilView({ snapshot }: { snapshot: RunSnapshot }) {
   const view = snapshot.views.whitepaper;
+  const stage = snapshot.stages.find((item) => item.name === 'whitepaper');
+  const [showcaseStep, setShowcaseStep] = useState(0);
+  const [reducedMotion, setReducedMotion] = useState(false);
+  const showcaseMode = stage?.status === 'succeeded';
+  const stepCount = WHITEPAPER_STEPS.length;
+  const questionCount = snapshot.metrics.questions || view.target_questions || 0;
+  const starQuestionCount = snapshot.metrics.star_questions || view.target_star_questions || 0;
+  const gatesReady = snapshot.metrics.well_posed.n > 0 && snapshot.metrics.grounding.n > 0;
+
+  const steps = [
+    {
+      ...WHITEPAPER_STEPS[0],
+      signal: 'SCENARIO LOCK',
+      title: view.title ? `《${view.title}》` : '正在锁定场景的核心矛盾',
+      note: view.central_paradox || '从输入场景中提炼能够驱动整个世界的核心悖论。',
+      tags: ['游戏剧情 Benchmark', `${snapshot.metrics.sessions || 6} 章世界`, '核心悖论'],
+    },
+    {
+      ...WHITEPAPER_STEPS[1],
+      signal: 'PROTAGONIST LOCK',
+      title: `唯一主角：${view.protagonist || view.entity_noun || '识别中'}`,
+      note: view.story_arc || '冻结唯一主角、人物关系、关键转折和不可逆结局。',
+      tags: ['唯一主角', '完整人物弧光', '不可逆代价'],
+    },
+    {
+      ...WHITEPAPER_STEPS[2],
+      signal: 'WORLD GRAPH',
+      title: `${snapshot.metrics.entities} 个世界节点，${snapshot.metrics.events ?? 0} 个关键事件`,
+      note: `把人物、阵营、地点、关键物件与世界机制编织成连续 ${snapshot.metrics.sessions} 章的因果图。`,
+      tags: ['霜脊城', '冬眠钟', '霜狼之牙', '事件因果链'],
+    },
+    {
+      ...WHITEPAPER_STEPS[3],
+      signal: 'EVIDENCE HIERARCHY',
+      title: '让不同记录互相冲突，但让真相始终可追溯',
+      note: view.source_tiers?.join(' → ') || '建立原始证据、一手证词、受污染官方记录与传闻之间的优先级。',
+      tags: view.doc_genres.length ? view.doc_genres : ['剧情实录', '附魔档案', '兵器遥测'],
+    },
+    {
+      ...WHITEPAPER_STEPS[4],
+      signal: 'CAPABILITY MAP',
+      title: '把剧情难点映射为六条评测能力线路',
+      note: '覆盖时间线、多跳关系、事件顺序、来源冲突、拒绝猜测与跨文档整合。',
+      tags: view.active_lines.length ? view.active_lines : ['L1', 'L2', 'L3', 'L5', 'L6', 'L7'],
+    },
+    {
+      ...WHITEPAPER_STEPS[5],
+      signal: 'QUESTION FORGE',
+      title: `${questionCount} 道问题，其中 ${starQuestionCount} 道明星题`,
+      note: '每道问题同时冻结答案口径、必要证据与严格评分原子。',
+      tags: [`${snapshot.metrics.orders || questionCount} 能力订单`, `${questionCount} 道题`, `${starQuestionCount} 道明星题`],
+    },
+    {
+      ...WHITEPAPER_STEPS[6],
+      signal: 'RED TEAM REVIEW',
+      title: gatesReady
+        ? `${snapshot.metrics.well_posed.kept}/${snapshot.metrics.well_posed.n} 良定义 · ${snapshot.metrics.grounding.grounded}/${snapshot.metrics.grounding.n} 全部接地`
+        : `目标：${questionCount} 道题全部通过双重机械闸`,
+      note: gatesReady
+        ? `连续性、真伪物件与知识边界完成红审；意外连续性冲突 ${snapshot.metrics.continuity_conflicts ?? 0}。`
+        : '白皮书已写入连续性、真伪物件、知识边界与证据闭包的验收标准。',
+      tags: ['单主角 PASS', '物件链 PASS', '知识边界 PASS', '终局代价 PASS'],
+    },
+  ];
+
+  useEffect(() => {
+    const media = window.matchMedia('(prefers-reduced-motion: reduce)');
+    const sync = () => setReducedMotion(media.matches);
+    sync();
+    media.addEventListener('change', sync);
+    return () => media.removeEventListener('change', sync);
+  }, []);
+
+  useEffect(() => {
+    if (!showcaseMode || reducedMotion) {
+      setShowcaseStep(showcaseMode ? stepCount : 0);
+      return;
+    }
+    setShowcaseStep(0);
+    let nextStep = 0;
+    let timer = 0;
+    const advance = () => {
+      nextStep = (nextStep + 1) % (stepCount + 1);
+      setShowcaseStep(nextStep);
+      timer = window.setTimeout(advance, nextStep === stepCount ? 2100 : 1100);
+    };
+    timer = window.setTimeout(advance, 1300);
+    return () => window.clearTimeout(timer);
+  }, [reducedMotion, showcaseMode, stepCount]);
+
+  const completedAgents = snapshot.agents.filter((agent) => agent.status === 'complete').length;
+  const actualActive = snapshot.agents.findIndex((agent) => agent.status === 'active');
+  const sequenceStep = showcaseMode
+    ? showcaseStep
+    : actualActive >= 0
+      ? actualActive
+      : Math.min(completedAgents, stepCount - 1);
+  const isSealed = showcaseMode && sequenceStep >= stepCount;
+  const activeIndex = Math.min(sequenceStep, stepCount - 1);
+  const activeStep = steps[activeIndex];
+  const progress = isSealed ? 100 : ((activeIndex + 1) / stepCount) * 100;
+  const finalTags = [
+    `${snapshot.metrics.sessions} 章`,
+    `${snapshot.metrics.entities} 个世界节点`,
+    `${snapshot.metrics.docs} 篇证据文档`,
+    gatesReady ? `${snapshot.metrics.grounding.grounded}/${snapshot.metrics.grounding.n} 全部接地` : `${questionCount} 道目标问题`,
+  ];
+
   return (
-    <div className="council-live-view">
+    <div className="council-live-view" data-sealed={isSealed ? 'true' : 'false'}>
       <div className="council-live-orbit">
-        <div className="council-live-core"><BrainCircuit /><span>COUNCIL</span><b>{snapshot.agents.filter((agent) => agent.status === 'complete').length}/7</b></div>
-        {snapshot.agents.map((agent, index) => (
-          <div key={agent.id} className={`council-live-agent is-${agent.status}`} style={{ '--agent-index': index } as React.CSSProperties}>
-            <i>{String(index + 1).padStart(2, '0')}</i><strong>{agent.name}</strong><span>{agent.role}</span>
+        <div className="council-live-core" style={{ '--council-progress': `${progress * 3.6}deg` } as React.CSSProperties}>
+          <div><BrainCircuit /><span>WHITEPAPER</span><b>{isSealed ? 'SEALED' : `${String(activeIndex + 1).padStart(2, '0')}/07`}</b></div>
+        </div>
+        {steps.map((item, index) => (
+          <div
+            key={item.name}
+            className={`council-live-agent ${index < sequenceStep || isSealed ? 'is-sequence-complete' : index === sequenceStep ? 'is-sequence-active' : 'is-sequence-waiting'}`}
+            style={{ '--agent-index': index } as React.CSSProperties}
+          >
+            <i>{String(index + 1).padStart(2, '0')}</i>
+            <div><strong>{item.name}</strong><span>{item.role}</span></div>
+            <em>{index < sequenceStep || isSealed ? '已锁定' : index === sequenceStep ? '生成中' : '等待'}</em>
+            <b aria-hidden="true" />
           </div>
         ))}
       </div>
       <div className="council-blueprint">
-        <p><Sparkles /> WHITEPAPER SIGNAL</p>
-        <h3>{view.entity_noun ? `已识别核心实体：${view.entity_noun}` : '多 Agent 正在汇聚世界蓝图'}</h3>
-        <div>{view.active_lines.map((line) => <span key={line}>{line}</span>)}</div>
-        <small>{view.doc_genres.length ? view.doc_genres.join(' / ') : snapshot.step_now}</small>
-        <ArtifactChip name="01_whitepaper.json" ready={snapshot.stages[1]?.ready} />
+        <div className="council-blueprint-head">
+          <p><Sparkles /> {isSealed ? 'WHITEPAPER SEALED' : activeStep.signal}</p>
+          <span>{isSealed ? '07 / 07' : `${String(activeIndex + 1).padStart(2, '0')} / 07`}</span>
+        </div>
+        <div className="council-signal" key={isSealed ? 'sealed' : activeIndex}>
+          <span>{isSealed ? 'EXECUTABLE WORLD SPECIFICATION' : `${activeStep.name} · ${activeStep.role}`}</span>
+          <h3>{isSealed ? `《${view.title || '世界'}》白皮书已封存` : activeStep.title}</h3>
+          <p>{isSealed ? `一个围绕 ${view.protagonist || view.entity_noun || '主角'} 运转、留下证据并可被追问的世界已经就绪。` : activeStep.note}</p>
+          <div className="council-signal-tags">{(isSealed ? finalTags : activeStep.tags).slice(0, 6).map((line) => <span key={line}>{line}</span>)}</div>
+        </div>
+        <div className="council-synthesis-meter">
+          <span><i style={{ width: `${progress}%` }} /></span>
+          <b>{isSealed ? 'SPEC LOCKED' : 'WHITEPAPER BUILD'}</b>
+          <em>{Math.round(progress)}%</em>
+        </div>
+        <ArtifactChip name="01_whitepaper.json" ready={isSealed || Boolean(stage?.ready && reducedMotion)} />
       </div>
     </div>
   );
@@ -805,7 +996,7 @@ function WorldBuildView({ snapshot }: { snapshot: RunSnapshot }) {
           </div>
         ))}
       </div>
-      <div className="world-counter"><span>WORLD STATE</span><strong>{snapshot.metrics.entities}</strong><small>ENTITIES</small><b>{snapshot.metrics.sessions} SESSIONS</b></div>
+      <div className="world-counter"><span>WORLD STATE</span><strong>{snapshot.metrics.entities}</strong><small>WORLD NODES</small><b>{snapshot.metrics.sessions} STORY CHAPTERS</b></div>
       <ArtifactChip name="02_world.json" ready={snapshot.stages[2]?.ready} />
     </div>
   );
@@ -841,7 +1032,7 @@ function CorpusBuildView({ snapshot }: { snapshot: RunSnapshot }) {
     <div className="corpus-live-view">
       <div className="corpus-vault">
         <Database />
-        <span>MEMORY CORPUS</span>
+        <span>WORLD EVIDENCE</span>
         <strong>{snapshot.metrics.docs}</strong>
         <small>REAL DOCUMENTS</small>
         <i />
@@ -887,9 +1078,9 @@ function DeliveryView({ snapshot, onReplay }: { snapshot: RunSnapshot; onReplay:
       <p>RUN COMPLETE · STOPPED AT 06</p>
       <h2>{grounding.grounded}<span> 道接地题</span></h2>
       <div className="delivery-metrics">
-        <span><b>{snapshot.metrics.entities}</b> 实体</span>
-        <span><b>{snapshot.metrics.sessions}</b> Sessions</span>
-        <span><b>{snapshot.metrics.docs}</b> 文档</span>
+        <span><b>{snapshot.metrics.entities}</b> 世界节点</span>
+        <span><b>{snapshot.metrics.sessions}</b> 剧情章</span>
+        <span><b>{snapshot.metrics.docs}</b> 证据文档</span>
         <span><b>{grounding.survival == null ? '—' : `${Math.round(grounding.survival * 100)}%`}</b> 接地率</span>
       </div>
       <div className="delivery-artifact"><FolderOpen /><div><small>SEALED ARTIFACT</small><strong>{snapshot.output}</strong></div><ShieldCheck /></div>

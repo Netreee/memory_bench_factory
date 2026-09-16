@@ -22,15 +22,32 @@ _lk = threading.Lock()
 
 
 def bench_id(questions: list) -> str:
-    """稳定标识一套题(题面集合的 sha1 前 16)。题变了 → 新 id → 不会误用旧结果。"""
+    """稳定标识一套题及其评分合同；题面或评分规则变化都会换缓存命名空间。"""
     h = hashlib.sha1()
     for q in questions:
-        h.update((str(q.get("question", "")) + "\x00").encode("utf-8"))
+        payload = {
+            "question": q.get("question", ""),
+            "capability": q.get("capability"),
+            "gt": q.get("gt"),
+            "strict_scoring": q.get("strict_scoring"),
+        }
+        h.update((json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\x00").encode("utf-8"))
     return h.hexdigest()[:16]
 
 
-def qhash(question_text: str) -> str:
-    return hashlib.sha1(str(question_text).encode("utf-8")).hexdigest()
+def qhash(question_or_item) -> str:
+    """单题缓存键；新调用传完整题对象，旧调用传字符串时仍向后兼容。"""
+    if isinstance(question_or_item, dict):
+        payload = {
+            "question": question_or_item.get("question", ""),
+            "capability": question_or_item.get("capability"),
+            "gt": question_or_item.get("gt"),
+            "strict_scoring": question_or_item.get("strict_scoring"),
+        }
+        raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    else:
+        raw = str(question_or_item)
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
 
 def _path(bid: str, system: str) -> Path:
@@ -60,8 +77,8 @@ def append(bid: str, system: str, rec: dict) -> None:
     """追加一条已判结果(线程安全 + 立即落盘)。仅存 JSON 可序列化字段。"""
     try:
         slim = {k: v for k, v in rec.items()
-                if k in ("_qh", "line", "capability", "question", "gt",
-                         "gold_set", "mode", "judgeable", "pred", "correct",
+                if k in ("_qh", "line", "capability", "question", "gt", "aux", "qid",
+                         "gold_set", "mode", "judgeable", "pred", "correct", "strict_scoring",
                          "bridge_extracted", "error", "judge_error")}
         with _lk:
             CACHE_DIR.mkdir(parents=True, exist_ok=True)

@@ -1007,6 +1007,9 @@ def assemble_world(table: dict, base: str = "2025-01-06", step_days: int = 7,
                     bad_role = True
             if bad_role:
                 continue
+            if len(set(participants.values())) != len(participants):
+                issues.append(f"event {eid} 不同 participant role 必须由互异实体承担:{participants}")
+                continue
             sess = _as_int(event.get("session"), -1)
             if sess < 0 or (session_limit and sess >= session_limit):
                 issues.append(f"event {eid} session 非法:{event.get('session')}")
@@ -1020,8 +1023,20 @@ def assemble_world(table: dict, base: str = "2025-01-06", step_days: int = 7,
                 continue
             allowed_effects = {(x.get("role"), x.get("field"))
                                for x in decl.get("effect_fields", []) if isinstance(x, dict)}
+            participant_role = {entity: role for role, entity in participants.items()}
+            raw_effects = _dicts(event.get("effects", []))
+            actual_effects = Counter(
+                (participant_role.get(effect.get("entity")), effect.get("field"))
+                for effect in raw_effects
+            )
+            expected_effects = Counter(allowed_effects)
+            if actual_effects != expected_effects:
+                issues.append(
+                    f"event {eid} effects 必须恰好覆盖 effect_fields:"
+                    f"actual={dict(actual_effects)} expected={dict(expected_effects)}")
+                continue
             clean_effects = []
-            for eff in _dicts(event.get("effects", [])):
+            for eff in raw_effects:
                 entity, fld = eff.get("entity"), eff.get("field")
                 effect_extra = sorted(set(eff) - {"entity", "field", "set", "value"})
                 if effect_extra:
@@ -1381,6 +1396,30 @@ def _self_test() -> bool:
     ck("typed event 拒绝蓝图未声明的额外 participant role",
        not extra_role_world.events
        and any("roles 必须精确等于声明" in issue for issue in extra_role_issues), True)
+
+    aliased_role_bp = deepcopy(relation_bp)
+    aliased_role_bp["event_types"][0].update({
+        "roles": {"actor": "a", "witness": "a"},
+        "effect_fields": [{"role": "actor", "field": "阶段"}],
+    })
+    aliased_role_table = deepcopy(relation_table)
+    aliased_role_table["events"][0]["participants"] = {"actor": "A1", "witness": "A1"}
+    aliased_role_world, aliased_role_issues = assemble_world(
+        aliased_role_table, blueprint=aliased_role_bp)
+    ck("typed event 不同 participant role 不得别名到同一实体",
+       not aliased_role_world.events
+       and any("互异实体" in issue for issue in aliased_role_issues), True)
+
+    complete_effect_bp = deepcopy(relation_bp)
+    complete_effect_bp["entity_types"][0]["fields"].append(
+        {"name": "结果备注", "kind": "text"})
+    complete_effect_bp["event_types"][0]["effect_fields"].append(
+        {"role": "actor", "field": "结果备注"})
+    incomplete_effect_world, incomplete_effect_issues = assemble_world(
+        relation_table, blueprint=complete_effect_bp)
+    ck("typed event effects 必须完整覆盖声明而非只写一个合法子集",
+       not incomplete_effect_world.events
+       and any("恰好覆盖 effect_fields" in issue for issue in incomplete_effect_issues), True)
 
     extra_payload_table = deepcopy(relation_table)
     extra_payload_table["relations"][0]["future_hint"] = "A1 已倒戈"

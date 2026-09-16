@@ -1,0 +1,5 @@
+# Core benchmark generation; optional evaluation integrations use requirements.txt.
+openai==2.43.0
+python-dotenv==1.2.1
+httpx==0.28.1
+json-repair==0.61.0

@@ -20,7 +20,7 @@ PROMPTS: dict[str, str] = {
 代码会据此机械算标准答案,你只填表——★严禁写问题/答案,严禁"最新/当前/截至…仍为"这类结论性措辞。
 
 【每个 $noun = 一个 entity】★核心:name 是这个【$noun】个体的【正式专名】,且必须【与「$noun」这个类别相称】——\
-是部门就起部门名(如「支付平台部」)、是商品就起商品名、是人才起人名;★不要跨类(别把部门起成人名),也★不要拿它的指标/字段当名字(别叫「XX缺陷率」)。
+名称形式必须对应【$noun】：组织用组织名，文件/报告/来源记录用文档标题，事件用事件名称，人物用人名。只命名当前类型的对象；不得用对象的出处、作者、部门或数值指标代替对象本身。
 ★字段【只能从下面这份给定清单里选】,逐字照抄字段名,严禁新增/改名/拆分同义字段(下游 gold 只认这份清单,擅自加的字段会被丢弃且制造近义串味坏题):$fdesc。
 $numeric_policy
 - person/status/category 字段:给 trajectory(随时间换),或 stable 给单一 value；但 user 若标为【domain event 驱动】，这里只能给可选初态，后续变化留给 event effect
@@ -39,8 +39,8 @@ $coverage_policy
     "world.structure": """你是世界蓝图实例化器。给定【已经生成的 typed entities】和【机器契约 blueprint】，只实例化契约声明的关系与领域事件。
 【硬约束】
 1. 只能引用给定实体专名；relation 的 from/to 类型必须匹配声明，且每种【恰好生成 min_count 个】（不要为每个实体铺满、不要额外多造）；每个 relation id 唯一，禁止重复边；temporal=false 的静态关系 session 必须为 0。代码会根据 relation.field 在哪一端声明，将另一端专名写入该 owner 的 Timeline。对同一 owner.field，按 session 递增时必须是真实引用变化，禁止连续重复同一目标凑数量。
-2. event 的 participants 必须逐角色匹配声明类型；每种【恰好生成 min_count 个】（因果规则所需见证也包含在这个数量内，不额外扩张）；session 为 0..$smax。event id 唯一，且同一 type/session/完整 participants 只能出现一次，禁止只换 id 重复计数。
-3. 每个 event effect 只能使用该事件 effect_fields 声明的 role/field；输出时 entity 必须等于 participants 中该 role 对应实体，并给 set 值。全局每个 (entity,field,session) effect slot 只能被一个事件使用；set 必须相对 initial_state 与此前事件造成真实变化。多个事件写同一状态字段时，分配到递增 session，并沿 fields.states 合法推进；numeric 遵守 monotonic 且数值不同。禁止冲突、同 session 双写或空操作。
+2. event 的 participants 必须逐角色匹配声明类型，同一事件的不同角色必须由不同实体承担；每种【恰好生成 min_count 个】（因果规则所需见证也包含在这个数量内，不额外扩张）；session 为 0..$smax。event id 唯一，且同一 type/session/完整 participants 只能出现一次，禁止只换 id 重复计数。
+3. 每个 event 的 effects 必须逐项且恰好一次覆盖该类型全部 effect_fields，不得漏项、重复或增加；输出时 entity 必须等于 participants 中该 role 对应实体，并给 set 值。全局每个 (entity,field,session) effect slot 只能被一个事件使用；set 必须相对 initial_state 与此前事件造成真实变化。多个事件写同一状态字段时，分配到递增 session，并沿 fields.states 合法推进；numeric 遵守 monotonic 且数值不同。禁止冲突、同 session 双写或空操作。
 4. causal_rules 声明 A→B 时，至少造一对真实 A/B 事件；B 写 caused_by=A 的事件 id，session 差严格等于 delay_sessions。
 5. typed entities 目录可能给出 event-owned 字段的 initial_state；effect 必须写成不同于其当时状态的真实变化，不能空操作。
 6. 严禁输出 cascades；代码会从验证过的事件因果机械编译。严禁新增类型、字段或实体。
@@ -69,6 +69,7 @@ $coverage_policy
     # ── game 叙事共用的只读 supportedness 闸；不改 canon，只指出编造 ──
     "narrative.review": """你是只读的叙事事实审查员。判断候选文本中每个具体的身份、状态、行动、持有关系、物品来源、阵营归属、生死、因果、结果和时间断言，是否被 CANON 明确支持。
 允许文风化连接、情绪和明确标为目标/风险/假设的语句；明确以“若失败”表述的 stakes 无需在 CANON 中有反事实事件，只要不与 CANON 冲突。不得把可能性写成已发生事实，不得为事件添加 CANON 没有的执行者、掉落物、复活、立场变化或后果。
+若 CANON 给出 period_label/document_date，它们就是本篇允许使用的章/期标签与文档日期；“日志记录/档案登记/通报提及”等纯文档载体动词也是允许的写作支架，不应被误判成新的领域事件。它们不能借机新增谁执行了游戏行动或产生了什么结果。
 若审查对象是 Story Ledger，还要检查 premise/goal 是否与整条事件链一致、goal 是否确实在最后一幕完成；未完成的许诺也要报告，但不要仅因 stakes 是反事实风险而报告。
 若审查对象是语料，还要检查每个 CANON domain_event 的动作、全部参与者和全部 effect 是否在同一篇文档里被明确叙述；只罗列状态、分散在多篇或漏掉事件也要报告。
 只报候选中不受支持或未闭合的具体问题，每条一句；全部通过则返回空数组。
@@ -108,41 +109,36 @@ $defects
     # ── 渲染链·盲判别器(Blinded Discriminator;只读渲染文档、对世界一无所知)──────
     #   死钉③:user 只喂 $docs(渲染正文)+ 要问的 ($entity,$field);★绝不喂 value/gt/fact_refs。
     "discriminate.system": """你是一个【只读下列文档的盲读者】,对文档之外的世界一无所知,没有任何先验常识或背景知识。
-你的任务:只依据【给定文档】回答某个实体的某个字段【字面写的是什么值】。
+你的任务:只依据【给定文档】逐项回答每个实体字段【字面写的是什么值】。
 【铁律】
 1. ★只回文档里【逐字写出的那个值本身】(含单位、百分号、量纲原样照抄):文档写"78%"就回"78%"、写"0.78"就回"0.78"、写"320万"就回"320万",绝不换算、绝不归一、绝不补单位、绝不去单位。
 2. 文档里【根本读不出】这个字段的值,或【多处说法不一致】,或【指代有歧义】(分不清是哪个实体的) → 回"不确定"。
 3. ★绝不猜测、绝不用任何外部常识补全、绝不编造一个文档里没有的值。
-【输出严格 JSON】{"answer":"<逐字照抄的那个值,或'不确定'>"}""",
+4. 每个输入 key 必须且只能返回一次，不得漏项、合并或改写 key。
+【输出严格 JSON】{"answers":[{"key":"q0","answer":"<逐字照抄的那个值,或'不确定'>"}]}""",
 
-    # ── 盲判别器 user($docs $entity $field)──────────────────────────────────
+    # ── 盲判别器 user($docs $queries)─────────────────────────────────────────
     "discriminate.user": """【文档】
 $docs
 
-【问题】据上述文档,$entity 的「$field」是什么?只回该值本身(逐字照抄,含单位/百分号/量纲),文档里读不出或有歧义或多处不一致就回"不确定"。
-严格 JSON {"answer":"..."}。""",
+【问题列表】$queries
+逐项回答 entity 的 field；只回该值本身(逐字照抄,含单位/百分号/量纲),文档里读不出或有歧义或多处不一致就回"不确定"。
+严格 JSON {"answers":[{"key":"q0","answer":"..."}]}。""",
 
     # ── §7 草堆渲染(system;$noun)─────────────────────────────────────────
-    "filler.system": """你为记忆评测生成【与目标场景同一领域、同一叙事世界】的背景干扰文档。草堆必须像这个世界自然产生的旁支记录,不能突然切换成另一个行业或时代。
+    "filler.system": """你为记忆评测生成一篇【与目标场景同一领域、同一叙事世界】的背景干扰文档。草堆必须像这个世界自然产生的旁支记录,不能突然切换成另一个行业或时代。
 【领域画像】主体类别:$noun；优先体裁:$genres；冻结世界语境:$world_context
 【硬约束】
-1. ★绝不碰任何被追踪的 $noun 名/人名/字段(连名字都不出现,不给数值/状态),只使用全新虚构的外围专名与无关旁支事件,不得承载可用于回答 benchmark 问题的事实。
+1. ★绝不碰任何被追踪的 $noun 专名或人物专名(连名字都不出现),只使用全新虚构的外围专名与无关旁支事件,不得承载可用于回答 benchmark 问题的事实。允许使用“状态/工具/负责人”等同领域通用词，但不得把它们与被追踪专名组合成可回答事实。
 2. 文体、术语、时间制度必须服从上述领域画像。例如 RPG 应写世界内告示、传闻、游记、货单等,不得出现公司员工、OA、办公区、食堂培训等现代办公内容；只有目标场景本来就是企业办公时才允许办公题材。
-3. 每批题材与体裁尽量不同,自然像真实文档；每篇600-1000字,带本期日期。
-【严格 JSON】{"docs":[{"type":"通知","content":"..."}]}""",
+3. 题材与体裁自然像真实文档；正文600-1000字,带本期日期。
+只输出文档正文，不要 JSON、代码块、标题标签或解释。""",
 
-    # ── 草堆 user($s $date $want $blocked)──────────────────────────────────
-    "filler.user": """【第 $s $time_unit / $date】生成 $want 篇互不相同的干扰文档。★严禁出现:$blocked
-严格 JSON。""",
-
-    # ── §7 冲突渲染(L5;低可信"小道"来源文档,陈述被矛盾的值)──────────────────
-    "conflict.system": """你为记忆评测语料合成一篇【低可信来源】文档:它以【小道消息/未经核实】的口吻,声称某事实是某个值。
-【硬约束】1.★必须让读者一眼看出这是【未经证实、来源不可靠】的传闻(用"据传/有未经核实的说法/小道消息称/暂未官方确认/有待核实"等口吻),绝不写成正式通报;2.只围绕给定的【实体·字段·值】展开,把那个值自然说进去,不另编其它被追踪的数值;3.含本期日期锚点(传闻就该说"据传现在/目前…",不必回避这类措辞——这正是"当期有人在传"的冲突设定);4.每篇 500-900 字。
-【严格 JSON】{"docs":[{"type":"传闻","content":"..."}]}""",
-
-    # ── 冲突 user($s $date $entity $field $value $source)────────────────────
-    "conflict.user": """【第 $s $time_unit / $date】请写一篇【$source】口吻的低可信文档:声称【$entity】的「$field」是「$value」(强调这只是未经证实的说法、尚无官方确认)。
-严格 JSON。""",
+    # ── 草堆 user($s $date)─────────────────────────────────────────────────
+    # 受保护专名只留在代码端验收，绝不放进提示词。把禁词逐项展示给模型会反而
+    # 提高复述概率；system 已声明只用全新外围专名，输出再由代码逐字 fail-closed。
+    "filler.user": """【第 $s $time_unit / $date】写一篇与主线无关的外围干扰文档。
+只输出正文。""",
 
     # ── §7 敏感注入渲染(L10;★确定性模板,绕开 LLM 那一跳 → 保证 X 逐字就近落地,G3 反退化L6）─────
     #   不走 tracer.chat_json:代码直接 Template.substitute 出成品文档(user 供出 X + assistant 已记录),
@@ -206,10 +202,10 @@ observe.observed_fields 是字面硬事实：其中每个 name 必须逐字出�
 ★先逐项核对场景描述里的核心循环：凡是有独立身份、会参与关系/事件、需要被持续追踪的核心名词，都必须成为 entity type，不能降成 category/text 来省事；描述明确列出的核心关系与核心事件必须分别有 relation/event 声明。例如“阵营控制地区”必须有 faction 与 region 两端，不能偷换成“玩家控制地区”；若描述分别列出“掉落、拾取、装备”，就不能合并成一个含糊事件。
 
 输出一个可执行 world_blueprint v1：
-- entity_types：每类有稳定英文 id、中文 noun、count、唯一一个 primary=true、该类型【专属】fields。字段沿用 {name,kind,unit?,monotonic?,range?,states?}；关系字段也必须先声明，kind 用 reference。
+- entity_types：每类有稳定英文 id、中文 noun、count、唯一一个 primary=true、该类型【专属】fields。字段沿用 {name,kind,unit?,monotonic?,range?,states?}；kind 只能逐字使用 numeric/person/status/category/text/reference，整数与浮点数也统一写 numeric，禁止写 number/integer/int/float；关系字段也必须先声明，kind 用 reference。`states` 只声明不可逆、单向推进的生命周期；会因重试、重开、恢复、上下线而回到早期状态的运行状态只写 kind=status，必须省略 states。
 - relation_types：{id,from_type,to_type,field,temporal,min_count}。from→to 必须能按“from 谓词 to”读成领域自然语义，绝不能因 field 在另一端就反转或替换端点；field 必须逐字声明在两个端点类型中的【恰好一端】，该端就是软外键 owner，值指向另一端。自关系约定 from/source 持有字段。v1 每个 reference 字段必须且只能绑定一种 relation，不能悬空，也不能同时被 event effect 写入。每种 relation 的 min_count>=1。一对多通常把 field 放在“多”的一侧，多对多改用关联实体。
-- event_types：{id,label,roles:{角色:type_id},effect_fields:[{role,field}],min_count}。label 是文档可自然逐字使用的人类可读事件名（如“击败首领”“预算修订”）；每个事件至少一个真实状态效果且 min_count>=1。描述中分开的领域动作不得为了省 schema 被合并。
-- entity 的 name 已经是稳定专名；不要再造“XX名称/姓名/编号/ID”充当事件效果。event effect 必须落到会真实变化的状态、数值或类别字段；若一个核心动作尚无可写效果，应补领域自然的生命周期字段（例如物品流转状态：未掉落→已掉落→已拾取→已装备），不能用“名称 SET 成自身”伪造变化。
+- event_types：{id,label,roles:{角色:type_id},effect_fields:[{role,field}],min_count}。label 是文档可自然逐字使用的人类可读事件名（如“击败首领”“预算修订”）；不同角色必须由互异实体承担，因此同类型角色出现 N 次时该类型 count 至少为 N；每个事件至少一个真实状态效果且 min_count>=1。描述中分开的领域动作不得为了省 schema 被合并。
+- entity 的 name 已经是稳定专名；除非 observe.observed_fields 字面要求，否则不要再把“XX名称/姓名/编号/ID”声明成 fields（只作为关系端点的类型允许 fields=[]），更不能拿它充当事件效果。event effect 必须落到会真实变化的状态、数值或类别字段；若一个核心动作尚无可写效果，应补领域自然的生命周期字段（例如物品流转状态：未掉落→已掉落→已拾取→已装备），不能用“名称 SET 成自身”伪造变化。
 - temporal_model：{unit,cadence,n_sessions,step_days}。unit 可为 week/chapter/business_day/round/event 等；n_sessions>=2，step_days>=1。
 - causal_rules：只有领域中无需额外主体选择、稳定必然成立的事件因果才写 {id,trigger_event,effect_event,delay_sessions}，没有就空数组；中间有人类/玩家选择时必须拆开，不能把“击败→掉落”偷换成“击败→拾取”。
 - evidence_channels：这个世界里真实留下痕迹、可观察核心事件的文档/记录渠道。
@@ -227,8 +223,11 @@ observe.observed_fields 是字面硬事实：其中每个 name 必须逐字出�
 - relation.field 必须 kind=reference，且每个 reference 字段必须且只能绑定一种 relation（禁止悬空或复用）；event effect 不得再写 relation-owned 字段。静态关系每个 owner 最多承载一个实例；时变关系也必须产生真实引用变化，不能重复同值凑 min_count。
 - 显式 v1 的每种 relation/event 都必须 min_count>=1；不允许靠设为 0 逃避实例化。场景描述明确分开的核心对象、关系和事件必须保留，不得偷换端点或合并动作。
 - 每个 event role/effect 引用闭合；effect 只能写该 role 类型已经声明的字段。
+- 字段 kind 只能逐字使用 numeric/person/status/category/text/reference；看到 number/integer/int/float 一律改成 numeric。数值字段若带 range/monotonic，kind 必须同时为 numeric。
 - “XX名称/姓名/编号/ID”等身份字段不得作为 event effect。若核心事件没有可变化字段，新增领域自然的状态/数值/类别字段；禁止用“名称 SET 成实体专名”伪造效果。
+- entity.name 已经承载 canonical 专名；不在 observe 冻结清单、也不被结构引用的重复身份字段应删除。只作为关系端点的类型允许 fields=[]，不要为满足非空而补“名称”。
 - range 只放 numeric，且为两个不同 JSON 数字；reference/status/category/text 不写 range。monotonic 只写 up/down。
+- `states` 只用于不可逆单向生命周期；重试、重开、恢复、上下线等可循环运行状态必须删除 states，只保留 kind=status，不能为了通过校验篡改真实事件顺序。
 - 跨类型同名字段约束若不同，改成领域清楚的不同字段名，并同步全部引用。
 - 错误若指出“未覆盖/改写 few-shot 字段”，必须把该字段名及明确的 kind/unit/monotonic/range 逐字恢复到合理类型；不得用英文翻译或近义词替代。
 - person/category/text 等已观测显示字段必须原样保留；若还要建立关系，新增不同名的 reference 字段承载，禁止改型或把非 reference 字段直接用作 relation.field。

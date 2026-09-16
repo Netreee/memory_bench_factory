@@ -1,0 +1,363 @@
+{
+  "schema_version": 1,
+  "seed_id": "legal_merchant_review_v1",
+  "family": "legal_merchant_review",
+  "title": "商户复核：证据充分性与处置条件",
+  "description": "由商户复核提示词和监管案例启发的合成运营工单。报道提供风险分类和证据关系，不提供完整的真实商户后续轨迹；所有新增补证和处置事件均为合成。",
+  "sources": [
+    {
+      "id": "legal_task",
+      "path": "data/real_seed/yukai_2026-09-15/extracted/研判样例数据（多附件）/法律/prompt.rtf",
+      "sha256": "3c233abfe8e25afbec7ac60d323f81e14fa369749ac4271ff51b00eaa4d5ec11",
+      "role": "corpus",
+      "title": "prompt.rtf"
+    },
+    {
+      "id": "legal_cases",
+      "path": "data/real_seed/yukai_2026-09-15/extracted/研判样例数据（多附件）/法律/附件1.严查幽灵外卖区市场监管局发布网络餐饮食品安全专项治理典型案例.pdf",
+      "sha256": "38991016583ae312ff57c91ca91c84a91840f0688542908ea349369ad88be4f0",
+      "role": "corpus",
+      "title": "附件1.严查幽灵外卖区市场监管局发布网络餐饮食品安全专项治理典型案例.pdf"
+    },
+    {
+      "id": "legal_commentary",
+      "path": "data/real_seed/yukai_2026-09-15/extracted/研判样例数据（多附件）/法律/附件2.新华典评整治幽灵外卖务必见底清零.pdf",
+      "sha256": "185fb743401da8b5277eb38954f38b7f13b2f41967b741a5b6010e05e17d8cae",
+      "role": "corpus",
+      "title": "附件2.新华典评整治幽灵外卖务必见底清零.pdf"
+    },
+    {
+      "id": "legal_rules",
+      "path": "data/real_seed/yukai_2026-09-15/extracted/研判样例数据（多附件）/法律/附件3.新华解码幽灵外卖和网络餐饮新规举措.pdf",
+      "sha256": "210838661d085a201ae5f9bcb87a3dbceb1ff10b936092a81c40fa69725f7e1a",
+      "role": "corpus",
+      "title": "附件3.新华解码幽灵外卖和网络餐饮新规举措.pdf"
+    },
+    {
+      "id": "legal_investigation",
+      "path": "data/real_seed/yukai_2026-09-15/extracted/研判样例数据（多附件）/法律/附件4.中国质量报市场监管总局依法查处七家电商平台幽灵外卖系列案纪实.pdf",
+      "sha256": "26977aa9ebc8d3f10e8ea2d08eba1ea7e29ad9fdda3d7361cd659e1c3b282c65",
+      "role": "corpus",
+      "title": "附件4.中国质量报市场监管总局依法查处七家电商平台幽灵外卖系列案纪实.pdf"
+    },
+    {
+      "id": "legal_clipped",
+      "path": "data/real_seed/yukai_2026-09-15/extracted/研判样例数据（多附件）/法律/附件5.一份蛋糕订单牵出巨额罚单幽灵外卖系列案追踪.pdf",
+      "sha256": "c1b1e59d0bc04230b0bc3a5a8b160b0f15ca499bb4bfeabcb50002b87c25d64b",
+      "role": "builder_only",
+      "title": "裁切文档，仅登记完整性问题；正文禁用于示例/事实，且与附件4同案报道重合"
+    }
+  ],
+  "task": {
+    "objective": "根据逐步到达的风险线索和补充材料维护商户复核工单，记录证据充分性、负责团队、允许动作与复查结论。",
+    "instructions": "生成新商户和合成材料；地址不一致、门头异常、转单投诉只是待核验线索。证据未提供不等于违法已成立，也不等于问题不存在。区分证照有效但公示未更新、实际场所未覆盖等不同情形。工单应关联商户，补充材料应关联工单；新增材料后再复核结论与处置阶段。平台运营动作与监管处罚分开；不捏造真实处罚编号、真实坐标或已经完成的真实整改。附件5的裁切正文不得使用，附件4和5的同案叙述不得算作两个独立原始证据。"
+  },
+  "exemplars": [
+    {
+      "title": "青禾食坊的初次工单",
+      "content": "以下商户与工作记录为合成。商户青禾食坊出现线上地址与骑手取餐地址不一致的反馈。工单《青禾地址核验》：关联商户=青禾食坊；证据充分性=待补证；处置阶段=资料核验；责任团队=商户运营。复查结论=尚不能确认具体原因。",
+      "doc_type": "风险工单",
+      "date": "2025-01-06",
+      "origin": "synthetic",
+      "source_refs": [],
+      "mechanism_refs": [
+        "evidence_sufficiency",
+        "scoped_action"
+      ]
+    },
+    {
+      "title": "补充材料到达",
+      "content": "本条为合成补证记录。《青禾新址材料》：关联工单=《青禾地址核验》；材料种类=新址证照与现场照片；材料完整性=已收齐待核验；信息来源=商户提交。材料收到尚不表示平台已经核验通过。",
+      "doc_type": "补证登记",
+      "date": "2025-01-13",
+      "origin": "synthetic",
+      "source_refs": [],
+      "mechanism_refs": [
+        "evidence_sufficiency"
+      ]
+    },
+    {
+      "title": "复核后的动作调整",
+      "content": "本条为合成复核结果。《青禾地址核验》已核对新址材料，证据充分性=本次地址问题证据充分；复查结论=新址证照有效而平台公示未更新；处置阶段=待更新公示；责任团队=商户运营。待确认公示完成后再关闭该问题；未作监管处罚决定。",
+      "doc_type": "复核记录",
+      "date": "2025-01-20",
+      "origin": "synthetic",
+      "source_refs": [],
+      "mechanism_refs": [
+        "evidence_sufficiency",
+        "scoped_action"
+      ]
+    }
+  ],
+  "mechanisms": [
+    {
+      "id": "evidence_sufficiency",
+      "description": "从线索到已核验结论需要材料到达与复核两步；知识状态作为明确的业务字段，不将待补证状态映射为无此项。不同异常原因可以得到不同结论。",
+      "source_refs": [
+        {
+          "source_id": "legal_task",
+          "locator": "RTF 正文：只能据已知材料生成待核实工单，禁止捏造商户事实及整改完成状态"
+        },
+        {
+          "source_id": "legal_cases",
+          "locator": "PDF 第1–2页：搬迁已办新证但平台未更新、冒用资质等不同案例"
+        }
+      ],
+      "required_entity_types": [
+        "merchant",
+        "review_ticket",
+        "evidence_record"
+      ],
+      "required_relation_types": [
+        "ticket_for_merchant",
+        "evidence_for_ticket"
+      ],
+      "required_event_types": [
+        "risk_registered",
+        "evidence_received",
+        "review_updated"
+      ],
+      "required_causal_rules": [
+        "evidence_to_review"
+      ]
+    },
+    {
+      "id": "scoped_action",
+      "description": "运营责任和允许动作随已核验结论更新，工单保留恢复/关闭前仍需满足的条件。新闻中的调查过程仅启发证据关系，不能替代真实商户台账或证明合成商户受罚。",
+      "source_refs": [
+        {
+          "source_id": "legal_task",
+          "locator": "RTF 正文：动作、责任团队、复查条件与待核实字段要求"
+        },
+        {
+          "source_id": "legal_investigation",
+          "locator": "PDF 第1–6页：投诉、订单流转、账号关联及交叉核验过程；非原始调查数据库"
+        }
+      ],
+      "required_entity_types": [
+        "merchant",
+        "review_ticket"
+      ],
+      "required_relation_types": [
+        "ticket_for_merchant"
+      ],
+      "required_event_types": [
+        "review_updated",
+        "action_updated"
+      ],
+      "required_causal_rules": [
+        "review_to_action"
+      ]
+    }
+  ],
+  "blueprint_requirements": {
+    "entity_types": [
+      {
+        "id": "merchant",
+        "noun": "平台商户",
+        "count": 3,
+        "fields": [
+          {
+            "name": "商户类型",
+            "kind": "category"
+          },
+          {
+            "name": "经营展示状态",
+            "kind": "status"
+          }
+        ]
+      },
+      {
+        "id": "review_ticket",
+        "noun": "商户复核工单",
+        "count": 3,
+        "fields": [
+          {
+            "name": "关联商户",
+            "kind": "reference"
+          },
+          {
+            "name": "证据充分性",
+            "kind": "status"
+          },
+          {
+            "name": "处置阶段",
+            "kind": "status"
+          },
+          {
+            "name": "责任团队",
+            "kind": "category"
+          },
+          {
+            "name": "复查结论",
+            "kind": "category"
+          }
+        ]
+      },
+      {
+        "id": "evidence_record",
+        "noun": "补充材料记录",
+        "count": 3,
+        "fields": [
+          {
+            "name": "关联工单",
+            "kind": "reference"
+          },
+          {
+            "name": "材料种类",
+            "kind": "category"
+          },
+          {
+            "name": "材料完整性",
+            "kind": "status"
+          },
+          {
+            "name": "信息来源",
+            "kind": "category"
+          }
+        ]
+      }
+    ],
+    "relation_types": [
+      {
+        "id": "ticket_for_merchant",
+        "from_type": "review_ticket",
+        "to_type": "merchant",
+        "field": "关联商户",
+        "temporal": false,
+        "min_count": 1
+      },
+      {
+        "id": "evidence_for_ticket",
+        "from_type": "evidence_record",
+        "to_type": "review_ticket",
+        "field": "关联工单",
+        "temporal": false,
+        "min_count": 1
+      }
+    ],
+    "event_types": [
+      {
+        "id": "risk_registered",
+        "label": "风险工单登记",
+        "roles": {
+          "ticket": "review_ticket"
+        },
+        "effect_fields": [
+          {
+            "role": "ticket",
+            "field": "证据充分性"
+          }
+        ],
+        "min_count": 1
+      },
+      {
+        "id": "evidence_received",
+        "label": "补充材料接收",
+        "roles": {
+          "evidence": "evidence_record",
+          "ticket": "review_ticket"
+        },
+        "effect_fields": [
+          {
+            "role": "evidence",
+            "field": "材料完整性"
+          }
+        ],
+        "min_count": 1,
+        "relation_bindings": [
+          {
+            "relation": "evidence_for_ticket",
+            "from_role": "evidence",
+            "to_role": "ticket"
+          }
+        ]
+      },
+      {
+        "id": "review_updated",
+        "label": "证据复核完成",
+        "roles": {
+          "ticket": "review_ticket",
+          "evidence": "evidence_record"
+        },
+        "effect_fields": [
+          {
+            "role": "ticket",
+            "field": "证据充分性"
+          },
+          {
+            "role": "ticket",
+            "field": "复查结论"
+          }
+        ],
+        "min_count": 1,
+        "relation_bindings": [
+          {
+            "relation": "evidence_for_ticket",
+            "from_role": "evidence",
+            "to_role": "ticket"
+          }
+        ]
+      },
+      {
+        "id": "action_updated",
+        "label": "工单动作调整",
+        "roles": {
+          "ticket": "review_ticket",
+          "merchant": "merchant"
+        },
+        "effect_fields": [
+          {
+            "role": "ticket",
+            "field": "处置阶段"
+          },
+          {
+            "role": "ticket",
+            "field": "责任团队"
+          },
+          {
+            "role": "merchant",
+            "field": "经营展示状态"
+          }
+        ],
+        "min_count": 1,
+        "relation_bindings": [
+          {
+            "relation": "ticket_for_merchant",
+            "from_role": "ticket",
+            "to_role": "merchant"
+          }
+        ]
+      }
+    ],
+    "causal_rules": [
+      {
+        "id": "evidence_to_review",
+        "trigger_event": "evidence_received",
+        "effect_event": "review_updated",
+        "delay_sessions": 1,
+        "shared_roles": [
+          "ticket",
+          "evidence"
+        ]
+      },
+      {
+        "id": "review_to_action",
+        "trigger_event": "review_updated",
+        "effect_event": "action_updated",
+        "delay_sessions": 1,
+        "shared_roles": [
+          "ticket"
+        ]
+      }
+    ],
+    "evidence_channels": [
+      "风险工单",
+      "补证登记",
+      "复核记录"
+    ],
+    "temporal_model": {
+      "min_sessions": 4
+    }
+  }
+}

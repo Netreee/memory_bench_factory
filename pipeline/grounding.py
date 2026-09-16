@@ -76,7 +76,7 @@ def gold_scalar(order: dict):
 # 证据文档收集(redesign §G.12.2):evidence_sessions 内的【信号文档】(非 filler);L5 含 conflict 文档
 # ════════════════════════════════════════════════════════════════════════════
 def gather_evidence(order: dict, by_id: dict) -> list[dict]:
-    """返回 [{session, content, is_conflict}],只取非 filler 文档(★is_filler 三态:None/True,用 not get)。"""
+    """返回证据池（含 doc_id/session/content），只取非 filler 文档。"""
     out = []
     for sid in (order.get("evidence_sessions") or []):
         s = by_id.get(sid) or by_id.get(str(sid))
@@ -85,7 +85,8 @@ def gather_evidence(order: dict, by_id: dict) -> list[dict]:
         for d in s.get("docs", []):
             if d.get("is_filler"):                 # None(信号)/True(草堆);only True 排除
                 continue
-            out.append({"session": sid, "content": d.get("content", ""),
+            out.append({"doc_id": d.get("doc_id"), "session": sid,
+                        "content": d.get("content", ""),
                         "is_conflict": bool(d.get("is_conflict"))})
     return out
 
@@ -123,10 +124,10 @@ def run_grounding(questions: list, corpus_obj: dict) -> tuple[list, dict]:
 
     for q in questions:
         line = line_for(q.get("line", ""))
+        ev = gather_evidence(q, by_id)
         if line is None or not callable(getattr(line, "ground", None)):
             status, reason = "drop", "无对应产线 / 该线未实现 ground()(fail-closed)"
         else:
-            ev = gather_evidence(q, by_id)
             try:
                 status, reason = line.ground(q, ev, all_sig)
             except Exception as e:
@@ -137,7 +138,11 @@ def run_grounding(questions: list, corpus_obj: dict) -> tuple[list, dict]:
             tally[k]["n"] += 1
             tally[k]["ok"] += int(status == "grounded")
         if status == "grounded":
-            kept.append(q)
+            # 06 是可交付题库：把本题实际送入接地器的非 filler 证据池一并发布。
+            # 这是候选证据集合，不声称做最小证明集；但每个 ID 都来自声明时间窗。
+            evidence_doc_ids = list(dict.fromkeys(
+                str(item["doc_id"]) for item in ev if item.get("doc_id")))
+            kept.append({**q, "evidence_doc_ids": evidence_doc_ids})
         else:
             drops.append({**_key(q), "reason": reason})
 
@@ -212,6 +217,8 @@ def _self_test() -> bool:
     ]
     kept, report = run_grounding(qs, corpus)
     ck("接地题保留(王皓)", any(q["gt"] == "王皓" for q in kept))
+    ck("接地题发布非空证据文档池",
+       kept[0]["evidence_doc_ids"] == ["s0_sig_0"])
     ck("幽灵题被弃(尤娜)", all(q.get("gt") != "尤娜" for q in kept))
     ck("串部门题被弃(0.13@基础架构)", len(kept) == 1)
     ck("存活率 1/3", report["overall"]["survival"] == round(1 / 3, 3))

@@ -7,11 +7,11 @@ const geistSans = Geist({ variable: '--font-geist-sans', subsets: ['latin'] });
 const geistMono = Geist_Mono({ variable: '--font-geist-mono', subsets: ['latin'] });
 
 export const metadata: Metadata = {
-  title: 'Memory Forge · 从场景到可验证的记忆世界',
-  description: '一段 60 秒的交互式诊断回放：白皮书、时间世界、问题铸造、证据闸门与六系统记忆竞技场。',
+  title: 'Memory Forge · 从场景到可验证的世界 Benchmark',
+  description: '以《霜狼之牙：被提前记录的死亡》为例，展示世界白皮书、因果世界、问题铸造与证据接地。',
   openGraph: {
-    title: 'Memory Forge · 从场景到可验证的记忆世界',
-    description: '从一句场景，锻造可验证的记忆世界。',
+    title: 'Memory Forge · 从场景到可验证的世界 Benchmark',
+    description: '给它一个场景；它构建一个会运转、会留下证据、也会被追问的世界。',
     type: 'website',
     locale: 'zh_CN',
     images: [{ url: '/memory-forge-social-preview.png', width: 1672, height: 941, alt: 'Memory Forge 世界内核' }],
@@ -19,7 +19,7 @@ export const metadata: Metadata = {
   twitter: {
     card: 'summary_large_image',
     title: 'Memory Forge',
-    description: '从一句场景，到可验证的记忆世界。',
+    description: '从一句场景，到一个可追问、可验证的世界 Benchmark。',
     images: ['/memory-forge-social-preview.png'],
   },
   icons: { icon: '/favicon.svg' },

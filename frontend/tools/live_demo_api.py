@@ -43,6 +43,8 @@ STEP_LABELS = {
     "council.style": "文风专家正在建立语言约束",
     "council.traps": "陷阱专家正在注入干扰",
     "council.critique": "审查者正在校验白皮书",
+    "council.world": "世界架构师正在编织故事契约",
+    "council.world_review": "世界审稿人正在闭合因果链",
     "world.batch": "正在生成世界实体",
     "world.structure": "正在编织世界关系",
     "world.repair": "机械校验正在修复世界",
@@ -110,6 +112,7 @@ app = FastAPI(title="Memory Forge Live Demo", version="0.1.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_allowed_origins(),
+    allow_origin_regex=r"^http://(?:localhost|127(?:\.\d{1,3}){3}|10(?:\.\d{1,3}){3}|192\.168(?:\.\d{1,3}){2}|172\.(?:1[6-9]|2\d|3[01])(?:\.\d{1,3}){2}|198\.18\.0\.1):3000$",
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
@@ -254,6 +257,10 @@ def _artifact_views(run_dir: Path, prompt: dict) -> dict:
     } for item in grounded_obj[-8:] if isinstance(item, dict) and item.get("question")]
 
     profile = whitepaper.get("domain_profile") or {}
+    story = whitepaper.get("story_contract") or {}
+    style = whitepaper.get("style_spec") or {}
+    capability_targets = whitepaper.get("capability_targets") or {}
+    source_authority = whitepaper.get("source_authority") or []
     active_lines = [
         _safe_text(item.get("line"), 40)
         for item in (whitepaper.get("active_lines") or [])
@@ -267,11 +274,30 @@ def _artifact_views(run_dir: Path, prompt: dict) -> dict:
             "sample_chars": len(str(few_shot[0].get("content") or "")) if few_shot else 0,
         },
         "whitepaper": {
+            "title": _safe_text(whitepaper.get("title"), 100),
+            "scenario_id": _safe_text(whitepaper.get("scenario_id"), 80),
             "entity_noun": _safe_text(profile.get("entity_noun"), 40),
+            "protagonist": _safe_text(story.get("protagonist"), 60),
+            "story_arc": _safe_text(story.get("arc"), 260),
+            "central_paradox": _safe_text(story.get("central_paradox"), 260),
+            "irreversible_cost": _safe_text(story.get("irreversible_cost"), 260),
+            "tone": _safe_text(style.get("tone"), 180),
+            "format": _safe_text(style.get("format"), 180),
+            "target_questions": int(capability_targets.get("total_q") or 0),
+            "target_star_questions": int(capability_targets.get("star_questions") or 0),
+            "source_tiers": [
+                _safe_text(item.get("meaning"), 100)
+                for item in source_authority[:4]
+                if isinstance(item, dict) and item.get("meaning")
+            ],
             "doc_genres": [_safe_text(value, 48) for value in (profile.get("doc_genres") or [])[:6]],
             "active_lines": active_lines,
         },
-        "world": {"entity_names": entity_names, "n_sessions": int(world.get("n_sessions") or 0)},
+        "world": {
+            "entity_names": entity_names,
+            "n_sessions": int(world.get("n_sessions") or 0),
+            "event_count": len(world.get("events") or []),
+        },
         "questions": question_views,
         "corpus_sessions": session_views,
         "grounding": {
@@ -286,14 +312,19 @@ def _safe_algo(manifest: dict, views: dict, prompt: dict) -> dict:
     algo = manifest.get("algo") or {}
     well = (algo.get("well_posed") or {}).get("overall") or {}
     grounding = (algo.get("grounding") or {}).get("overall") or views["grounding"]["overall"]
+    quality = algo.get("quality") or {}
     return {
         "entities": int(algo.get("entities") or len(views["world"]["entity_names"])),
         "sessions": int(algo.get("sessions") or views["world"]["n_sessions"]),
+        "events": int(algo.get("events") or views["world"].get("event_count") or 0),
         "orders": int(algo.get("orders") or 0),
         "well_posed": {"n": int(well.get("n") or 0), "kept": int(well.get("well_posed") or 0), "rate": well.get("pass_rate")},
         "questions": int(algo.get("questions") or prompt["step_counts"].get("phrase") or len(views["questions"])),
         "docs": int(algo.get("docs") or sum(item["docs"] for item in views["corpus_sessions"])),
         "chars": int(algo.get("chars") or 0),
+        "star_questions": int(quality.get("star_questions") or 0),
+        "signal_docs": int(quality.get("signal_documents") or 0),
+        "continuity_conflicts": int(quality.get("unintended_continuity_conflicts") or 0),
         "grounding": {
             "n": int(grounding.get("n") or 0),
             "grounded": int(grounding.get("grounded") or 0),
@@ -529,6 +560,7 @@ def replayable_runs() -> dict:
             rows.append({
                 "run_id": run_dir.name,
                 "scenario": _safe_text(manifest.get("scenario"), 40),
+                "title": _safe_text((_read_json(run_dir / "01_whitepaper.json", {}) or {}).get("title"), 100),
                 "status": manifest.get("status") or "unknown",
                 "created": manifest.get("created"),
                 "completed_stages": sum(1 for value in stages.values() if (value or {}).get("done")),
@@ -536,13 +568,14 @@ def replayable_runs() -> dict:
                 "has_06": (run_dir / "06_grounded_questions.json").exists(),
             })
     preferred = {
-        "office__20260717-064826": 0,
-        "game__20260625-112210": 1,
-        "agent__20260624-214306": 2,
-        "cs__20260625-134047": 3,
-        "companion__20260624-234524": 4,
-        "assistant__20260625-143946": 5,
-        "kb__20260625-032549": 6,
+        "game_showcase__20260906-053636": 0,
+        "office__20260717-064826": 1,
+        "game__20260625-112210": 2,
+        "agent__20260624-214306": 3,
+        "cs__20260625-134047": 4,
+        "companion__20260624-234524": 5,
+        "assistant__20260625-143946": 6,
+        "kb__20260625-032549": 7,
     }
     rows.sort(key=lambda row: (preferred.get(row["run_id"], 99), row["run_id"]))
     return {"runs": rows}
@@ -624,7 +657,7 @@ async def cancel_run(run_id: str) -> dict:
 @app.get("/api/recorded")
 def recorded_run() -> dict:
     """返回明确标记为 RECORDED 的历史成功 Run，供现场兜底和电影回放。"""
-    preferred = "office__20260717-064826"
+    preferred = "game_showcase__20260906-053636"
     if (RUNS_DIR / preferred).is_dir():
         return _run_snapshot(preferred, recorded=True)
     for run_dir in sorted(RUNS_DIR.iterdir(), reverse=True) if RUNS_DIR.exists() else []:

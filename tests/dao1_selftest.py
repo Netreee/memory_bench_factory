@@ -14,7 +14,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from pipeline.world_state import WorldState, Timeline, Op, SET, UPDATE, EXPIRE, _date_of, validate
 from pipeline.world_gen import _affix_units, imprint_structure
-from pipeline.render import (_attach_story_provenance, _story_signal_groups,
+from pipeline.render import (_attach_story_provenance, _canonical_fact_refs,
+                             _sanitize_corpus, _story_signal_groups,
                              _strict_eq, render_corpus)
 from pipeline.story import StoryLedgerError, compile_story_ledger
 from pipeline.central_office import _canonicalize_lines
@@ -23,6 +24,16 @@ from pipeline.lines import prepare_lines
 
 checks: list[tuple[bool, str]] = []
 def ck(name, cond): checks.append((bool(cond), name))
+
+
+def _fake_filler(messages):
+    """按新顶层数组协议返回调用方要求的精确 filler 数量。"""
+    import re
+    user = messages[-1]["content"]
+    match = re.search(r"生成\s*(\d+)\s*篇", user)
+    want = int(match.group(1)) if match else 0
+    return [{"type": "旁支日志", "content": f"外围无关归档记录 {index}"}
+            for index in range(want)]
 
 
 ck("盲读答案的成对引号不改变精确值", _strict_eq("『已拾取』", "已拾取")
@@ -53,7 +64,10 @@ def _tl(*sv):                            # sv: (session, value);自动 SET/UPDAT
 class _ScriptedTracer:
     """按脚本回 docs。只对 render.signal 出脚本+记历史(filler/conflict 等其它调用回空,免互相吃响应)。"""
     def __init__(self, script):
-        self.script = list(script); self.calls = []; self.systems = []
+        self.script = list(script); self.calls = []; self.systems = []; self.text_prompts = []
+    def chat_text(self, tag, messages, **kw):
+        self.text_prompts.append(messages)
+        return "外围无关归档记录。"
     def chat_json(self, tag, messages, **kw):
         if tag == "narrative.review":
             return {"unsupported_claims": []}
@@ -61,8 +75,10 @@ class _ScriptedTracer:
             text = messages[-1]["content"]
             for value in ("86小时", "维持治疗"):
                 if value in text:
-                    return {"answer": value}
-            return {"answer": "不确定"}
+                    return {"answers": [{"key": "q0", "answer": value}]}
+            return {"answers": [{"key": "q0", "answer": "不确定"}]}
+        if tag == "render.filler":
+            return _fake_filler(messages)
         if tag != "render.signal":
             return {"docs": []}
         self.systems.append(messages[0]["content"])
@@ -90,8 +106,27 @@ t1 = _ScriptedTracer([{"docs": [good_doc]}])
 docs1 = _run_render(t1)
 ck("①豁免:字段名含禁词的合格 doc 一次过(不再静默杀)", len(t1.calls) == 1 and any("86小时" in d["content"] for d in docs1))
 ck("①无兜底备忘混入", not any(d.get("is_fallback") for d in docs1))
+ck("filler 提示词不向模型暴露冻结实体专名",
+   t1.text_prompts and all("鼎晟案" not in message["content"]
+                           for prompt in t1.text_prompts for message in prompt))
 ck("①信号文档漏 fact_refs 时按当期真值反推补齐",
    docs1 and docs1[0].get("fact_refs") == ["鼎晟案.累计计费工时"])
+
+# 模型即使自报了非空但非法的引用，最终元数据也必须以冻结世界+正文为准。
+wrong_refs = {"sessions": [{"session_id": 0, "docs": [{
+    "doc_id": "s0_sig_0", "content": "鼎晟案累计计费工时为86小时。",
+    "fact_refs": ["case.鼎晟案.累计计费工时", "不存在.stopped"],
+}]}]}
+canonical_stats = _sanitize_corpus(wrong_refs, _mini_ws())
+ck("①信号文档非空错误 fact_refs 被规范真源覆盖",
+   wrong_refs["sessions"][0]["docs"][0]["fact_refs"] == ["鼎晟案.累计计费工时"]
+   and canonical_stats["canonicalized_refs"] == 1)
+
+event_ref = _canonical_fact_refs(
+    "艾尔文在霜牙参与下完成击败：艾尔文的任务状态更新为完成。",
+    [], [{"id": "evt-1", "participants": {"player": "艾尔文", "boss": "霜牙"},
+          "effects": [{"entity": "艾尔文", "field": "任务状态", "set": "完成"}]}])
+ck("①事件 provenance 使用规范 event-id，不再生成不存在的 .label 字段", event_ref == ["evt-1"])
 
 # ①b:doc 真犯禁(正文用「目前」)→ 重渲,且 hint 必须【如实】说"因全局口径词被废",不再谎报"没写"
 bad_doc = {"title": "周度纪要", "type": "纪要", "content": "鼎晟案本期累计计费工时为86小时,目前整体平稳。"}
@@ -104,7 +139,8 @@ ck("①b hint 如实报死因(含'全局口径词'与『目前』)", "全局口�
 t3 = _ScriptedTracer([{"docs": []}] * 4)
 docs3 = _run_render(t3)
 fb = [d for d in docs3 if d.get("is_fallback")]
-ck("②耗尽 fail-loud:4 轮失败后弃段", len(t3.calls) == 4 and docs3 == [])
+signal3 = [d for d in docs3 if "_sig_" in str(d.get("doc_id", ""))]
+ck("②耗尽 fail-loud:4 轮失败后弃段", len(t3.calls) == 4 and signal3 == [])
 ck("②弃段不注 K=V 兜底备忘", not fb)
 
 # ②b:whitepaper style_spec 必须进入实际 signal system prompt，且旧固定长文约束不得残留
@@ -177,17 +213,24 @@ class _StoryTracer:
     """按事件返回合格短文，并留存 signal prompt 供剧情边界断言。"""
     def __init__(self):
         self.calls = []
+        self.review_calls = []
+
+    def chat_text(self, tag, messages, **kw):
+        return "边境商队在本期登记了一批与主线无关的普通货物。"
 
     def chat_json(self, tag, messages, **kw):
         user = messages[-1]["content"]
         if tag == "narrative.review":
+            self.review_calls.append(user)
             return {"unsupported_claims": []}
         if tag == "render.discriminate":
             if "任务状态" in user and "记录为出发" in user:
-                return {"answer": "出发"}
+                return {"answers": [{"key": "q0", "answer": "出发"}]}
             if "任务状态" in user and "记录为完成" in user:
-                return {"answer": "完成"}
-            return {"answer": "不确定"}
+                return {"answers": [{"key": "q0", "answer": "完成"}]}
+            return {"answers": [{"key": "q0", "answer": "不确定"}]}
+        if tag == "render.filler":
+            return _fake_filler(messages)
         if tag != "render.signal":
             return {"docs": []}
         self.calls.append(user)
@@ -201,6 +244,21 @@ class _StoryTracer:
 
 
 story_ws = _story_ws()
+
+# 普通场景也可以有 domain events；只有启用 Story Ledger 的 Game 才要求事件组全覆盖。
+agent_event_ws = deepcopy(story_ws)
+agent_event_ws.narrative = None
+try:
+    render_corpus({"domain_profile": {"doc_genres": ["执行日志"]}}, agent_event_ws, 0,
+                  _ScriptedTracer([]), {"sessions": []}, set(),
+                  save_cb=lambda: None, log=lambda *a: None)
+except RuntimeError:
+    agent_event_drop_allowed = False
+else:
+    agent_event_drop_allowed = True
+ck("②c 普通 Agent 的 event 组失败只弃段，不误报 game narrative 全局失败",
+   agent_event_drop_allowed)
+
 story_tracer = _StoryTracer()
 story_corpus = {"sessions": []}
 render_corpus({"domain_profile": {"doc_genres": ["剧情日志"]}}, story_ws, 0,
@@ -224,6 +282,49 @@ ck("②c accepted doc 的 scene_refs/event_refs 由代码确定",
    and story_docs[1].get("event_refs") == ["evt-finish"])
 ck("②c signal 身份由代码决定，模型不能用 is_filler 删除事件证据",
    all(doc.get("is_filler") is False for doc in story_docs.values()))
+ck("②c 语料叙事审阅 CANON 含本篇 document_date 与载体动作白名单",
+   story_tracer.review_calls
+   and all('"period_label": "第1章"' in story_tracer.review_calls[0]
+           and '"time_unit": "章"' in story_tracer.review_calls[0]
+           and '"document_date": "2025-01-' in user
+           and '"allowed_document_scaffolding"' in user
+           for user in story_tracer.review_calls))
+
+
+class _PartialFillerTracer(_StoryTracer):
+    """第一篇 filler 空正文，其余正常，验证草堆按总规模而非逐调用验收。"""
+
+    def __init__(self, fail_all=False):
+        super().__init__()
+        self.filler_calls = 0
+        self.fail_all = fail_all
+
+    def chat_text(self, tag, messages, **kw):
+        self.filler_calls += 1
+        if self.fail_all or self.filler_calls == 1:
+            return {"__error__": "reasoning-only"}
+        return super().chat_text(tag, messages, **kw)
+
+
+partial_filler_corpus = {"sessions": []}
+partial_filler_done = set()
+render_corpus({"domain_profile": {"doc_genres": ["剧情日志"]}}, story_ws, 0,
+              _PartialFillerTracer(), partial_filler_corpus, partial_filler_done,
+              save_cb=lambda: None, log=lambda *a: None)
+partial_fillers = [doc for session in partial_filler_corpus["sessions"]
+                   for doc in session["docs"] if doc.get("is_filler") is True]
+ck("②c 单篇 filler 失败显式跳过，不杀死已满足规模与事件合同的 corpus",
+   partial_filler_done == {0, 1} and len(partial_fillers) == 15)
+
+try:
+    render_corpus({"domain_profile": {"doc_genres": ["剧情日志"]}}, story_ws, 1000,
+                  _PartialFillerTracer(fail_all=True), {"sessions": []}, set(),
+                  save_cb=lambda: None, log=lambda *a: None)
+except RuntimeError as exc:
+    filler_size_closed = "语料字符不足" in str(exc)
+else:
+    filler_size_closed = False
+ck("②c filler 可缺失但总语料规模仍 fail-closed", filler_size_closed)
 
 split_docs = [
     {"content": "艾尔文响应启程，任务状态记录为出发。"},
@@ -285,11 +386,11 @@ class _BackgroundUnsupportedTracer(_StoryTracer):
     def chat_json(self, tag, messages, **kw):
         user = messages[-1]["content"]
         if tag == "render.discriminate" and "称号" in user:
-            return {"answer": "守夜人"}
+            return {"answers": [{"key": "q0", "answer": "守夜人"}]}
         if tag == "narrative.review" and "私自复活" in user:
             self.background_reviews.append(user)
             return {"unsupported_claims": ["无依据复活"]}
-        if tag == "render.signal" and "evt-start" not in user and "evt-finish" not in user:
+        if tag == "render.signal" and "称号" in user:
             return {"docs": [{"type": "角色记录",
                               "content": "2025-01-06，艾尔文的称号记为守夜人，并在无记录下私自复活。",
                               "fact_refs": ["艾尔文.称号"]}]}
@@ -562,9 +663,16 @@ class _OkTracer:
         return {"question": "周涛的督导合伙人按官方记录是哪位？"} if tag == "phrase" else {"docs": []}
 ph_ok = phrase_questions([ord49], {"domain_profile": {}}, _OkTracer(), log=lambda *a: None)
 ck("⑫b 正常含主语题面不被兜底改写", ph_ok[0]["question"] == "周涛的督导合伙人按官方记录是哪位？")
+# ⑫c 润色协议失败不应杀死已经通过良定义闸的订单；产线 intent 是题面真源。
+class _EmptyPhraseTracer:
+    def chat_json(self, tag, messages, **kw):
+        return {"__error__": "reasoning-only"} if tag == "phrase" else {"docs": []}
+ph_empty = phrase_questions([ord49], {"domain_profile": {}}, _EmptyPhraseTracer(), log=lambda *a: None)
+ck("⑫c phraser 空正文→保留完整 intent，不侵蚀订单 floor",
+   len(ph_empty) == 1 and "周涛" in ph_empty[0]["question"])
 # ⑫c 协议加属性归属声明(v4)
 from pipeline.factory import ANSWER_PROTOCOL as _AP
-ck("⑫c 协议 v4 + 属性归属声明", _AP["version"] == 4 and _AP.get("attribute_ownership_no_fold") is True
+ck("⑫d 协议 v4 + 属性归属声明", _AP["version"] == 4 and _AP.get("attribute_ownership_no_fold") is True
    and any("不得经关系链折算" in r for r in _AP["rules"]))
 
 # ════════ ⑦ L4 _choice_field 叠词去重 ════════

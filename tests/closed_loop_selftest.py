@@ -11,11 +11,15 @@ driver 本体(build_to_target)调真 LLM stage 逻辑,端到端另用小规模�
 """
 from __future__ import annotations
 import sys, math, dataclasses
+from copy import deepcopy
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from pipeline.closed_loop import (_orders_by_line, _order_deficit, _grow_for_supply,
-                                  _floor_status, _scale_world_contract)
+from pipeline.closed_loop import (_orders_by_line, _order_deficit, _order_shortfall, _grow_for_supply,
+                                  _ensure_l7_capacity,
+                                  _floor_status, _resolve_per_line_contract,
+                                  _scale_world_contract)
+from pipeline.world_blueprint import WorldBlueprintError
 from pipeline.targetspec import TargetSpec, WorldParams, invert_rate, N_ENT_CLAMP, N_SESS_CLAMP, DEFAULT_SLACK
 
 checks: list[tuple[bool, str]] = []
@@ -31,20 +35,43 @@ obl = _orders_by_line(orders)
 ck("_orders_by_line 计数正确", obl == {"L1_timeline": 8, "L2_relational": 4, "L3_process": 5})
 ck("_orders_by_line 空输入 → {}", _orders_by_line([]) == {})
 
-# ── _order_deficit:可行线【实质】短缺才记(容差吸收噪声)、不可行线不计、达标线不计 ──
+# ── _order_deficit:只比较硬下限；不可行线不计、达标线不计 ────────────────
 target = {"L1_timeline": 10, "L2_relational": 6, "L3_process": 5, "L5_conflict": 3}
-# L1 缺2(=容差 max(1,round(10×.15))=2,噪声,不算);L3 缺3(>容差 max(1,round(5×.15))=1,实质);L2 够;L5 0
 produced = {"L1_timeline": 8, "L2_relational": 6, "L3_process": 2}
 feasible = {"L1_timeline", "L2_relational", "L3_process"}               # L5 不可行(无文本字段)
 defi = _order_deficit(produced, target, feasible)
-ck("_order_deficit:噪声级短缺(L1 缺2=容差)不进赤字", "L1_timeline" not in defi)
-ck("_order_deficit:实质短缺(L3 缺3>容差)进赤字、记全额", defi.get("L3_process") == 3)
+ck("_order_deficit:硬下限差 2 也必须进赤字", defi.get("L1_timeline") == 2)
+ck("_order_deficit:硬下限差 3 进赤字", defi.get("L3_process") == 3)
 ck("_order_deficit:配额已满足的线不进赤字(L2)", "L2_relational" not in defi)
 ck("_order_deficit:不可行线不进赤字(L5,扩世界也没用)", "L5_conflict" not in defi)
 ck("_order_deficit:全达标 → 空赤字", _order_deficit({"L1_timeline": 10}, {"L1_timeline": 10}, {"L1_timeline"}) == {})
-# 容差边界(配额10→容差2):缺=容差放过、缺=容差+1 触发(记全额)
-ck("_order_deficit:容差边界 缺=tol 放过", _order_deficit({"L1_timeline": 8}, {"L1_timeline": 10}, {"L1_timeline"}) == {})
-ck("_order_deficit:容差边界 缺=tol+1 触发记全额3", _order_deficit({"L1_timeline": 7}, {"L1_timeline": 10}, {"L1_timeline"}) == {"L1_timeline": 3})
+# 当前真实受控样本：软配额 L3=16 只产 13，但硬下限 L3=5，绝不能重建世界。
+controlled_produced = {
+    "L1_timeline": 8, "L2_relational": 7, "L3_process": 13,
+    "L5_conflict": 7, "L6_refusal": 7, "L7_consolidation": 8,
+}
+controlled_floor = {
+    "L1_timeline": 4, "L2_relational": 4, "L3_process": 5,
+    "L5_conflict": 4, "L6_refusal": 3, "L7_consolidation": 4,
+}
+ck("_order_deficit:真实样本已过硬下限，不追软 slack 重建",
+   _order_deficit(controlled_produced, controlled_floor, set(controlled_floor)) == {})
+ck("_order_shortfall:最终硬闸包含不可行线，不能进入不可能成功的 corpus",
+   _order_shortfall({"L1_timeline": 4, "L7_consolidation": 3},
+                    {"L1_timeline": 4, "L7_consolidation": 4})
+   == {"L7_consolidation": 1})
+
+# 显式配额是调用者契约：规范化可以，静默丢线不可以。
+ck("_resolve_per_line_contract:可规范化 L1 简写",
+   _resolve_per_line_contract(["L1_timeline"], {"L1": 3}) == {"L1_timeline": 3})
+try:
+    _resolve_per_line_contract(["L1_timeline"], {"L7_consolidation": 4})
+except WorldBlueprintError:
+    _inactive_floor_rejected = True
+else:
+    _inactive_floor_rejected = False
+ck("_resolve_per_line_contract:显式 L7 未激活时 fail-closed",
+   _inactive_floor_rejected)
 
 # ── _grow_for_supply:有赤字才长、夹 clamp、无赤字原样 ───────────────────────────
 p0 = WorldParams(n_entities=12, n_sessions=10, quota_L1=10, max_n_conflicts=3, target_orders=target)
@@ -98,6 +125,14 @@ ck("_scale_world_contract:typed blueprint 与 legacy 镜像使用实际实体/se
    scaled_bp["temporal_model"]["n_sessions"] == 12
    and typed_wp["shared_world_spec"]["entities"]["count"] == 20
    and typed_wp["shared_world_spec"]["timeline"]["n_sessions"] == 12)
+
+# 闭环发布必须把 01/02 当成同一事务：候选可变，但已发布合同快照不可被原地污染。
+published_contract = deepcopy(typed_wp)
+candidate_contract = deepcopy(typed_wp)
+_scale_world_contract(candidate_contract, n_entities=18, n_sessions=9)
+ck("闭环合同事务:候选扩容不污染此前已发布白皮书快照",
+   published_contract["world_blueprint"]["temporal_model"]["n_sessions"] == 12
+   and candidate_contract["world_blueprint"]["temporal_model"]["n_sessions"] == 9)
 
 # 缩放目标来自闭环旋钮：小目标也必须能压回小世界；比例锚始终取首次白皮书。
 _scale_world_contract(typed_wp, n_entities=7, n_sessions=6)
@@ -180,6 +215,33 @@ event_capacity_wp = {
 _scale_world_contract(event_capacity_wp, n_entities=100, n_sessions=2)
 ck("_scale_world_contract:event min_count 不超过角色组合×session 的实例容量",
    event_capacity_wp["world_blueprint"]["event_types"][0]["min_count"] == 2)
+
+l7_capacity_wp = {
+    "domain_profile": {},
+    "world_blueprint": {
+        "entity_types": [
+            {"id": "tool", "count": 1, "fields": [
+                {"name": "success_rate", "kind": "numeric", "range": [0, 1]},
+                {"name": "timeout_count", "kind": "numeric", "monotonic": "up"},
+            ]},
+            {"id": "invocation", "count": 9, "fields": [
+                {"name": "retry_count", "kind": "numeric", "monotonic": "up"},
+            ]},
+        ],
+        "relation_types": [],
+        "event_types": [],
+        "temporal_model": {"n_sessions": 10},
+    },
+}
+l7_capacity = _ensure_l7_capacity(l7_capacity_wp, 4)
+l7_counts = {item["id"]: item["count"]
+             for item in l7_capacity_wp["world_blueprint"]["entity_types"]}
+ck("_ensure_l7_capacity:按硬 floor 把自然趋势容量从 1 提到 4",
+   l7_capacity == {"before": 1, "after": 4, "moved": {"tool": 3, "invocation": -3}})
+ck("_ensure_l7_capacity:只重分配类型人口，总实体数不膨胀",
+   l7_counts == {"tool": 4, "invocation": 6})
+ck("_ensure_l7_capacity:累计数值不冒充可塑趋势，imprint 上限同步 floor",
+   l7_capacity_wp["domain_profile"]["l7_max_trends"] == 4)
 
 # ── _floor_status:达标/可行未达(growable)/不可行未达(permanent)/总数闸 ─────────
 spec = TargetSpec(min_questions=20, per_line_min={"L1_timeline": 8, "L2_relational": 6, "L3_process": 5})
@@ -270,11 +332,12 @@ st3, r3, bl3 = drive_sim(spec1, {"L1_timeline": .9, "L2_relational": .9},
 ck("控制流③:floor 线不可行 → UNMET_permanent", st3 == "UNMET_permanent")
 ck("控制流③:不可行 → 第1轮即收手,不空转到 max_rounds", r3 == 1)
 
-# 场景4:floor 高到 clamp 也供不满(survival 极低)→ 耗尽 max_rounds 仍 UNMET(fail-open,不死循环)
+# 场景4:floor 高到 clamp 也供不满(survival 极低)→ 耗尽 max_rounds 仍 UNMET(上层必须 fail-closed)
 spec4 = TargetSpec(min_questions=200, per_line_min={"L1_timeline": 90, "L2_relational": 90})
 st4, r4, bl4 = drive_sim(spec4, {"L1_timeline": .2, "L2_relational": .2},
                          {"L1_timeline", "L2_relational"}, max_rounds=2)
-ck("控制流④:floor 远超 clamp 上限 → 耗尽 max_rounds 仍 UNMET(有界,不死循环)", st4 == "UNMET_exhausted" and r4 == 2)
+ck("控制流④:floor 远超 clamp 上限 → 有界返回 UNMET 供上层判失败",
+   st4 == "UNMET_exhausted" and r4 == 2)
 
 # 场景5:总下限盈余摊派 —— min_q 大于 Σfloor 时,摊派后 Σfloor' ≥ min_q(消掉"总数单独差"歧义态)
 spec5 = TargetSpec(min_questions=30, per_line_min={"L1_timeline": 8, "L2_relational": 6, "L3_process": 5})  # Σ=19<30

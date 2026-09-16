@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from collections import Counter
 from pathlib import Path
@@ -31,6 +32,10 @@ REQUIRED_ARTIFACTS = [
     "06_grounding_report.json",
     "manifest.json",
 ]
+
+_CREDENTIAL_TOKEN_RE = re.compile(
+    r"(?<![A-Za-z0-9_-])(?:sk-[A-Za-z0-9_-]{16,}|AKIA[A-Z0-9]{16}|"
+    r"gh[pousr]_[A-Za-z0-9]{20,})(?![A-Za-z0-9_-])")
 
 
 class Audit:
@@ -108,6 +113,10 @@ def audit_run(run_dir: Path) -> Audit:
     whitepaper = data["01_whitepaper.json"]
     world = data["02_world.json"]
     audit.check(isinstance(manifest, dict) and manifest.get("status") == "done", "manifest.status=done")
+    audit.check(
+        isinstance(manifest, dict) and manifest.get("run_id") == run_dir.name,
+        "manifest.run_id 与 Run 目录名一致",
+    )
 
     blueprint = None
     try:
@@ -155,7 +164,10 @@ def audit_run(run_dir: Path) -> Audit:
             rule_id = rule.get("id")
             audit.check(cascade_counts[rule_id] >= 1, f"因果规则 {rule_id} 有真实事件对见证")
 
-        expected_sessions = int((blueprint.get("temporal_model") or {}).get("n_sessions", 0) or 0)
+        # 结构签名冻结语义骨架；闭环允许在 01 中发布有效规模旋钮。02 自带的
+        # blueprint 才是生成该世界的直接合同，时间片/基数必须按它验。
+        effective_blueprint = world_blueprint if isinstance(world_blueprint, dict) else blueprint
+        expected_sessions = int((effective_blueprint.get("temporal_model") or {}).get("n_sessions", 0) or 0)
         audit.check(int(world.get("n_sessions", 0) or 0) == expected_sessions,
                     f"世界时间片数量与蓝图一致（{expected_sessions}）")
 
@@ -167,6 +179,19 @@ def audit_run(run_dir: Path) -> Audit:
     audit.check(bool(questions) and all(item.get("question") and "gt" in item for item in questions),
                 "题库非空且每题含题面与机械 gold")
     audit.check(bool(grounded), "接地后题库非空")
+    # 06 只能给 04 增加证据池，不能在接地阶段悄悄改题面、gold 或能力标签。
+    def question_signature(question: dict) -> str:
+        return json.dumps(
+            {key: value for key, value in question.items() if key != "evidence_doc_ids"},
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+
+    question_counts = Counter(question_signature(item) for item in questions)
+    grounded_counts = Counter(question_signature(item) for item in grounded)
+    lineage_ok = all(count <= question_counts[signature]
+                     for signature, count in grounded_counts.items())
+    audit.check(lineage_ok, "06 是 04 的未篡改子集")
     report_grounded = ((report.get("overall") or {}).get("grounded")
                        if isinstance(report, dict) else None)
     audit.check(report_grounded == len(grounded), "接地报告数量与 06 题库一致")
@@ -186,19 +211,139 @@ def audit_run(run_dir: Path) -> Audit:
     sessions = _as_list(corpus, "sessions")
     docs = [doc for session in sessions for doc in _as_list(session.get("docs", []))]
     doc_ids = [doc.get("doc_id") for doc in docs]
+    doc_sessions = {
+        doc.get("doc_id"): session.get("session_id")
+        for session in sessions
+        for doc in _as_list(session.get("docs", []))
+    }
+    docs_by_id = {
+        doc.get("doc_id"): doc
+        for session in sessions
+        for doc in _as_list(session.get("docs", []))
+    }
     audit.check(bool(sessions) and bool(docs), "语料含时间片与文档")
     audit.check(None not in doc_ids and len(doc_ids) == len(set(doc_ids)), "所有 doc_id 存在且唯一")
+    missing_evidence_ids = sorted({
+        doc_id
+        for question in grounded
+        for doc_id in (question.get("evidence_doc_ids") or [])
+        if doc_id not in doc_sessions
+    })
+    out_of_scope_evidence = [
+        (question.get("qid"), doc_id, doc_sessions[doc_id])
+        for question in grounded
+        for doc_id in (question.get("evidence_doc_ids") or [])
+        if doc_id in doc_sessions and doc_sessions[doc_id] not in (question.get("evidence_sessions") or [])
+    ]
+    empty_evidence_pools = [
+        question.get("qid") or f"{question.get('line')}:{index}"
+        for index, question in enumerate(grounded)
+        if not question.get("evidence_doc_ids")
+    ]
+    duplicate_evidence_pools = [
+        question.get("qid") or f"{question.get('line')}:{index}"
+        for index, question in enumerate(grounded)
+        if len(question.get("evidence_doc_ids") or [])
+        != len(set(question.get("evidence_doc_ids") or []))
+    ]
+    filler_evidence = [
+        (question.get("qid") or f"{question.get('line')}:{index}", doc_id)
+        for index, question in enumerate(grounded)
+        for doc_id in (question.get("evidence_doc_ids") or [])
+        if doc_id in docs_by_id and docs_by_id[doc_id].get("is_filler") is True
+    ]
+    audit.check(
+        not empty_evidence_pools,
+        "06 每道题都发布非空 evidence_doc_ids"
+        if not empty_evidence_pools
+        else f"06 存在空证据池：{empty_evidence_pools[:12]}",
+    )
+    audit.check(
+        not missing_evidence_ids,
+        "题目 evidence_doc_ids 全部存在"
+        if not missing_evidence_ids
+        else f"题目引用不存在的 evidence_doc_ids：{missing_evidence_ids[:12]}",
+    )
+    audit.check(
+        not out_of_scope_evidence,
+        "evidence_doc_ids 全部落在声明 evidence_sessions 内"
+        if not out_of_scope_evidence
+        else f"证据文档落在声明时间窗外：{out_of_scope_evidence[:12]}",
+    )
+    audit.check(
+        not duplicate_evidence_pools,
+        "每题 evidence_doc_ids 均无重复"
+        if not duplicate_evidence_pools
+        else f"题目证据池含重复 ID：{duplicate_evidence_pools[:12]}",
+    )
+    audit.check(
+        not filler_evidence,
+        "evidence_doc_ids 全部指向非 filler 文档"
+        if not filler_evidence
+        else f"题目把 filler 当证据：{filler_evidence[:12]}",
+    )
     signal_docs = [doc for doc in docs if "_sig_" in str(doc.get("doc_id", ""))]
     filler_docs = [doc for doc in docs if doc.get("is_filler") is True]
+    corpus_chars = sum(len(str(doc.get("content", ""))) for doc in docs)
+    target_chars = int((manifest.get("config") or {}).get("target_tokens") or 0)
+    audit.check(
+        corpus_chars >= target_chars,
+        f"语料规模 {corpus_chars} 字符≥目标 {target_chars}"
+        if corpus_chars >= target_chars
+        else f"语料规模不足：{corpus_chars}/{target_chars}",
+    )
     audit.check(bool(signal_docs) and all(doc.get("fact_refs") for doc in signal_docs),
                 "信号文档非空且全部带 fact_refs")
+    valid_fact_refs = {
+        f"{entity}.{field}"
+        for entity, fields in entities.items()
+        for field in fields
+    }
+    valid_fact_refs.update(item.get("id") for item in events)
+    valid_fact_refs.update(item.get("id") for item in relations)
+    valid_fact_refs.update(item.get("rule_id") for item in cascades)
+    dangling_fact_refs = sorted({
+        ref
+        for doc in signal_docs
+        for ref in (doc.get("fact_refs") or [])
+        if ref not in valid_fact_refs
+    })
+    audit.check(
+        not dangling_fact_refs,
+        "全部 fact_refs 可解析到世界事实"
+        if not dangling_fact_refs
+        else f"fact_refs 存在悬空引用：{dangling_fact_refs[:12]}",
+    )
     audit.check(all(not doc.get("fact_refs") for doc in filler_docs), "filler 全部不携带 fact_refs")
+    credential_like_fillers = [
+        doc.get("doc_id") for doc in filler_docs
+        if _CREDENTIAL_TOKEN_RE.search(str(doc.get("content") or ""))
+    ]
+    audit.check(
+        not credential_like_fillers,
+        "filler 不含凭据形态 token"
+        if not credential_like_fillers
+        else f"filler 含凭据形态 token：{credential_like_fillers[:12]}",
+    )
 
     tracked_terms = set(entities)
-    tracked_terms.update(field for fields in entities.values() for field in fields)
+    profile = whitepaper.get("domain_profile", {}) if isinstance(whitepaper, dict) else {}
+    person_fields = {
+        item.get("name") for item in profile.get("field_schema", [])
+        if isinstance(item, dict) and item.get("kind") == "person"
+    }
+    tracked_terms.update(
+        str(point.get("value"))
+        for fields in entities.values()
+        for field, timeline in fields.items()
+        if field in person_fields and isinstance(timeline, list)
+        for point in timeline
+        if isinstance(point, dict) and point.get("value") not in (None, "")
+    )
     filler_text = "\n".join(str(doc.get("content", "")) for doc in filler_docs)
-    leaks = sorted(term for term in tracked_terms if term and term in filler_text)
-    audit.check(not leaks, "filler 未触碰被追踪实体/字段" if not leaks else f"filler 泄漏追踪词：{leaks[:10]}")
+    # 与生产 blocklist 对齐：单字状态占位（如“无”）不是可定位的人物专名。
+    leaks = sorted(term for term in tracked_terms if term and len(str(term)) >= 2 and term in filler_text)
+    audit.check(not leaks, "filler 未触碰被追踪实体/人物专名" if not leaks else f"filler 泄漏追踪专名：{leaks[:10]}")
 
     if manifest.get("scenario") == "game":
         office_markers = ["OA系统", "办公区", "行政部", "人力资源部", "员工培训", "公司员工", "食堂管理部"]

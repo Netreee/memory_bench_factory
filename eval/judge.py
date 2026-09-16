@@ -175,6 +175,13 @@ def judge_spec(q: dict) -> tuple:
 
 
 def is_judgeable(q: dict) -> bool:
+    strict = q.get("strict_scoring") or {}
+    if strict:
+        if strict.get("policy") != "all_required_atoms":
+            return False
+        atoms = strict.get("required_atoms") or []
+        if not isinstance(atoms, list) or not atoms or not all(str(atom).strip() for atom in atoms):
+            return False
     mode, gold, expect = judge_spec(q)
     if mode == "value":
         return bool(gold)
@@ -363,8 +370,44 @@ def judge_l9(q: dict, pred: str) -> dict:
     return {"selected": None, "correct": False}                        # 0 命中 / 歧义多命中 → 判错
 
 
+_STRICT_NEGATION_MARKERS = (
+    "不是", "并非", "不在", "没有", "未能", "未曾", "不能", "没能", "从未", "并未", "不曾",
+)
+
+
+def _judge_all_required_atoms(required: list[str], pred: str) -> bool:
+    """严格原子判分：所有原子须被正向陈述，显式否定不能靠关键词共现得分。"""
+    normalized_pred = _norm(pred)
+
+    def positively_mentioned(atom: str) -> bool:
+        needle = _norm(atom)
+        if not needle:
+            return False
+        index = normalized_pred.find(needle)
+        while index >= 0:
+            prefix = normalized_pred[max(0, index - 10):index]
+            negated = False
+            for marker in _STRICT_NEGATION_MARKERS:
+                token = _norm(marker)
+                marker_index = prefix.rfind(token)
+                if marker_index >= 0 and len(prefix) - marker_index - len(token) <= 2:
+                    negated = True
+                    break
+            if not negated:
+                return True
+            index = normalized_pred.find(needle, index + 1)
+        return False
+
+    return bool(required) and all(positively_mentioned(atom) for atom in required)
+
+
 def judge_answer(q: dict, pred: str, use_llm: bool = True) -> bool:
     """统一判分入口。按 q['capability'] 声明分派到 value/refusal/order/admission/mc。"""
+    strict = q.get("strict_scoring") or {}
+    if strict.get("policy") == "all_required_atoms":
+        # 宣传片明星题使用全原子合同，防止长答案只命中一个短词就被互为子串快路误判为正确。
+        required = [str(atom) for atom in (strict.get("required_atoms") or []) if str(atom).strip()]
+        return _judge_all_required_atoms(required, pred)
     mode, gold, expect = judge_spec(q)
     question = q.get("question", "")
     if mode == "mc":                                 # ★L9:闭选项 MC EM(纯代码,use_llm 不生效 → 死命门)
@@ -483,6 +526,31 @@ if __name__ == "__main__":
     # 歧义:答案同时含两个不同选项 → 无法唯一定位 → False
     ck("L9 答含两选项(歧义)→ False", judge_l9(ql9, "升级为紧急工单还是上报主管都行")["correct"] is False)
     ck("L9 gold_display 标 MC 闭选项", "MC" in str(gold_display(ql9)))
+
+    # ── 宣传片明星题：所有必答原子必须同时出现，杜绝长 gold 的局部子串误判 ──
+    qstar = {
+        "line": "L5_conflict", "capability": "L5_conflict",
+        "question": "真正死亡发生在何时何地？", "gt": "2025-02-17，白钟桥",
+        "strict_scoring": {
+            "policy": "all_required_atoms",
+            "required_atoms": ["2025-02-17", "白钟桥"],
+        },
+    }
+    ck("strict star 可判", is_judgeable(qstar) is True)
+    ck("strict star 全原子命中 → True",
+       judge_answer(qstar, "真正死亡发生于 2025-02-17 的白钟桥。", use_llm=False) is True)
+    ck("strict star 只答地点 → False",
+       judge_answer(qstar, "发生在白钟桥。", use_llm=False) is False)
+    ck("strict star 只答日期 → False",
+       judge_answer(qstar, "发生在 2025-02-17。", use_llm=False) is False)
+    ck("strict star 否定式堆齐原子 → False",
+       judge_answer(qstar, "不是 2025-02-17，也不在白钟桥。", use_llm=False) is False)
+    ck("strict star 纠正旧值后给全答案 → True",
+       judge_answer(qstar, "不是 2 月 11 日，而是 2025-02-17 的白钟桥。", use_llm=False) is True)
+    ck("strict star 无关代价被否定、答案原子仍正向 → True",
+       judge_answer(qstar, "他没能保住清白，但真正死亡发生于 2025-02-17 的白钟桥。", use_llm=False) is True)
+    ck("strict star 否定词与原子间有修饰语 → False",
+       judge_answer(qstar, "并非真正发生在 2025-02-17，也不在白钟桥。", use_llm=False) is False)
 
     npass = sum(1 for ok, _ in checks if ok)
     for ok, name in checks:

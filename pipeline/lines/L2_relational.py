@@ -87,7 +87,9 @@ def discover_fk_paths(ws: WorldState, hops: int = 2) -> list[list[str]]:
                         for z in fk_targets(y, f2):
                             for f3 in ws.entities.get(z, {}):   # hop3:桥2 的任意字段(末跳=答案)
                                 patterns.add((f1, f2, f3))
-    return [list(p) for p in patterns]
+    # set 的遍历顺序受 PYTHONHASHSEED 影响；若不排序，后续 target 截断会让同一
+    # 冻结世界在不同进程中得到不同订单与 floor 结果。
+    return [list(p) for p in sorted(patterns)]
 
 
 def _l2_difficulty(hops: int, cross_week: bool) -> str:
@@ -255,7 +257,11 @@ class RelationalLine(ProductionLine):
             aux["time_unit"] = ws.period_unit()
             tagged.append({"line": self.id, "capability": "L2_multihop", "entity": o.entity,
                            "field": o.field, "gt": o.gt, "evidence_sessions": o.evidence_sessions, "aux": aux})
-        return _apportion_by_tier(tagged, self._TIER_RATIO, target)
+        # 同一条确定性良定义合同最终还会在全局边 A 闸复核；这里先过滤，避免已知
+        # 会被拒绝的候选占掉 target 名额，造成“全池 66 条合法却只选中 3 条”的假短缺。
+        eligible = [order for order in tagged
+                    if self.well_posed(order, ws)[0] == "well_posed"]
+        return _apportion_by_tier(eligible, self._TIER_RATIO, target)
 
     def gt(self, ws, o: dict):
         """护城河:时序软外键图遍历,与 enumerate 烘焙逐字段相等(见自检校验闸)。"""
@@ -272,13 +278,12 @@ class RelationalLine(ProductionLine):
         unit = aux.get("time_unit") or "周"
         anchor = f"第{week_label(aw)}{unit}" if aw is not None else ""
         wk = f"截至{anchor}(以该时点的状态为准)," if anchor else ""
-        chain = f"从【{ent}】出发,先找它的「{path[0]}」**所指对象**"
-        for f in path[1:-1]:
-            chain += f",再找【该对象】的「{f}」**所指对象**"
-        chain += f",最后问【该对象】的「{path[-1]}」{q}。"
-        s = (f"{wk}沿一条{hops}步关系链提问:{chain}"
-             f"★必须点明'{anchor}'这个时点(时变关系,不带时间锚答案不唯一);"
-             f"只给起点【{ent}】和「{'→'.join(path)}」这条关系链;【绝不点名链上任何中间对象】;答案也不能出现。")
+        # intent 同时是 phraser 失败时的公开题面，因此自身必须是一句可直接发布的
+        # 问题，不能混入“必须点明/绝不点名”等给模型看的制作指令。
+        chain = f"【{ent}】"
+        for field in path[:-1]:
+            chain += f"的「{field}」所指对象"
+        s = f"{wk}{chain}的「{path[-1]}」{q}？"
         hide = [str(gt)]
         if aux.get("bridge"):
             hide.append(str(aux["bridge"]))            # L2 桥实体必须隐藏
@@ -367,6 +372,7 @@ if __name__ == "__main__":
     paths = discover_fk_paths(relws)
     l2 = enumerate_l2_orders(relws, [["负责人", "汇报对象"]])
     ck("软外键路径发现含 [负责人,汇报对象]", ["负责人", "汇报对象"] in paths)
+    ck("软外键路径按字段元组稳定排序", paths == sorted(paths))
     ck("L2 枚举出≥2 订单", len(l2) >= 2)
     ck("L2 全是 2 跳关系题", all(o.capability == "L2_relational" and o.aux.get("hops") == 2 for o in l2))
     ck("L2 答案非空/非 INSUFFICIENT", all(o.gt not in (INSUFFICIENT, INVALID, None) for o in l2))
@@ -376,6 +382,8 @@ if __name__ == "__main__":
 
     # ★护城河校验闸:gt() 重算 == enumerate 烘焙
     orders = line.enumerate(relws)
+    ck("enumerate 配额前已过滤自身确定性坏题",
+       all(line.well_posed(o, relws)[0] == "well_posed" for o in orders))
     ck("校验闸:gt() 重算 == 烘焙", all(line.gt(relws, o) == o["gt"] for o in orders))
     # ★§V-A 良定义:时变多跳题,题面必须带周锚(否则 gold 不唯一)
     ck("§V-A:L2 题面带周锚(单一真源 week_label=s+1)",
@@ -386,6 +394,8 @@ if __name__ == "__main__":
                             "gt": "v", "aux": {"path": ["负责人", "末跳"], "at_week": 0, "ans_kind": kind}})[0]
     ck("Fix2:L2 末跳 numeric(真实schema词表)→ '是多少'且非'是谁'", "是多少" in _l2q("numeric") and "是谁" not in _l2q("numeric"))
     ck("Fix2:L2 末跳 person → '是谁'", "是谁" in _l2q("person"))
+    ck("L2 intent 本身可公开，不泄漏内部制作指令",
+       not any(marker in _l2q("person") for marker in ("★", "必须点明", "绝不点名", "提问:")))
 
     # prepare:office 型 profile(2 person 字段)应增强出人员实体
     base_table = {"entities": [

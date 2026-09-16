@@ -1,0 +1,322 @@
+{
+  "schema_version": 1,
+  "seed_id": "insurance_annual_review_v1",
+  "family": "insurance_annual_review",
+  "title": "保险年度档案：版本采用与分析失效",
+  "description": "由年度档案任务设计启发的合成工作世界。保留来源版本、财年口径与分析依赖机制，生成新公司、新记录和新数值；原年报与评级原件未提供，不重放或认证设计卡中的真实数值。",
+  "sources": [
+    {
+      "id": "insurance_task",
+      "path": "data/real_seed/yukai_2026-09-15/extracted/0915保险CUA返修/insurance-cua-uail-0001_instruction (2).md",
+      "sha256": "1a288f3356bf0ff4deb40e8225624cc75bab70f3157f6fc076039204462cfb06",
+      "role": "corpus",
+      "title": "insurance-cua-uail-0001_instruction (2).md"
+    },
+    {
+      "id": "insurance_design",
+      "path": "data/real_seed/yukai_2026-09-15/extracted/0915保险CUA返修/United_Ajod_最终任务设计卡(1).md",
+      "sha256": "c7b347677158fe2f6c37eb3679b7317f43aa20df7de6dc17a493f1300e9d1579",
+      "role": "builder_only",
+      "title": "United_Ajod_最终任务设计卡(1).md"
+    },
+    {
+      "id": "insurance_rubric",
+      "path": "data/real_seed/yukai_2026-09-15/extracted/0915保险CUA返修/United_Ajod_rubric设计表_v1.2.xlsx",
+      "sha256": "6d3eda4ea2c55ced36b6e37fe3c4bb5317de575ff5a7e7c224929af1703d33c4",
+      "role": "evaluator_only",
+      "title": "未冻结评分稿；仅登记来源，不进入机制、示例或生成提示词"
+    }
+  ],
+  "task": {
+    "objective": "维护保险客户年度档案，在多份资料逐步到达时更新采用依据、财务记录和分析确认状态。",
+    "instructions": "生成合成公司与来源，金额统一为 NPR million。来源记录应分别记录报告期间、版本性质和发布日期；同一指标的暂定版、最终版和比较期重述不能只按收到先后裁决。分析记录必须关联客户与采用来源，来源采用发生变化后记录分析是否需要重核，完成复核后再确认。保留合法等价留痕路径；不要求候选编号、双观察记录或固定工作表。原任务研究截止日仅是机制出处，生成世界可使用明确标注的合成日历，不把未提供的原年报数值当真值。"
+  },
+  "exemplars": [
+    {
+      "title": "澄川保险的资料登记",
+      "content": "本例公司、文档和数值均为合成。澄川保险的来源记录《年度预报甲》：来源客户=澄川保险；报告期间=FY2024；版本性质=暂定；来源发布日期=2025-01-06；税后利润=120 NPR million。分析记录《澄川年度复核》的采用来源为《年度预报甲》，分析确认状态=已确认。",
+      "doc_type": "资料登记",
+      "date": "2025-01-06",
+      "origin": "synthetic",
+      "source_refs": [],
+      "mechanism_refs": [
+        "version_adoption"
+      ]
+    },
+    {
+      "title": "终版到达后的采用更新",
+      "content": "本例为合成后续记录。澄川保险的《年度终报乙》已收到：报告期间=FY2024；版本性质=最终；来源发布日期=2025-01-13；税后利润=96 NPR million。《澄川年度复核》的采用来源改为《年度终报乙》，采用口径=最终年度报告；分析确认状态=待重核。旧分析采用的是预报，不应继续标作已确认。",
+      "doc_type": "采用变更单",
+      "date": "2025-01-13",
+      "origin": "synthetic",
+      "source_refs": [],
+      "mechanism_refs": [
+        "version_adoption",
+        "analysis_reconfirmation"
+      ]
+    },
+    {
+      "title": "重核完成",
+      "content": "本例为合成复核记录。《澄川年度复核》已检查新采用来源及相关计算输入，分析确认状态=已确认；澄川保险的档案阶段=待复核。该条仅记录工作流状态，未提供或认证真实公司的财务结果。",
+      "doc_type": "复核记录",
+      "date": "2025-01-20",
+      "origin": "synthetic",
+      "source_refs": [],
+      "mechanism_refs": [
+        "analysis_reconfirmation"
+      ]
+    }
+  ],
+  "mechanisms": [
+    {
+      "id": "version_adoption",
+      "description": "来源记录的版本性质、报告期间与发布日期共同决定采用口径；收到资料和采用资料分成不同事件，保持旧来源可追踪。不得将设计卡的具体 Oracle 数值复制为事实。",
+      "source_refs": [
+        {
+          "source_id": "insurance_task",
+          "locator": "Markdown 第 19–24 行：来源、财年、版本、单位及引用可追溯"
+        },
+        {
+          "source_id": "insurance_design",
+          "locator": "第 3 节时间与口径；第 7 节暂定/最终版本与比较期重述机制"
+        }
+      ],
+      "required_entity_types": [
+        "insurer",
+        "source_record",
+        "analysis_record"
+      ],
+      "required_relation_types": [
+        "source_for_insurer",
+        "analysis_uses_source"
+      ],
+      "required_event_types": [
+        "report_received",
+        "adoption_revised"
+      ],
+      "required_causal_rules": [
+        "receipt_to_adoption"
+      ]
+    },
+    {
+      "id": "analysis_reconfirmation",
+      "description": "采用来源变化后，下游分析进入待重核；复核事件更新确认状态和档案阶段。这里要求可观察的状态依赖，不声称第一阶段已实现利润桥、ROE 或依赖计算执行器。",
+      "source_refs": [
+        {
+          "source_id": "insurance_design",
+          "locator": "第 6 节子步骤 13；第 8 节分析有效性等价路径；第 9 节成功判据"
+        }
+      ],
+      "required_entity_types": [
+        "insurer",
+        "analysis_record"
+      ],
+      "required_relation_types": [
+        "analysis_for_insurer"
+      ],
+      "required_event_types": [
+        "adoption_revised",
+        "analysis_rechecked"
+      ],
+      "required_causal_rules": [
+        "adoption_to_recheck"
+      ]
+    }
+  ],
+  "blueprint_requirements": {
+    "entity_types": [
+      {
+        "id": "insurer",
+        "noun": "保险客户",
+        "count": 2,
+        "fields": [
+          {
+            "name": "所属市场",
+            "kind": "category"
+          },
+          {
+            "name": "档案阶段",
+            "kind": "status"
+          }
+        ]
+      },
+      {
+        "id": "source_record",
+        "noun": "财务来源记录",
+        "count": 4,
+        "fields": [
+          {
+            "name": "来源客户",
+            "kind": "reference"
+          },
+          {
+            "name": "报告期间",
+            "kind": "category"
+          },
+          {
+            "name": "版本性质",
+            "kind": "category"
+          },
+          {
+            "name": "来源发布日期",
+            "kind": "date"
+          },
+          {
+            "name": "税后利润",
+            "kind": "numeric",
+            "unit": "NPR million"
+          },
+          {
+            "name": "资料接收状态",
+            "kind": "status"
+          }
+        ]
+      },
+      {
+        "id": "analysis_record",
+        "noun": "年度分析记录",
+        "count": 2,
+        "fields": [
+          {
+            "name": "分析客户",
+            "kind": "reference"
+          },
+          {
+            "name": "采用来源",
+            "kind": "reference"
+          },
+          {
+            "name": "采用口径",
+            "kind": "category"
+          },
+          {
+            "name": "分析确认状态",
+            "kind": "status"
+          }
+        ]
+      }
+    ],
+    "relation_types": [
+      {
+        "id": "source_for_insurer",
+        "from_type": "source_record",
+        "to_type": "insurer",
+        "field": "来源客户",
+        "temporal": false,
+        "min_count": 1
+      },
+      {
+        "id": "analysis_for_insurer",
+        "from_type": "analysis_record",
+        "to_type": "insurer",
+        "field": "分析客户",
+        "temporal": false,
+        "min_count": 1
+      },
+      {
+        "id": "analysis_uses_source",
+        "from_type": "analysis_record",
+        "to_type": "source_record",
+        "field": "采用来源",
+        "temporal": true,
+        "min_count": 1
+      }
+    ],
+    "event_types": [
+      {
+        "id": "report_received",
+        "label": "报告到达登记",
+        "roles": {
+          "source": "source_record"
+        },
+        "effect_fields": [
+          {
+            "role": "source",
+            "field": "资料接收状态"
+          }
+        ],
+        "min_count": 1
+      },
+      {
+        "id": "adoption_revised",
+        "label": "采用口径复核",
+        "roles": {
+          "analysis": "analysis_record",
+          "source": "source_record"
+        },
+        "effect_fields": [
+          {
+            "role": "analysis",
+            "field": "采用口径"
+          },
+          {
+            "role": "analysis",
+            "field": "分析确认状态"
+          }
+        ],
+        "min_count": 1,
+        "relation_bindings": [
+          {
+            "relation": "analysis_uses_source",
+            "from_role": "analysis",
+            "to_role": "source"
+          }
+        ]
+      },
+      {
+        "id": "analysis_rechecked",
+        "label": "分析重新确认",
+        "roles": {
+          "analysis": "analysis_record",
+          "client": "insurer"
+        },
+        "effect_fields": [
+          {
+            "role": "analysis",
+            "field": "分析确认状态"
+          },
+          {
+            "role": "client",
+            "field": "档案阶段"
+          }
+        ],
+        "min_count": 1,
+        "relation_bindings": [
+          {
+            "relation": "analysis_for_insurer",
+            "from_role": "analysis",
+            "to_role": "client"
+          }
+        ]
+      }
+    ],
+    "causal_rules": [
+      {
+        "id": "receipt_to_adoption",
+        "trigger_event": "report_received",
+        "effect_event": "adoption_revised",
+        "delay_sessions": 1,
+        "shared_roles": [
+          "source"
+        ]
+      },
+      {
+        "id": "adoption_to_recheck",
+        "trigger_event": "adoption_revised",
+        "effect_event": "analysis_rechecked",
+        "delay_sessions": 1,
+        "shared_roles": [
+          "analysis"
+        ]
+      }
+    ],
+    "evidence_channels": [
+      "资料登记",
+      "采用变更单",
+      "复核记录"
+    ],
+    "temporal_model": {
+      "min_sessions": 4
+    }
+  }
+}

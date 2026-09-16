@@ -5,8 +5,10 @@ pipeline.closed_loop —— §S 闭环旋钮 driver(从 run_factory_v2 拆出,�
 """
 from __future__ import annotations
 import dataclasses, math
+from copy import deepcopy
 from pipeline.world_state import WorldState
-from pipeline.world_blueprint import relation_capacity, relation_owner_side
+from pipeline.world_blueprint import (WorldBlueprintError, event_role_requirements,
+                                      relation_capacity, relation_owner_side)
 from pipeline.lines import line_for
 from pipeline.run import Run, _finalize_run, _run_stage, _update_run_metadata
 from pipeline.targetspec import TargetSpec, invert_rate, WorldParams, DEFAULT_SLACK
@@ -22,6 +24,12 @@ def _event_key(event: dict) -> tuple:
     """领域事件实例的稳定增量键。"""
     return ("id", event.get("id")) if event.get("id") else (
         "event", event.get("type"), event.get("session"), repr(event.get("participants")))
+
+
+def _seed_type_floors(wp: dict) -> dict[str, int]:
+    requirements = (wp.get("seed_contract") or {}).get("blueprint_requirements") or {}
+    return {item["id"]: item.get("count", 1)
+            for item in requirements.get("entity_types", [])}
 
 
 def _render_delta_scope(ws: WorldState, previous_entities: set,
@@ -122,13 +130,17 @@ def _scale_world_contract(wp: dict, n_entities: int, n_sessions: int,
                 scaled[pos] += 1
             for i, count in zip(scalable, scaled):
                 counts[i] = count
+        seed_floors = _seed_type_floors(wp)
         for t, count in zip(types, counts):
-            t["count"] = count
+            t["count"] = max(count, seed_floors.get(t.get("id"), 0))
         actual_entities = sum(int(t.get("count", 0)) for t in types)
         temporal = bp.setdefault("temporal_model", {})
         # 时间跨度与实体规模一样服从本轮旋钮；build_to_target 后续轮只会放大参数，
         # 因而不会把已经生成的世界反向缩短。
-        temporal["n_sessions"] = max(2, int(n_sessions))
+        seed_requirements = (wp.get("seed_contract") or {}).get("blueprint_requirements") or {}
+        seed_temporal = seed_requirements.get("temporal_model") or {}
+        temporal["n_sessions"] = max(2, int(n_sessions), seed_temporal.get("min_sessions", 0))
+        actual_sessions = temporal["n_sessions"]
         density_factor = actual_entities / int(baseline["entity_total"])
         for key, declarations in (("relation_min_counts", bp.get("relation_types") or []),
                                   ("event_min_counts", bp.get("event_types") or [])):
@@ -140,7 +152,11 @@ def _scale_world_contract(wp: dict, n_entities: int, n_sessions: int,
                     # 剧情事件是 canonical spine，不随为了补 benchmark 题而扩的外围实体膨胀。
                     scaled_min = base_min if narrative and key == "event_min_counts" \
                         else math.ceil(base_min * density_factor)
-                    declaration["min_count"] = max(1, scaled_min)
+                    seed_key = "relation_types" if key == "relation_min_counts" else "event_types"
+                    seed_min = next((item.get("min_count", 1)
+                                     for item in seed_requirements.get(seed_key, [])
+                                     if item["id"] == declaration_id), 1)
+                    declaration["min_count"] = max(1, scaled_min, seed_min)
         # relation 是标量 FK；人口比例取整后，owner 侧可能没长大，不能让同比 min_count 超过容量。
         for relation in bp.get("relation_types") or []:
             if relation_owner_side(bp, relation) is not None:
@@ -158,6 +174,119 @@ def _scale_world_contract(wp: dict, n_entities: int, n_sessions: int,
     sw.setdefault("timeline", {})["n_sessions"] = actual_sessions
 
 
+def _ensure_l7_capacity(wp: dict, floor: int) -> dict:
+    """在总实体数不变时，为 L7 分配足够的内在非单调数值字段实例。"""
+    bp = wp.get("world_blueprint") or {}
+    types = bp.get("entity_types") or []
+    if floor <= 0 or not types:
+        return {"before": 0, "after": 0, "moved": {}}
+
+    structural: set[tuple[str, str]] = set()
+    if wp.get("seed_contract"):
+        from pipeline.seed_world import seed_protected_fields
+        structural.update(seed_protected_fields(wp))
+    for relation in bp.get("relation_types") or []:
+        side = relation_owner_side(bp, relation)
+        owner = relation.get("from_type") if side == "from" else relation.get("to_type")
+        if owner and relation.get("field"):
+            structural.add((owner, relation["field"]))
+    for event in bp.get("event_types") or []:
+        roles = event.get("roles") or {}
+        for effect in event.get("effect_fields") or []:
+            owner = roles.get(effect.get("role"))
+            if owner and effect.get("field"):
+                structural.add((owner, effect["field"]))
+
+    widths = {}
+    role_floors = event_role_requirements(bp)
+    for type_id, seed_floor in _seed_type_floors(wp).items():
+        role_floors[type_id] = max(role_floors.get(type_id, 0), seed_floor)
+    for index, entity_type in enumerate(types):
+        if entity_type.get("cardinality_policy") == "exact":
+            continue
+        type_id = entity_type.get("id")
+        widths[index] = sum(
+            field.get("kind") == "numeric"
+            and field.get("monotonic") not in ("up", "down")
+            and (type_id, field.get("name")) not in structural
+            for field in entity_type.get("fields") or []
+        )
+    recipients = [index for index, width in widths.items() if width > 0]
+    before = sum(int(types[index].get("count", 0)) * width for index, width in widths.items())
+    capacity = before
+    moved: dict[str, int] = {}
+    while capacity < floor and recipients:
+        recipient = max(recipients, key=lambda index: (widths[index], -int(types[index].get("count", 0))))
+        donors = [
+            index for index, entity_type in enumerate(types)
+            if index != recipient
+            and entity_type.get("cardinality_policy") != "exact"
+            and int(entity_type.get("count", 0)) > max(1, role_floors.get(entity_type.get("id"), 0))
+            and widths.get(index, 0) < widths[recipient]
+        ]
+        if not donors:
+            break
+        donor = max(donors, key=lambda index: (
+            widths[recipient] - widths.get(index, 0),
+            int(types[index].get("count", 0)),
+            not bool(types[index].get("primary")),
+        ))
+        types[recipient]["count"] = int(types[recipient].get("count", 0)) + 1
+        types[donor]["count"] = int(types[donor].get("count", 0)) - 1
+        capacity += widths[recipient] - widths.get(donor, 0)
+        moved[str(types[recipient].get("id"))] = moved.get(str(types[recipient].get("id")), 0) + 1
+        moved[str(types[donor].get("id"))] = moved.get(str(types[donor].get("id")), 0) - 1
+
+    # 类型人口重分配后重新夹住结构声明容量。
+    for relation in bp.get("relation_types") or []:
+        if relation_owner_side(bp, relation) is not None:
+            relation["min_count"] = min(int(relation.get("min_count", 0)),
+                                         relation_capacity(bp, relation))
+    counts = {item.get("id"): int(item.get("count", 0)) for item in types}
+    n_sessions = int((bp.get("temporal_model") or {}).get("n_sessions", 1))
+    for event in bp.get("event_types") or []:
+        event_capacity = n_sessions
+        for type_id in (event.get("roles") or {}).values():
+            event_capacity *= counts.get(type_id, 0)
+        event["min_count"] = min(int(event.get("min_count", 0)), event_capacity)
+    wp.setdefault("domain_profile", {})["l7_max_trends"] = max(
+        int(wp.get("domain_profile", {}).get("l7_max_trends", 0)), int(floor))
+    return {"before": before, "after": capacity, "moved": moved}
+
+
+def _ensure_event_role_capacity(wp: dict) -> dict[str, int]:
+    """总实体数不变地保证同一事件的不同角色可由互异实体承担。"""
+    bp = wp.get("world_blueprint") or {}
+    types = bp.get("entity_types") or []
+    required = event_role_requirements(bp)
+    for type_id, seed_floor in _seed_type_floors(wp).items():
+        required[type_id] = max(required.get(type_id, 0), seed_floor)
+    moved: dict[str, int] = {}
+    for recipient in types:
+        type_id = recipient.get("id")
+        floor = required.get(type_id, 0)
+        while int(recipient.get("count", 0)) < floor:
+            if recipient.get("cardinality_policy") == "exact":
+                raise WorldBlueprintError(
+                    f"event 需要 {floor} 个互异 {type_id}，但 exact count={recipient.get('count')}")
+            donors = [
+                item for item in types
+                if item is not recipient
+                and item.get("cardinality_policy") != "exact"
+                and int(item.get("count", 0))
+                    > max(1, required.get(item.get("id"), 0))
+            ]
+            if not donors:
+                raise WorldBlueprintError(
+                    f"总实体数内无法为 event 分配 {floor} 个互异 {type_id}")
+            donor = max(donors, key=lambda item: int(item.get("count", 0)))
+            recipient["count"] = int(recipient.get("count", 0)) + 1
+            donor["count"] = int(donor.get("count", 0)) - 1
+            moved[str(type_id)] = moved.get(str(type_id), 0) + 1
+            moved[str(donor.get("id"))] = moved.get(str(donor.get("id")), 0) - 1
+    return moved
+
+
 def _orders_by_line(orders) -> dict:
     """{line_id: 该线产了多少 order}。"""
     out: dict = {}
@@ -166,17 +295,24 @@ def _orders_by_line(orders) -> dict:
     return out
 
 
-def _order_deficit(produced: dict, target_orders: dict, feasible: set) -> dict:
-    """①环判据:可行线里【实质】短缺 {line: 全额缺多少}(短超容差才算)。不可行线不计(扩世界也没用)。
-    ★容差 = max(1, round(配额×0.15)):配额本就是 floor/survival×slack 的【过度供给】,slack 就是用来吸收
-    "12/13 这种噪声抖动"的——差 1 单 / <15% 不该触发重渲整个世界(实测:差 1 单曾引发 14→49 的 3.5× 重建)。
-    真不够(短超容差)才记赤字去长世界;小缺口交给 over-provision slack + ②实测纠偏环 + fail-open 兜。"""
-    out = {}
-    for lid, tgt in target_orders.items():
-        got = produced.get(lid, 0)
-        if lid in feasible and got < tgt - max(1, round(tgt * 0.15)):
-            out[lid] = tgt - got
-    return out
+def _order_shortfall(produced: dict, required_orders: dict) -> dict:
+    """计算所有显式产线硬下限的订单缺口。"""
+    return {
+        lid: floor - produced.get(lid, 0)
+        for lid, floor in required_orders.items()
+        if produced.get(lid, 0) < floor
+    }
+
+
+def _order_deficit(produced: dict, required_orders: dict, feasible: set) -> dict:
+    """①环判据：只在可行产线没有达到硬下限时扩世界。
+
+    ``target_orders`` 含 survival 与 slack，是为了提高一次接地成功率的软生产量；
+    它不能升级成重建契约。这里直接比较调用者的 ``per_line_min``，不设容差，
+    也不让不可行线触发无意义扩容。
+    """
+    return {lid: amount for lid, amount in _order_shortfall(produced, required_orders).items()
+            if lid in feasible}
 
 
 def _grow_for_supply(params: WorldParams, deficit: dict, grow_sessions: bool = True) -> WorldParams:
@@ -209,12 +345,37 @@ def _floor_status(by_line: dict, overall: dict, spec: TargetSpec, feasible: set)
     return met, per_line_final, growable, permanent
 
 
+def _resolve_per_line_contract(active: list[str], requested: dict) -> dict:
+    """规范化显式产线下限；未实现或未激活时直接报错，不得静默丢弃。"""
+    resolved: dict[str, int] = {}
+    unknown: list[str] = []
+    inactive: list[str] = []
+    for raw_id, floor in requested.items():
+        line = line_for(raw_id)
+        if line is None:
+            unknown.append(str(raw_id))
+            continue
+        if line.id not in active:
+            inactive.append(line.id)
+            continue
+        resolved[line.id] = int(floor)
+    if unknown or inactive:
+        parts = []
+        if unknown:
+            parts.append(f"未实现/不可识别={sorted(set(unknown))}")
+        if inactive:
+            parts.append(f"白皮书未激活={sorted(set(inactive))}")
+        raise WorldBlueprintError("显式 per_line_min 与本轮执行计划冲突:"
+                                  + "；".join(parts))
+    return resolved
+
+
 def build_to_target(run: Run, spec: TargetSpec, max_rounds: int = 2, order_subrounds: int = 2):
     """§S 闭环旋钮 v0。前置:input + whitepaper 已由 drive 跑完(本函数从 01_whitepaper.json 起,自管 world→grounding)。
     ★只管【循环控制】:反推规模/配额 → patch 白皮书+config → 直调【现有 stage 函数】(经 _run_stage)→ 读回产物判 floor。
       stage 体零复制(评审:避免第二条编排路径漂移);quota 经 run.config 喂给 stage_orders。
     一轮 = ①订单供给环(stage_world+stage_orders 多子轮长世界) → 出题 → 整轮重渲 → 接地 → ② floor 校验/纠偏。
-    达标 MET 返回;耗尽 max_rounds 仍不达 → fail-open 标 UNMET(不抛错,题库照出,留痕 manifest.algo.met_status)。"""
+    达标 MET 才发布；耗尽 max_rounds 或硬下限不可行时保留审计产物并明确失败。"""
     from pipeline.factory import (stage_world, stage_orders, stage_well_posed,
                                   stage_questions, stage_corpus, stage_grounding,
                                   ART, CORPUS_CKPT)
@@ -223,14 +384,10 @@ def build_to_target(run: Run, spec: TargetSpec, max_rounds: int = 2, order_subro
                    for l in wp.get("active_lines", [])
                    if line_for(l.get("line", "")) and float(l.get("weight") or 0) > 0]
     active = list(dict.fromkeys(l["line"] for l in canon_lines))                  # 已建且去重的激活线
-    if not spec.per_line_min:                                                     # 没显式给 → 白皮书 weight 派生(weight 终于被读)
+    explicit_per_line = bool(spec.per_line_min)
+    if not explicit_per_line:                                                     # 没显式给 → 白皮书 weight 派生(weight 终于被读)
         spec.per_line_min = spec.derive_per_line_min(canon_lines)
-    plm: dict = {}                                                                # 显式 floor 的 key 也过 line_for 规范化(防 --per-line L1=30 被静默丢)
-    for k, v in spec.per_line_min.items():
-        ln = line_for(k)
-        if ln and ln.id in active:
-            plm[ln.id] = v
-    spec.per_line_min = plm                                                       # 只对【已建激活线】设 floor
+    spec.per_line_min = _resolve_per_line_contract(active, spec.per_line_min)
     s = sum(spec.per_line_min.values())                                           # ★总下限盈余无处落 → 按比例摊进各线 floor
     if 0 < s < spec.min_questions:                                                #   (使「逐线 floor 全达 ⟹ 总数达标」,消掉"总数单独差"的歧义态)
         scale = spec.min_questions / s
@@ -249,12 +406,22 @@ def build_to_target(run: Run, spec: TargetSpec, max_rounds: int = 2, order_subro
     prev_events: set = set()
     narrative_mode = run.scenario == "game"
     for rnd in range(1, max_rounds + 1):
+        # 01 是当前已发布世界的有效合同。候选扩容只能与新的 02 一起提交；否则
+        # world 在失败/中断前被写回 01，会留下“旧世界 + 新合同”的撕裂 Run。
+        published_wp = run.read(ART["whitepaper"])
         run.log(f"╠═ 第 {rnd}/{max_rounds} 轮 ══════════════════════════════")
         _scale_world_contract(wp, params.n_entities, params.n_sessions,
                               narrative=narrative_mode)                           # patch 规模旋钮；显式蓝图同步更新 primary/time
+        event_role_moves = _ensure_event_role_capacity(wp)
+        if event_role_moves:
+            run.log(f"║  事件角色互异容量：总实体不变，类型重分配 {event_role_moves}")
+        l7_capacity = _ensure_l7_capacity(
+            wp, int(spec.per_line_min.get("L7_consolidation", 0)))
+        if l7_capacity["moved"]:
+            run.log(f"║  L7 基质容量 {l7_capacity['before']}→{l7_capacity['after']}，"
+                    f"总实体不变，类型重分配 {l7_capacity['moved']}")
         sw = wp["shared_world_spec"]
         wp.setdefault("domain_profile", {})["l5_max_conflicts"] = params.max_n_conflicts
-        run.write(ART["whitepaper"], wp)
         run_cfg["quotas"] = dict(params.target_orders)                            # ★经 config 喂配额给 stage_orders(不内联 run_lines)
         # 普通场景续长实体；game 的 canon 很小，整轮重建比拼接新旧剧情更可靠。
         run_cfg["augment"] = (rnd > 1 and not narrative_mode)
@@ -262,21 +429,53 @@ def build_to_target(run: Run, spec: TargetSpec, max_rounds: int = 2, order_subro
         # ── ① 订单供给环:直调 stage_world + stage_orders(便宜,绝不渲);供不上 → 长世界重跑 ──
         feasible: set = set()
         for sub in range(1, order_subrounds + 1):
-            _run_stage(run, "world", stage_world, ART["world"])
+            try:
+                run.write(ART["whitepaper"], wp)
+                _run_stage(run, "world", stage_world, ART["world"])
+            except BaseException:
+                # KeyboardInterrupt 也必须回滚；02 在 stage_world 成功末尾才原子发布，
+                # 因而恢复此前 01 就重新得到一对一致的已发布产物。
+                run.write(ART["whitepaper"], published_wp)
+                raise
+            published_wp = deepcopy(wp)
             _run_stage(run, "orders", stage_orders, ART["orders"])
             _run_stage(run, "well_posed", stage_well_posed, "03_well_posed_report.json")  # ★边A闸:赤字按【良定义后】供给算
             ws = WorldState.from_dict(run.read(ART["world"]))
             feasible = {ln.id for a in active if (ln := line_for(a)) and ln.feasible(ws, profile)[0]}
             produced = _orders_by_line(run.read(ART["orders"]))   # 此时 03_orders 已是过闸(良定义)子集
-            deficit = _order_deficit(produced, params.target_orders, feasible)
-            run.log(f"║  ①供给子轮{sub}:实产 {produced} / 配额 {params.target_orders} → 赤字 {deficit or '无'}")
+            deficit = _order_deficit(produced, spec.per_line_min, feasible)
+            run.log(f"║  ①供给子轮{sub}:实产 {produced} / 硬下限 {spec.per_line_min} "
+                    f"(软配额 {params.target_orders}) → 硬赤字 {deficit or '无'}")
             if not deficit or sub == order_subrounds:
                 break
             params = _grow_for_supply(params, deficit, grow_sessions=(rnd == 1)) # 第2轮+只长实体，不破坏旧语料时间轴
             _scale_world_contract(wp, params.n_entities, params.n_sessions,
                                   narrative=narrative_mode)
-            run.write(ART["whitepaper"], wp)
-            run.log(f"║  ↑供给不足 → 长世界 n_ent={params.n_entities} n_sess={params.n_sessions} 重建")
+            event_role_moves = _ensure_event_role_capacity(wp)
+            l7_capacity = _ensure_l7_capacity(
+                wp, int(spec.per_line_min.get("L7_consolidation", 0)))
+            run.log(f"║  ↑供给不足 → 长世界 n_ent={params.n_entities} n_sess={params.n_sessions} 重建"
+                    + (f"；事件角色互异类型重分配 {event_role_moves}" if event_role_moves else "")
+                    + (f"；L7 基质容量 {l7_capacity['before']}→{l7_capacity['after']}，"
+                       f"类型重分配 {l7_capacity['moved']}" if l7_capacity["moved"] else ""))
+
+        # 订单数是问题数和接地题数的严格上界。供给子轮耗尽后仍缺硬下限时，
+        # questions/corpus 不可能补回，必须在最贵的渲染前失败。
+        order_shortfall = _order_shortfall(produced, spec.per_line_min)
+        if order_shortfall:
+            _update_run_metadata(run, algo={
+                "targetspec": {"min_questions": spec.min_questions,
+                               "per_line_min": spec.per_line_min,
+                               "haystack_ratio": spec.haystack_ratio},
+                "orders_by_line": produced,
+                "met_status": f"UNMET_ORDER_SUPPLY: {order_shortfall}",
+            })
+            _update_run_metadata(
+                run, config_remove=("augment", "render_only", "render_only_pairs"))
+            run.set_status("failed")
+            run.log(f"╚═ ✗ 订单硬下限未满足:{order_shortfall}；题目/接地数不可能超过订单数，"
+                    "在 questions/corpus 前停止。")
+            raise WorldBlueprintError(f"订单硬下限未满足:{order_shortfall}")
 
         # ── 出题 → 渲染(round1 全量;round2+ ★增量 delta:只渲新实体、旧 docs 原样保留,§10.1)→ 接地 ──
         _run_stage(run, "questions", stage_questions, ART["questions"])
@@ -324,7 +523,7 @@ def build_to_target(run: Run, spec: TargetSpec, max_rounds: int = 2, order_subro
             run.log(f"╚═ ✓ 旋钮达标(MET):总 {o['grounded']}≥{spec.min_questions},各线 floor 均满足。")
             break
         if permanent:                                                            # floor 落在【不可行线】→ 永远达不到,长世界也救不了,别空转
-            run.log(f"╚═ ⚠ floor 落在不可行线{permanent}(基质供不出)→ 无解,fail-open(不耗剩余轮次)。")
+            run.log(f"╚═ ⚠ floor 落在不可行线{permanent}(基质供不出)→ 无解,停止空转并判失败。")
             break
         if rnd < max_rounds:                                                     # ② 用实测 survival 放大(只增不减)
             measured = {lid: v["survival"] for lid, v in report["by_line"].items() if v.get("survival") is not None}
@@ -337,8 +536,13 @@ def build_to_target(run: Run, spec: TargetSpec, max_rounds: int = 2, order_subro
     if not met:
         unmet = (last["growable"] + last["permanent"]) or ["总数未达 min_questions"]
         _update_run_metadata(run, algo={"met_status": f"UNMET: {unmet}"})
-        run.log(f"╚═ ✗ 旋钮未达标(UNMET,已尽 {max_rounds} 轮):{unmet}。题库仍写出(fail-open,留痕 met_status)。")
+        _update_run_metadata(
+            run, config_remove=("augment", "render_only", "render_only_pairs"))
+        run.set_status("failed")
+        run.log(f"╚═ ✗ 旋钮未达标(UNMET,已尽 {max_rounds} 轮):{unmet}。"
+                "中间产物仅供审计，不得作为完成的 benchmark 发布。")
+        raise WorldBlueprintError(f"闭环硬契约未满足:{unmet}")
     _update_run_metadata(
         run, config_remove=("augment", "render_only", "render_only_pairs"))       # ★清增量信号,免泄漏到后续 --only 重跑
     _finalize_run(run)
-    return last["kept"], ("MET" if met else "UNMET")
+    return last["kept"], "MET"

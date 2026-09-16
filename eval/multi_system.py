@@ -37,6 +37,7 @@ import config
 from eval.memory_interface import EmbedMemory, _chunk
 from eval.embed_cache import cached_embed, cache_size
 from eval import qa_cache
+from eval.question_filter import export_filtered_benchmark, validate_options as validate_filter_options
 from eval.baseline_r1 import unified_answer
 from eval.judge import judge, judge_answer, is_judgeable, gold_display, judge_spec, classify_refusal, judge_l2_partial
 
@@ -296,16 +297,18 @@ def run_system(name: str, questions: list, sys_instance, workers: int = WORKERS,
 
     # ── 每题的求解函数(题与题独立 → pmap 并行) ──
     def solve(q: dict) -> dict:
-        qh = qa_cache.qhash(q["question"])
+        qh = qa_cache.qhash(q)
         if qh in done:                       # 续传:已判过 → 直接用盘上结果,不调 LLM
             r = dict(done[qh]); r["_qh"] = qh; r["_resumed"] = True
             return r
         mode, _, _ = judge_spec(q)
         rec = {
             "_qh": qh,
+            "qid": q.get("qid"),
             "line": q["line"], "capability": q["capability"],
             "question": q["question"], "gt": q.get("gt"),
             "aux": q.get("aux"),                             # ★L6 透传:判分需 aux.lure.value(吐诱饵=判错)
+            "strict_scoring": q.get("strict_scoring"),       # 明星题全原子合同必须穿透真实评测调用链
             "gold_set": gold_display(q), "mode": mode,
             "judgeable": is_judgeable(q),
         }
@@ -345,7 +348,8 @@ def run_system(name: str, questions: list, sys_instance, workers: int = WORKERS,
         else:
             try:
                 qd = {"capability": rec["capability"], "gt": rec.get("gt"),
-                      "question": rec["question"], "aux": rec.get("aux")}
+                      "question": rec["question"], "aux": rec.get("aux"),
+                      "strict_scoring": rec.get("strict_scoring")}
                 rec["correct"] = bool(judge_answer(qd, pred, use_llm=True))
                 if rec["capability"] == "L6_refusal":       # ★三分桶(报表用):refuse/lure/other
                     lure = ((rec.get("aux") or {}).get("lure") or {}).get("value")
@@ -654,7 +658,7 @@ def L_interpret(results: dict, sys_names: list) -> list:
 # ─────────────────────────────────────────────────────────────────────────────
 def _load_questions(bench_path: Path) -> list:
     """读题库;兼容 list 与 {questions:[...]} 两种格式。"""
-    data = json.loads(Path(bench_path).read_text(encoding="utf-8"))
+    data = json.loads(Path(bench_path).read_text(encoding="utf-8-sig"))
     return data if isinstance(data, list) else data.get("questions", data)
 
 
@@ -668,10 +672,21 @@ def main():
                     help="逗号分隔,如 A,B,C 或 simpleMem,mem0,zep,memos")
     ap.add_argument("--workers", type=int, default=WORKERS)
     ap.add_argument("--smoke", action="store_true", help="烟测:每 line 取 1 题快速验通管线")
+    ap.add_argument("--filter-easy", action="store_true", help="评测后导出 filtered/，默认剔除全员答对题")
+    ap.add_argument("--keep-easy-ratio", type=float, default=None, help="全员答对题保留比例(0..1)，同时启用筛选")
+    ap.add_argument("--filter-seed", type=int, default=0, help="简单题抽样种子")
+    ap.add_argument("--preserve-capability", action="append", default=[], help="筛选时保留该能力全部题，供判分复核；可重复指定")
     args = ap.parse_args()
 
     sys_names = [s.strip() for s in args.systems.split(",") if s.strip()]
     sys_names = [s.upper() if s.upper() in ("A", "B", "C") else s for s in sys_names]
+    filter_enabled = args.filter_easy or args.keep_easy_ratio is not None or bool(args.preserve_capability)
+    keep_easy_ratio = args.keep_easy_ratio if args.keep_easy_ratio is not None else 0.0
+    if filter_enabled:
+        try:
+            validate_filter_options(sys_names, keep_easy_ratio, args.filter_seed)
+        except ValueError as exc:
+            ap.error(str(exc))
 
     all_q = _load_questions(args.bench)
     questions = [q for q in all_q if is_judgeable(q)]   # 七线全判;弃不可判分(未知题类)
@@ -790,6 +805,16 @@ def main():
         "fullctx_truncated": fullctx_truncated, "protocol_injected": proto_on,
     }
     write_report(results, sys_names, meta, out_path=probe.run_dir / "report.md")
+    if filter_enabled:
+        filter_report = export_filtered_benchmark(
+            Path(args.bench), {s: results[s]["records"] for s in sys_names},
+            probe.run_dir / "filtered", keep_easy_ratio=keep_easy_ratio, seed=args.filter_seed,
+            preserve_capabilities=args.preserve_capability,
+            corpus=Path(args.corpus), about=about_path if about_path.is_file() else None,
+            result_paths=[out_json])
+        fc = filter_report["counts"]
+        print(f"[筛题] 全员答对 {fc['all_correct']}，剔除 {fc['removed_easy']}，"
+              f"保留 {fc['kept']} → {probe.run_dir / 'filtered'}")
     probe.done(disc=discrimination_summary(results, sys_names))
 
 

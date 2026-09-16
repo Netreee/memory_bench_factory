@@ -1,0 +1,395 @@
+{
+  "schema_version": 1,
+  "seed_id": "finance_product_scope_v1",
+  "family": "finance_product_scope",
+  "title": "金融资料复核：份额币种日期与缺失输入",
+  "description": "由内部培训及测算任务启发的合成资料复核世界。保留产品/份额/币种/数据日期的联合归属，并以明确的准备状态区分已披露零值、缺失与口径不匹配。第一阶段不提供新增金融计算题型或公式执行器。",
+  "sources": [
+    {
+      "id": "finance_task",
+      "path": "data/real_seed/yukai_2026-09-15/extracted/研判样例数据（多附件）/金融/prompt.rtf",
+      "sha256": "0875801c4c241e98c42aa3e8d38c519c98212e3230d74a7ae169cbb0dc8f01e2",
+      "role": "corpus",
+      "title": "prompt.rtf"
+    },
+    {
+      "id": "finance_hang_seng",
+      "path": "data/real_seed/yukai_2026-09-15/extracted/研判样例数据（多附件）/金融/附件一_恒生招商彭博美国国债7-10年指数ETF产品资料概要_20260430.pdf",
+      "sha256": "397bd64afd17ba10ba7e639a6ed3131ff2339529ceccd78442d0f2eab00d7d60",
+      "role": "corpus",
+      "title": "附件一_恒生招商彭博美国国债7-10年指数ETF产品资料概要_20260430.pdf"
+    },
+    {
+      "id": "finance_bosera",
+      "path": "data/real_seed/yukai_2026-09-15/extracted/研判样例数据（多附件）/金融/附件二_博时20年以上美国国债ETF产品资料概要_20260430.pdf",
+      "sha256": "6973670001b763ac447cb1b52dff7c0c1dce779cc15e077baccf20c2525010fb",
+      "role": "corpus",
+      "title": "附件二_博时20年以上美国国债ETF产品资料概要_20260430.pdf"
+    },
+    {
+      "id": "finance_global_x",
+      "path": "data/real_seed/yukai_2026-09-15/extracted/研判样例数据（多附件）/金融/附件三_GlobalX美国0-3月国债ETF产品资料概要_20260430.pdf",
+      "sha256": "b4725428e8212d388fb88af97a4cebf6e599fae0f6c62d612edfdfdac395a240",
+      "role": "corpus",
+      "title": "附件三_GlobalX美国0-3月国债ETF产品资料概要_20260430.pdf"
+    },
+    {
+      "id": "finance_premia",
+      "path": "data/real_seed/yukai_2026-09-15/extracted/研判样例数据（多附件）/金融/附件四_Premia美国国库浮息票据ETF资料单张_20260610.pdf",
+      "sha256": "88f704312be56c9131cef600dcbb9073617a0ec9c060c24261cde6cc97229071",
+      "role": "corpus",
+      "title": "附件四_Premia美国国库浮息票据ETF资料单张_20260610.pdf"
+    },
+    {
+      "id": "finance_china_amc",
+      "path": "data/real_seed/yukai_2026-09-15/extracted/研判样例数据（多附件）/金融/附件五_华夏海外收益债券基金招募说明书更新_20260529.pdf",
+      "sha256": "88b8a5855ea271ddf7f7cf9042fd04b01b8ee018f5276b6b0da34cdcd9f73adb",
+      "role": "corpus",
+      "title": "附件五_华夏海外收益债券基金招募说明书更新_20260529.pdf"
+    },
+    {
+      "id": "finance_efund",
+      "path": "data/real_seed/yukai_2026-09-15/extracted/研判样例数据（多附件）/金融/附件六_易方达中短期美元债QDII_2026年第1季度报告_20260422.pdf",
+      "sha256": "dd925dbafee898d2b64bb9539b2b88a11ea385dc78d4e14bbb6c937f34ecfe55",
+      "role": "corpus",
+      "title": "附件六_易方达中短期美元债QDII_2026年第1季度报告_20260422.pdf"
+    },
+    {
+      "id": "finance_boc",
+      "path": "data/real_seed/yukai_2026-09-15/extracted/研判样例数据（多附件）/金融/附件七_中银香港投资策略月报_20260618.pdf",
+      "sha256": "51bdd36721fecce0d228aa0b9650eab092e9b286f4104c4d314ccba2201e1937",
+      "role": "corpus",
+      "title": "附件七_中银香港投资策略月报_20260618.pdf"
+    }
+  ],
+  "task": {
+    "objective": "维护供内部培训使用的产品资料和测算准备记录，在份额、币种、日期及字段口径明确后更新准备状态与补数清单。",
+    "instructions": "生成合成产品、份额及观测记录；不将公开文件替代内部持仓、净值、同步价格或客户成本数据。交易币种、估值币种、派息币种分别记录，累积份额和派息份额分开。数据日期不是文件发布日期；同文件不同字段可有不同截止日。有效久期不自动等于修正久期。已披露零值不等于缺失，缺费用不能填零；没有匹配输入时记录待补或口径不匹配，不能承诺计算已完成。本种子只增强输入到白皮书的字段、关系与事件合同，不新增收益、久期或折溢价计算执行器；不生成交易建议、收益承诺或真实客户结论。"
+  },
+  "exemplars": [
+    {
+      "title": "岚桥产品的份额档案",
+      "content": "以下产品和份额均为合成。岚桥短债产品的岚桥港币派息份额：所属产品=岚桥短债；交易币种=HKD；估值币种=USD；派息币种=HKD；分派方式=派息。另一份额岚桥美元累积份额：所属产品=岚桥短债；交易币种=USD；估值币种=USD；派息币种=不适用；分派方式=累积。",
+      "doc_type": "份额资料卡",
+      "date": "2025-01-06",
+      "origin": "synthetic",
+      "source_refs": [],
+      "mechanism_refs": [
+        "scope_binding"
+      ]
+    },
+    {
+      "title": "零值披露与不同口径",
+      "content": "本条为合成资料。《岚桥月末久期观测》：观测份额=岚桥港币派息份额；数据日期=2025-01-03；指标口径=有效久期；有效久期=0.00 年；输入状态=已披露。这不是修正久期已披露的证明。《岚桥测算准备单》的测算份额为岚桥港币派息份额，参考观测为《岚桥月末久期观测》，口径核对状态=指标口径不匹配；测算准备状态=需补修正久期。",
+      "doc_type": "输入复核单",
+      "date": "2025-01-13",
+      "origin": "synthetic",
+      "source_refs": [],
+      "mechanism_refs": [
+        "scope_binding",
+        "missing_input_gate"
+      ]
+    },
+    {
+      "title": "日期与费用核验",
+      "content": "本条为合成复核记录。《岚桥测算准备单》的价格日期与净值日期尚未对齐，口径核对状态=样本日期不一致；费用输入状态=未提供；测算准备状态=待补同日数据及费用。费用未提供不能解释为零费用，此条没有给出敏感度或收益率计算结果。",
+      "doc_type": "补数清单",
+      "date": "2025-01-20",
+      "origin": "synthetic",
+      "source_refs": [],
+      "mechanism_refs": [
+        "missing_input_gate"
+      ]
+    }
+  ],
+  "mechanisms": [
+    {
+      "id": "scope_binding",
+      "description": "值必须绑定产品、份额、指标口径、币种和数据日期；相邻表格、另一份额或另一截止日的值不能直接补位。资料发布与输入复核形成独立事件，复核状态显式进入世界。",
+      "source_refs": [
+        {
+          "source_id": "finance_hang_seng",
+          "locator": "PDF 第1、3–4页：交易/基本/派息货币与市场价格、净值的区别"
+        },
+        {
+          "source_id": "finance_global_x",
+          "locator": "PDF 第1、4页：交易柜台币种和分派币种"
+        },
+        {
+          "source_id": "finance_bosera",
+          "locator": "PDF 第1页：上市累积股份类别"
+        },
+        {
+          "source_id": "finance_china_amc",
+          "locator": "PDF 第3页：财务净值、人员及其他内容采用不同截止日期"
+        },
+        {
+          "source_id": "finance_efund",
+          "locator": "PDF 第3–4页：A/C与人民币/美元份额代码、财务表单位"
+        }
+      ],
+      "required_entity_types": [
+        "product",
+        "share_class",
+        "metric_observation",
+        "worksheet_record"
+      ],
+      "required_relation_types": [
+        "share_of_product",
+        "observation_for_share",
+        "worksheet_for_share",
+        "worksheet_uses_observation"
+      ],
+      "required_event_types": [
+        "observation_registered",
+        "scope_reviewed"
+      ],
+      "required_causal_rules": [
+        "observation_to_scope_review"
+      ]
+    },
+    {
+      "id": "missing_input_gate",
+      "description": "零值、未提供和口径不匹配是不同输入状态；所需资料不足时输出准备状态与补数任务。包内 Premia 的零有效久期只支持零非缺失这一机制，不被改写成任何合成产品的真实修正久期。第一阶段约束结构和状态，不声称自动验证金融公式。",
+      "source_refs": [
+        {
+          "source_id": "finance_task",
+          "locator": "RTF 正文 Excel 要求：缺修正久期、缺凸性、缺或零净值、日期不一致、缺费用的处理"
+        },
+        {
+          "source_id": "finance_premia",
+          "locator": "PDF 第2页：基金特点表有效久期与凸性0.00；截至2026-05-31，基金与指数表分开"
+        }
+      ],
+      "required_entity_types": [
+        "metric_observation",
+        "worksheet_record"
+      ],
+      "required_relation_types": [
+        "worksheet_uses_observation"
+      ],
+      "required_event_types": [
+        "scope_reviewed",
+        "readiness_updated"
+      ],
+      "required_causal_rules": [
+        "scope_to_readiness"
+      ]
+    }
+  ],
+  "blueprint_requirements": {
+    "entity_types": [
+      {
+        "id": "product",
+        "noun": "债券投资产品",
+        "count": 2,
+        "fields": [
+          {
+            "name": "产品类别",
+            "kind": "category"
+          }
+        ]
+      },
+      {
+        "id": "share_class",
+        "noun": "产品份额",
+        "count": 3,
+        "fields": [
+          {
+            "name": "所属产品",
+            "kind": "reference"
+          },
+          {
+            "name": "交易币种",
+            "kind": "category"
+          },
+          {
+            "name": "估值币种",
+            "kind": "category"
+          },
+          {
+            "name": "派息币种",
+            "kind": "category"
+          },
+          {
+            "name": "分派方式",
+            "kind": "category"
+          }
+        ]
+      },
+      {
+        "id": "metric_observation",
+        "noun": "指标观测记录",
+        "count": 3,
+        "fields": [
+          {
+            "name": "观测份额",
+            "kind": "reference"
+          },
+          {
+            "name": "数据日期",
+            "kind": "date"
+          },
+          {
+            "name": "指标口径",
+            "kind": "category"
+          },
+          {
+            "name": "有效久期",
+            "kind": "numeric",
+            "unit": "年"
+          },
+          {
+            "name": "输入状态",
+            "kind": "status"
+          }
+        ]
+      },
+      {
+        "id": "worksheet_record",
+        "noun": "测算准备记录",
+        "count": 2,
+        "fields": [
+          {
+            "name": "测算份额",
+            "kind": "reference"
+          },
+          {
+            "name": "参考观测",
+            "kind": "reference"
+          },
+          {
+            "name": "口径核对状态",
+            "kind": "status"
+          },
+          {
+            "name": "费用输入状态",
+            "kind": "status"
+          },
+          {
+            "name": "测算准备状态",
+            "kind": "status"
+          }
+        ]
+      }
+    ],
+    "relation_types": [
+      {
+        "id": "share_of_product",
+        "from_type": "share_class",
+        "to_type": "product",
+        "field": "所属产品",
+        "temporal": false,
+        "min_count": 1
+      },
+      {
+        "id": "observation_for_share",
+        "from_type": "metric_observation",
+        "to_type": "share_class",
+        "field": "观测份额",
+        "temporal": false,
+        "min_count": 1
+      },
+      {
+        "id": "worksheet_for_share",
+        "from_type": "worksheet_record",
+        "to_type": "share_class",
+        "field": "测算份额",
+        "temporal": false,
+        "min_count": 1
+      },
+      {
+        "id": "worksheet_uses_observation",
+        "from_type": "worksheet_record",
+        "to_type": "metric_observation",
+        "field": "参考观测",
+        "temporal": true,
+        "min_count": 1
+      }
+    ],
+    "event_types": [
+      {
+        "id": "observation_registered",
+        "label": "指标资料登记",
+        "roles": {
+          "observation": "metric_observation"
+        },
+        "effect_fields": [
+          {
+            "role": "observation",
+            "field": "输入状态"
+          }
+        ],
+        "min_count": 1
+      },
+      {
+        "id": "scope_reviewed",
+        "label": "输入口径核对",
+        "roles": {
+          "observation": "metric_observation",
+          "worksheet": "worksheet_record"
+        },
+        "effect_fields": [
+          {
+            "role": "worksheet",
+            "field": "口径核对状态"
+          }
+        ],
+        "min_count": 1,
+        "relation_bindings": [
+          {
+            "relation": "worksheet_uses_observation",
+            "from_role": "worksheet",
+            "to_role": "observation"
+          }
+        ]
+      },
+      {
+        "id": "readiness_updated",
+        "label": "测算准备更新",
+        "roles": {
+          "worksheet": "worksheet_record"
+        },
+        "effect_fields": [
+          {
+            "role": "worksheet",
+            "field": "费用输入状态"
+          },
+          {
+            "role": "worksheet",
+            "field": "测算准备状态"
+          }
+        ],
+        "min_count": 1
+      }
+    ],
+    "causal_rules": [
+      {
+        "id": "observation_to_scope_review",
+        "trigger_event": "observation_registered",
+        "effect_event": "scope_reviewed",
+        "delay_sessions": 1,
+        "shared_roles": [
+          "observation"
+        ]
+      },
+      {
+        "id": "scope_to_readiness",
+        "trigger_event": "scope_reviewed",
+        "effect_event": "readiness_updated",
+        "delay_sessions": 1,
+        "shared_roles": [
+          "worksheet"
+        ]
+      }
+    ],
+    "evidence_channels": [
+      "份额资料卡",
+      "输入复核单",
+      "补数清单"
+    ],
+    "temporal_model": {
+      "min_sessions": 4
+    }
+  }
+}

@@ -30,10 +30,19 @@ if not API_KEY:
 if not MODEL:
     sys.exit("[配置错误] 未找到 MODEL,请检查 .env。")
 
-# ★socket 级超时(防死连接,不防慢代理):read 是 per-recv 300s,代理持续发数据就不触发。
+# 盲判别只做短 JSON 抽取，允许固定使用不展开 reasoning 的模型；不设置时
+# 沿用主模型，保持任意 OpenAI 兼容端点可直接运行。
+DISCRIMINATOR_MODEL = os.getenv("DISCRIMINATOR_MODEL") or MODEL
+
+# 大型关系/事件 JSON 需要稳定吐正文；只允许显式固定路由，不做运行时模型 fallback。
+STRUCTURE_MODEL = os.getenv("STRUCTURE_MODEL") or MODEL
+
+# ★socket 级超时(防死连接,不防慢代理):read 缺省 580s,代理持续发数据就不触发。
 #   总响应时间由 chat() 的 DEADLINE_S 截止;这里只管 connect/write/pool 快速失败。
+HTTP_READ_TIMEOUT_S = float(os.getenv("LLM_HTTP_READ_TIMEOUT_S", "580"))
 client = OpenAI(api_key=API_KEY, base_url=BASE_URL,
-                timeout=httpx.Timeout(300.0, connect=15.0, write=30.0, pool=15.0),
+                timeout=httpx.Timeout(HTTP_READ_TIMEOUT_S, connect=15.0,
+                                      write=30.0, pool=15.0),
                 max_retries=0)   # 重试逻辑在 chat_json 里(带退避+日志),SDK 层不重复重试
 
 # ★全局 LLM 在飞并发上限:无论上层 pmap 怎么嵌套/并行,真正打到 API 的请求数 ≤ LLM_CONCURRENCY。
@@ -41,17 +50,36 @@ client = OpenAI(api_key=API_KEY, base_url=BASE_URL,
 LLM_CONCURRENCY = int(os.getenv("LLM_CONCURRENCY", "8"))
 _LLM_SEM = threading.BoundedSemaphore(LLM_CONCURRENCY)
 DEADLINE_S = int(os.getenv("LLM_DEADLINE_S", "600"))
+MIN_COMPLETION_TOKENS = int(os.getenv("LLM_MIN_COMPLETION_TOKENS", "0"))
 
 
-def chat(messages, temperature=0.7, top_p=1.0, max_tokens=4096):
+def _completion_text(response):
+    """提取正文；空正文时保留服务端停止原因与 token 证据。"""
+    choice = response.choices[0]
+    text = choice.message.content or ""
+    if text:
+        return text
+    usage = getattr(response, "usage", None)
+    details = getattr(usage, "completion_tokens_details", None) if usage else None
+    raise ValueError(
+        "LLM 返回空正文:"
+        f"finish_reason={getattr(choice, 'finish_reason', None)},"
+        f"completion_tokens={getattr(usage, 'completion_tokens', None)},"
+        f"reasoning_tokens={getattr(details, 'reasoning_tokens', None)}")
+
+
+def chat(messages, temperature=0.7, top_p=1.0, max_tokens=4096, model=None):
     """薄封装:信号量限并发 + daemon 线程限总时间(DEADLINE_S)。"""
+    effective_max_tokens = max(max_tokens, MIN_COMPLETION_TOKENS)
+    effective_model = model or MODEL
     with _LLM_SEM:
         rv = [None, None]
         def _do():
             try:
                 rv[0] = client.chat.completions.create(
-                    model=MODEL, messages=messages,
-                    temperature=temperature, top_p=top_p, max_tokens=max_tokens)
+                    model=effective_model, messages=messages,
+                    temperature=temperature, top_p=top_p,
+                    max_tokens=effective_max_tokens)
             except Exception as e:
                 rv[1] = e
         t = threading.Thread(target=_do, daemon=True)
@@ -61,7 +89,7 @@ def chat(messages, temperature=0.7, top_p=1.0, max_tokens=4096):
             raise TimeoutError(f"LLM 调用超总截止 {DEADLINE_S}s")
         if rv[1] is not None:
             raise rv[1]
-    return rv[0].choices[0].message.content
+    return _completion_text(rv[0])
 
 
 def _strip_code_fence(text):
@@ -72,23 +100,28 @@ def _strip_code_fence(text):
 
 
 def chat_json(messages, temperature=0.7, max_tokens=4096, retries=3,
-              retry_delay_base=3.0):
+              retry_delay_base=3.0, model=None, strict_json=False):
     """调用 LLM 并把回复解析成 JSON 对象。
 
     任何异常(LLM API timeout / network / JSON 解析失败)都触发指数退避重试。
     推理模型偶尔会在 JSON 外面带点话或裹代码块,做"剥壳 + 抓第一个 {..}/[..]" 容错。
+    ``strict_json=True`` 时只接受去掉代码围栏后的完整 JSON，不抓子串、不修语法；
+    与 ``retries=1`` 合用可形成单次、无修复的硬协议。
     """
     import time as _time
     last_err = None
     raw = ""
     for attempt in range(retries):
         try:
-            raw = chat(messages, temperature=temperature, max_tokens=max_tokens)
+            raw = chat(messages, temperature=temperature, max_tokens=max_tokens,
+                       model=model)
             cleaned = _strip_code_fence(raw)
             try:
                 return json.loads(cleaned)
             except json.JSONDecodeError as e:
                 last_err = e
+                if strict_json:
+                    raise
                 m = re.search(r"(\{.*\}|\[.*\])", cleaned, re.DOTALL)
                 if m:
                     try:

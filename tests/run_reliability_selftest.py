@@ -9,10 +9,12 @@ import json
 import sys
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+import config
 import pipeline.run as run_module
-from pipeline.run import Run, Stage, _run_stage
+from pipeline.run import Run, Stage, _dependent_stage_names, _run_stage
 from pipeline.world_state import WorldState
 
 
@@ -21,6 +23,22 @@ checks: list[tuple[bool, str]] = []
 
 def ck(name, cond):
     checks.append((bool(cond), name))
+
+
+empty_response = SimpleNamespace(
+    choices=[SimpleNamespace(
+        finish_reason="length", message=SimpleNamespace(content=""))],
+    usage=SimpleNamespace(
+        completion_tokens=8192,
+        completion_tokens_details=SimpleNamespace(reasoning_tokens=8192)))
+try:
+    config._completion_text(empty_response)
+except ValueError as exc:
+    empty_detail = str(exc)
+else:
+    empty_detail = ""
+ck("空正文错误保留 finish_reason 与 reasoning token 证据",
+   "finish_reason=length" in empty_detail and "reasoning_tokens=8192" in empty_detail)
 
 
 with tempfile.TemporaryDirectory() as td:
@@ -147,6 +165,15 @@ with tempfile.TemporaryDirectory() as td:
        run.manifest["stages"]["a"]["status"] == "succeeded" and
        run.manifest["stages"]["a"]["attempt"] == 4)
 
+    branched = [
+        Stage("world", [], ok_stage, "world.json"),
+        Stage("questions", ["world"], ok_stage, "questions.json"),
+        Stage("corpus", ["world"], ok_stage, "corpus.json"),
+        Stage("grounding", ["questions", "corpus"], ok_stage, "grounding.json"),
+    ]
+    ck("force 失效传播按 DAG：重出题不误伤独立 corpus 分支",
+       _dependent_stage_names("questions", branched) == ["questions", "grounding"])
+
     invalidated_dependency_rejected = False
     try:
         drive(run, stages, only="c")
@@ -252,16 +279,50 @@ with tempfile.TemporaryDirectory() as td:
                    config_meta={"target_tokens": 10, "render_only": ["old-entity"]})
     game_run.write(factory.ART["whitepaper"], {"domain_profile": {}})
     game_run.write(factory.ART["world"], WorldState(n_sessions=1, narrative={"version": 1}).to_dict())
-    game_run.write(factory.ART["corpus"], old_final)
+    game_final = {"corpus": {"sessions": [{"session_id": 0, "date": "full", "docs": []}]},
+                  "done_weeks": [0]}
+    game_run.write(factory.ART["corpus"], game_final)
 
     def narrative_render(_wp, _ws, _target, _tracer, corpus, done, save, _log=None, **kwargs):
-        ck("narrative 忽略残留 delta 选项并从空语料起步",
-           kwargs.get("only_entities") is None and kwargs.get("only_entity_sessions") is None
-           and corpus == {"sessions": []} and done == set())
+        ck("narrative delta 只在已有完整语料上追加，并保留定向范围",
+           kwargs.get("only_entities") == {"old-entity"}
+           and kwargs.get("only_entity_sessions") == set()
+           and corpus == game_final["corpus"] and done == set(game_final["done_weeks"]))
         save()
 
     factory.render_corpus = narrative_render
     factory.stage_corpus(game_run)
+
+    empty_narrative_delta = Run(
+        "game", "game__empty-narrative-delta-test",
+        config_meta={"target_tokens": 10, "render_only_pairs": [["old-entity", 0]]})
+    empty_narrative_delta.write(factory.ART["whitepaper"], {"domain_profile": {}})
+    empty_narrative_delta.write(
+        factory.ART["world"], WorldState(n_sessions=1, narrative={"version": 1}).to_dict())
+    try:
+        factory.stage_corpus(empty_narrative_delta)
+    except factory.WorldBlueprintError:
+        empty_narrative_delta_rejected = True
+    else:
+        empty_narrative_delta_rejected = False
+    ck("narrative delta 没有既有完整 corpus 时 fail-closed",
+       empty_narrative_delta_rejected)
+
+    partial_narrative_delta = Run(
+        "game", "game__partial-narrative-delta-test",
+        config_meta={"target_tokens": 10, "render_only_pairs": [["old-entity", 0]]})
+    partial_narrative_delta.write(factory.ART["whitepaper"], {"domain_profile": {}})
+    partial_narrative_delta.write(
+        factory.ART["world"], WorldState(n_sessions=1, narrative={"version": 1}).to_dict())
+    partial_narrative_delta.write(factory.ART["corpus"], old_final)
+    try:
+        factory.stage_corpus(partial_narrative_delta)
+    except factory.WorldBlueprintError:
+        partial_narrative_delta_rejected = True
+    else:
+        partial_narrative_delta_rejected = False
+    ck("narrative delta 的既有 corpus 缺章或多章时 fail-closed",
+       partial_narrative_delta_rejected)
 
     missing_story_run = Run("game", "game__missing-story-test",
                             config_meta={"target_tokens": 10})
@@ -331,6 +392,29 @@ with tempfile.TemporaryDirectory() as td:
        game_wp["world_blueprint"]["entity_types"][0]["count"] == 1
        and game_wp["world_blueprint"]["relation_types"][0]["min_count"] == 1
        and game_wp["shared_world_spec"]["entities"]["count"] == 2)
+
+    # 从中游恢复时，grounding 必须以当前 06 覆盖历史 UNMET 状态。
+    import pipeline.grounding as grounding_module
+    grounding_run = Run("game", "game__grounding-ledger-test")
+    grounding_run.manifest.setdefault("algo", {}).update({
+        "met_status": "UNMET_ORDER_SUPPLY: stale",
+        "targetspec": {"min_questions": 3, "per_line_min": {"L1_timeline": 2}},
+    })
+    grounding_run._save_manifest()
+    grounding_run.write(factory.ART["questions"], [{"qid": str(i)} for i in range(3)])
+    grounding_run.write(factory.ART["corpus"], {"corpus": {"sessions": []}})
+    original_run_grounding = grounding_module.run_grounding
+    grounding_module.run_grounding = lambda *_args: (
+        [{"qid": str(i)} for i in range(3)],
+        {"overall": {"n": 3, "grounded": 3, "survival": 1.0},
+         "by_line": {"L1_timeline": {"n": 3, "grounded": 3, "survival": 1.0}},
+         "by_capability": {}, "n_dropped": 0, "drops": []},
+    )
+    factory.stage_grounding(grounding_run)
+    ck("grounding 汇合点按当前产物把陈旧 UNMET 重算为 MET",
+       grounding_run.manifest["algo"]["met_status"] == "MET"
+       and grounding_run.manifest["algo"]["per_line_final"] == {"L1_timeline": 3})
+    grounding_module.run_grounding = original_run_grounding
 
     factory.build_world = original_build_world
     factory._prepare_lines = original_prepare_lines

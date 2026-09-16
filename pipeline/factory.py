@@ -27,6 +27,10 @@ from pipeline.run import Run, Stage, drive, list_runs, latest_run_for, new_run_i
 from pipeline.targetspec import TargetSpec
 from pipeline.closed_loop import build_to_target
 from tools.diversity_metrics import report as diversity_report
+from pipeline.seed_pack import SeedPackError
+from pipeline.seed_run import (prepare_seed_input, seed_config, validate_seed_input,
+                               validate_seed_identity)
+from pipeline.seed_world import validate_seed_world
 
 
 SCENARIOS = {
@@ -175,8 +179,18 @@ ANSWER_PROTOCOL = {
 
 
 def stage_input(run: Run):
-    run.write(ART["input"], SCENARIOS[run.scenario])
-    run.write("00_about.json", {"answer_protocol": ANSWER_PROTOCOL})   # ★出厂作答协议(随题库交付,eval 侧读)
+    scenario = prepare_seed_input(run)
+    if scenario is None:
+        if run.scenario not in SCENARIOS:
+            raise ValueError(f"未知场景 {run.scenario!r}；使用内置 --scenario 或 --seed-pack")
+        scenario = SCENARIOS[run.scenario]
+    run.write(ART["input"], scenario)
+    about = {"answer_protocol": ANSWER_PROTOCOL}
+    if scenario.get("seed"):
+        about["seed"] = scenario["seed"]
+        about["generation_mode"] = "real_task_seeded_synthetic"
+        run.set_algo(seed=scenario["seed"])
+    run.write("00_about.json", about)
 
 
 def _pin_game_primary(wp: dict) -> None:
@@ -207,7 +221,14 @@ def _pin_game_primary(wp: dict) -> None:
 
 def stage_whitepaper(run: Run):
     sc = run.read(ART["input"])
-    wp = central_office(sc["description"], sc["few_shot"], run.tracer, run.log)
+    pack = validate_seed_input(run, sc)
+    if pack is None:
+        wp = central_office(sc["description"], sc["few_shot"], run.tracer, run.log)
+    else:
+        wp = central_office(sc["description"], sc["few_shot"], run.tracer, run.log,
+                            seed_pack=pack)
+        validate_seed_identity(run, wp)
+        run.write("01_seed_audit.json", wp["seed_audit"])
     if run.scenario == "game":
         _pin_game_primary(wp)
     run.write(ART["whitepaper"], wp)
@@ -218,6 +239,7 @@ def stage_whitepaper(run: Run):
 
 def stage_world(run: Run):
     wp = run.read(ART["whitepaper"])
+    validate_seed_identity(run, wp)
     existing = None
     # game 的 Story Ledger 必须基于单一 canon；即使 manifest 残留 augment 也始终全量重建。
     if (run.scenario != "game" and run.manifest["config"].get("augment")
@@ -226,6 +248,9 @@ def stage_world(run: Run):
     ws = build_world(wp, run.tracer, run.log, existing=existing,
                      narrative=(run.scenario == "game"))
     _prepare_lines(wp, ws, run.log)
+    seed_audit = validate_seed_world(wp, ws)
+    if wp.get("seed_contract"):
+        run.write("02_seed_audit.json", seed_audit)
     run.write(ART["world"], ws.to_dict())
     # world 已更换，任何旧渲染中断点都不再与当前 canon 对应。
     (run.dir / CORPUS_CKPT).unlink(missing_ok=True)
@@ -234,6 +259,8 @@ def stage_world(run: Run):
 
 def stage_orders(run: Run):
     wp = run.read(ART["whitepaper"]); ws = WorldState.from_dict(run.read(ART["world"]))
+    validate_seed_identity(run, wp)
+    validate_seed_world(wp, ws)
     quotas = run.manifest["config"].get("quotas")           # ★闭环 driver 经 config 喂各线配额;普通 drive 路径无此键 → None → run_lines 回退 total_q(向后兼容)
     orders = run_lines(wp, ws, run.log, quotas=quotas)
     run.write(ART["orders"], orders)
@@ -249,6 +276,10 @@ def stage_well_posed(run: Run):
     源头修复后(week_label / L3 跳复现 / L5 排己)新鲜 order 应≈全过 → 本闸=兜底+防回归。"""
     from pipeline.well_posed import run_well_posed
     orders = run.read(ART["orders"]); ws = WorldState.from_dict(run.read(ART["world"]))
+    if run.has(ART["whitepaper"]):
+        wp = run.read(ART["whitepaper"])
+        validate_seed_identity(run, wp)
+        validate_seed_world(wp, ws)
     kept, report = run_well_posed(orders, ws)
     run.write(ART["orders"], kept)                          # 过闸 orders 覆写(下游 stage_questions 只对良定义题出题)
     run.write("03_well_posed_report.json", report)
@@ -260,7 +291,11 @@ def stage_well_posed(run: Run):
 
 def stage_questions(run: Run):
     orders = run.read(ART["orders"]); wp = run.read(ART["whitepaper"])
+    pack = validate_seed_identity(run, wp)
     qs = phrase_questions(orders, wp, run.tracer, run.log)
+    if pack is not None:
+        provenance = run.read(ART["input"])["seed"]
+        qs = [{**q, "seed": provenance} for q in qs]
     run.write(ART["questions"], qs)
     run.set_algo(questions=len(qs))
 
@@ -288,14 +323,34 @@ def _corpus_checkpoint_identity(wp: dict, world: dict, target: int,
 def stage_corpus(run: Run):
     wp = run.read(ART["whitepaper"]); world = run.read(ART["world"])
     ws = WorldState.from_dict(world)
+    validate_seed_identity(run, wp)
+    validate_seed_world(wp, ws)
     if run.scenario == "game" and not ws.narrative:
         raise WorldBlueprintError(
             "game corpus 缺少合法 Story Ledger；请先强制重跑 world，禁止退化为普通语料渲染")
     cfg = run.manifest["config"]
     requested_delta = "render_only" in cfg or "render_only_pairs" in cfg
-    delta_mode = requested_delta and not bool(ws.narrative)
+    # 叙事世界也允许在【已有完整 05】上定向补充实体×章节；render_corpus 会继续
+    # 使用 Story Ledger/reviewer，并在全量旧+新语料上复核全部 canonical event。
+    # 没有既有语料时禁止把 delta 冒充首次全量渲染。
     if requested_delta and ws.narrative:
-        run.log("  ⓘ game Story Ledger 启用：忽略残留 delta 配置，按完整 canon 渲染")
+        if not run.has(ART["corpus"]):
+            raise WorldBlueprintError(
+                "game narrative delta 需要已有完整 corpus；首次渲染必须覆盖全部 Story Ledger")
+        published = run.read(ART["corpus"])
+        published_corpus = published.get("corpus", published) if isinstance(published, dict) else {}
+        expected_sessions = set(ws.sessions())
+        published_sessions = {
+            item.get("session_id") for item in (published_corpus.get("sessions") or [])
+            if isinstance(item, dict)
+        }
+        published_done = set(published.get("done_weeks") or []) if isinstance(published, dict) else set()
+        if published_sessions != expected_sessions or published_done != expected_sessions:
+            raise WorldBlueprintError(
+                "game narrative delta 的既有 corpus 未精确覆盖全部章节，拒绝把局部语料当完整基线")
+    delta_mode = requested_delta
+    if requested_delta and ws.narrative:
+        run.log("  ⓘ game Story Ledger 定向补渲：只追加指定范围，收口仍复核全部 canonical event")
     target = int(run.manifest["config"].get("target_tokens", 1_000_000))
     only = set(cfg.get("render_only") or []) if delta_mode else None
     pairs = ({(item[0], int(item[1])) for item in (cfg.get("render_only_pairs") or [])
@@ -350,14 +405,40 @@ def stage_grounding(run: Run):
     【逐字 + 就近归属】可验,不接地即弃。纯代码、零 LLM。出厂题库 = 06_grounded_questions;
     存活率写进 manifest.algo.grounding,弃因逐条另存 06_grounding_report.json。"""
     from pipeline.grounding import run_grounding
+    if run.has(ART["whitepaper"]):
+        wp = run.read(ART["whitepaper"])
+        validate_seed_identity(run, wp)
+        if wp.get("seed_contract"):
+            validate_seed_world(wp, WorldState.from_dict(run.read(ART["world"])))
+    elif run.manifest.get("config", {}).get("seed_pack_digest"):
+        raise SeedPackError("种子运行缺少白皮书，不能发布题库")
     questions = run.read(ART["questions"])
     corpus_obj = run.read(ART["corpus"])
     kept, report = run_grounding(questions, corpus_obj)
     run.write(ART["grounding"], kept)
     run.write("06_grounding_report.json", report)
     o = report["overall"]
-    run.set_algo(grounding={"overall": o, "by_line": report["by_line"],
-                            "by_capability": report["by_capability"], "n_dropped": report["n_dropped"]})
+    algo_update = {"grounding": {"overall": o, "by_line": report["by_line"],
+                                  "by_capability": report["by_capability"],
+                                  "n_dropped": report["n_dropped"]}}
+    # grounding 是产物汇合点，必须据当前 06 重算闭环账本。否则一次早期失败后
+    # 从中游恢复，即使最终题量已达标，manifest 仍会永久携带陈旧 UNMET。
+    target = (run.manifest.get("algo") or {}).get("targetspec") or {}
+    floors = target.get("per_line_min") or {}
+    if target and isinstance(floors, dict):
+        per_line_final = {
+            line_id: int((report["by_line"].get(line_id) or {}).get("grounded", 0) or 0)
+            for line_id in floors
+        }
+        min_questions = int(target.get("min_questions", 0) or 0)
+        met = (int(o.get("grounded", 0) or 0) >= min_questions
+               and all(per_line_final[line_id] >= int(floor)
+                       for line_id, floor in floors.items()))
+        algo_update.update({
+            "per_line_final": per_line_final,
+            "met_status": "MET" if met else "UNMET_GROUNDING",
+        })
+    run.set_algo(**algo_update)
     run.log(f"  ★接地闸:{o['grounded']}/{o['n']} 接地({(o['survival'] or 0):.0%}),弃 {report['n_dropped']} "
             f"→ 出厂题库 {ART['grounding']}")
 
@@ -390,7 +471,8 @@ def _print_runs():
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--scenario", default="office")
+    ap.add_argument("--scenario", default=None)
+    ap.add_argument("--seed-pack", help="策展种子 JSON；增强 input→whitepaper，后续阶段保持同一合同")
     ap.add_argument("--target-mtokens", type=float, default=None, help="目标 token(M);新 run 缺省 1.0,续 run 沿用")
     ap.add_argument("--tag", default=None, help="人类标签(进 manifest,不影响 run_id)")
     ap.add_argument("--from", dest="from_stage", default=None, help=f"从哪个 stage 起跑 {list(ART)}")
@@ -412,17 +494,35 @@ def main():
     if a.list_runs:
         _print_runs(); return
 
+    if a.seed_pack and a.scenario:
+        ap.error("--seed-pack 已定义场景，不能同时指定 --scenario")
+    try:
+        seed_cfg = seed_config(a.seed_pack) if a.seed_pack else {}
+    except (SeedPackError, OSError) as error:
+        ap.error(str(error))
+    requested_scenario = ("seed_" + seed_cfg["seed_id"] if seed_cfg
+                          else a.scenario or "office")
+
     if a.run_id:                                            # 在已有 run 上继续:scenario 取自其 manifest
-        run_id, scenario = a.run_id, a.scenario
+        run_id, scenario = a.run_id, requested_scenario
         mf = RUNS_DIR / a.run_id / "manifest.json"
         if mf.exists():
-            scenario = json.loads(mf.read_text(encoding="utf-8")).get("scenario", a.scenario)
+            scenario = json.loads(mf.read_text(encoding="utf-8")).get("scenario", requested_scenario)
     elif a.resume:
-        run_id = latest_run_for(a.scenario) or new_run_id(a.scenario); scenario = a.scenario
+        run_id = latest_run_for(requested_scenario) or new_run_id(requested_scenario)
+        scenario = requested_scenario
     else:
-        run_id, scenario = new_run_id(a.scenario), a.scenario
+        run_id, scenario = new_run_id(requested_scenario), requested_scenario
 
     cfg = {"from": a.from_stage, "to": a.to_stage, "only": a.only}
+    manifest_path = RUNS_DIR / run_id / "manifest.json"
+    if seed_cfg and manifest_path.exists():
+        try:
+            previous = json.loads(manifest_path.read_text(encoding="utf-8"))
+            seed_cfg = seed_config(a.seed_pack, previous.get("config") or {})
+        except (SeedPackError, OSError) as error:
+            ap.error(str(error))
+    cfg.update(seed_cfg)
     if a.target_mtokens is not None:
         cfg["target_tokens"] = int(a.target_mtokens * 1_000_000)
     elif not (RUNS_DIR / run_id / "manifest.json").exists():
