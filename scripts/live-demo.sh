@@ -38,7 +38,7 @@ trap cleanup INT TERM EXIT
 
 cd "$ROOT"
 MEMORY_FORGE_ALLOWED_ORIGINS="$ALLOWED_ORIGINS" \
-  "$PYTHON" -m uvicorn tools.live_demo_api:app --host "$API_HOST" --port "$API_PORT" &
+  "$PYTHON" -m uvicorn tools.live_demo_api:app --app-dir "$ROOT" --host "$API_HOST" --port "$API_PORT" &
 API_PID=$!
 
 cd "$ROOT/frontend"

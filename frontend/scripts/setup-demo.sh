@@ -1,12 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$ROOT"
-
-python3 -m venv .venv
-"$ROOT/.venv/bin/python" -m pip install --upgrade pip
-"$ROOT/.venv/bin/python" -m pip install -r requirements-demo.txt
-npm ci
-
-echo "安装完成。运行 ./scripts/live-demo.sh；脚本会显示本机与局域网访问地址。"
+BACKEND_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+if [[ ! -f "$BACKEND_ROOT/backend_bootstrap.py" || ! -f "$BACKEND_ROOT/scripts/setup-demo.sh" ]]; then
+  echo "Memory Forge backend is missing. Keep frontend inside the complete repository checkout." >&2
+  exit 1
+fi
+exec bash "$BACKEND_ROOT/scripts/setup-demo.sh" "$@"

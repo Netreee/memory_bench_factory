@@ -88,11 +88,12 @@ from experiment_state import (  # noqa: E402
 
 
 def aggregate(records: list[dict]) -> dict:
+    from eval.grading import is_scored
     jr = [r for r in records if r.get("judgeable")]
-    judged = [r for r in jr if r.get("correct") is not None]
+    judged = [r for r in jr if is_scored(r)]
 
     def acc(rs):
-        rs = [r for r in rs if r.get("judgeable") and r.get("correct") is not None]
+        rs = [r for r in rs if r.get("judgeable") and is_scored(r)]
         if not rs:
             return {"n": 0, "correct": 0, "acc": None}
         c = sum(1 for r in rs if r["correct"])
@@ -113,7 +114,8 @@ def aggregate(records: list[dict]) -> dict:
         "overall": acc(jr),
         "by_line": by_line,
         "by_cap": by_cap,
-        "n_errors": sum(1 for r in records if r.get("error")),
+        "n_errors": sum(1 for r in records if r.get("error") or r.get("judge_error")),
+        "n_incomplete": len(records) - len(judged),
     }
 
 
@@ -133,6 +135,8 @@ def write_summary_md(path: Path, meta: dict, agg: dict) -> None:
         "| line | n | correct | acc |",
         "|---|---:|---:|---:|",
     ]
+    if (meta.get("release") or {}).get("override"):
+        lines += ["> 历史研究模式：显式绕过发布资格，结果不能作为正式成绩。", ""]
     for ln, d in agg["by_line"].items():
         a = "—" if d["acc"] is None else f"{d['acc']:.3f}"
         lines.append(f"| {ln} | {d['n']} | {d['correct']} | {a} |")
@@ -164,6 +168,7 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--factory-root", default="", help="工厂根目录；默认 MEMORY_BENCH_FACTORY_ROOT 或向上自动发现")
     ap.add_argument("--run", required=True, help="工厂 run 目录（含 05/06/00 json）")
+    ap.add_argument("--allow-unverified", action="store_true", help="仅历史研究：显式允许未取得发布资格的输入")
     ap.add_argument(
         "--harness",
         default="openai-agents",
@@ -213,10 +218,14 @@ def main() -> int:
 
     # API 配置已就绪后才导入判分器；CLI 路径无需安装 Agents SDK。
     from harness_cli import answer_cli, apply_cli_env, ensure_workspace_instructions
-    from eval.judge import classify_refusal, gold_display, is_judgeable, judge_answer, judge_l2_partial, judge_spec
+    from eval.judge import classify_refusal, gold_display, is_judgeable, judge_record, judgement, literal_match, judge_spec
+    from eval.grading import JUDGE_VERSION
+    from pipeline.quality import require_release
 
     run_dir = Path(args.run).resolve()
     corpus, questions, about = load_run(run_dir)
+    release = require_release(run_dir / "06_grounded_questions.json", allow_unverified=args.allow_unverified,
+                              corpus_path=run_dir / "05_corpus.json")
     protocol = render_protocol(about)
     sessions = sessions_from_corpus(corpus)
     judgeable = [q for q in questions if is_judgeable(q)]
@@ -237,9 +246,10 @@ def main() -> int:
     )
     source_files = [p for p in sorted(EVAL_ROOT.glob("*.py")) if not p.name.startswith("test_")]
     source_files += sorted(SDK_DIR.glob("*.py"))
-    source_files += [FACTORY_ROOT / "eval" / "judge.py", FACTORY_ROOT / "config.py"]
+    source_files += [FACTORY_ROOT / "eval" / "judge.py", FACTORY_ROOT / "eval" / "grading.py", FACTORY_ROOT / "config.py"]
     experiment_config = {
-        "schema": 1, "harness": args.harness, "model": model_name,
+        "schema": 2, "harness": args.harness, "model": model_name, "judge_version": JUDGE_VERSION,
+        "allow_unverified": args.allow_unverified,
         "max_turns": args.max_turns, "timeout": args.timeout,
         "api_endpoint_hash": digest(os.environ.get("OPENAI_BASE_URL", "")),
         "disable_thinking": os.environ.get("LLM_DISABLE_THINKING", ""),
@@ -268,7 +278,7 @@ def main() -> int:
         _ = client
 
     results_path = out_dir / "results.jsonl"
-    done = {key: rec for key, rec in current_records.items() if is_reusable(rec)}
+    done = {key: rec for key, rec in current_records.items() if is_reusable(rec, JUDGE_VERSION)}
     print(
         f"run={run_dir.name} model={model} sessions={len(sessions)} "
         f"docs={len(store.docs)} questions={len(indexed)} "
@@ -293,6 +303,7 @@ def main() -> int:
                 "_experiment": fingerprint,
                 "qid": q.get("qid"),
                 "strict_scoring": q.get("strict_scoring"),
+                "question_contract": q.get("question_contract"),
                 "i": i,
                 "line": q["line"],
                 "capability": q["capability"],
@@ -305,7 +316,12 @@ def main() -> int:
                 "mode": mode,
                 "judgeable": True,
             }
-            if args.harness == "openai-agents":
+            previous = current_records.get(qhash) or {}
+            if (previous.get("judge_error") and not previous.get("error")
+                    and isinstance(previous.get("pred"), str) and previous["pred"].strip()):
+                ans = {key: previous[key] for key in ("pred", "elapsed_s", "usage") if key in previous}
+                ans["_prediction_resumed"] = True
+            elif args.harness == "openai-agents":
                 ans = answer_one(
                     agent,
                     provider,
@@ -328,21 +344,24 @@ def main() -> int:
             rec.update(ans)
             attach_cost(rec, model)
             pred = rec.get("pred") or ""
-            if rec.get("error") and pred.startswith("[SOLVE_ERROR"):
-                rec["correct"] = False
-            elif rec.get("error") and not pred:
-                rec["correct"] = False
+            if rec.get("error"):
+                grade = judgement("error", "solver", str(rec["error"])[:160])
             else:
                 try:
-                    rec["correct"] = bool(judge_answer(q, pred, use_llm=True))
+                    grade = judge_record(q, pred, use_llm=True)
                     if q["capability"] == "L6_refusal":
                         lure = ((q.get("aux") or {}).get("lure") or {}).get("value")
                         rec["refusal_bucket"] = classify_refusal(pred, lure)
                     if q["capability"] == "L2_multihop":
-                        rec["partial"] = judge_l2_partial(q, pred, use_llm=True)
+                        rec["partial"] = (1.0 if grade["correct"] is True else
+                                          0.5 if grade["correct"] is False and literal_match(pred, [(q.get("aux") or {}).get("bridge")]) else
+                                          0.0 if grade["correct"] is False else None)
                 except Exception as e:
-                    rec["correct"] = False
-                    rec["judge_error"] = f"{type(e).__name__}:{str(e)[:80]}"
+                    grade = judgement("error", "judge_exception", f"{type(e).__name__}:{str(e)[:160]}")
+            rec["judgement"] = grade
+            rec["correct"] = grade["correct"]
+            if grade["verdict"] == "error" and not rec.get("error"):
+                rec["judge_error"] = grade["reason"]
             fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
             fh.flush()
             current_records[qhash] = rec
@@ -364,6 +383,8 @@ def main() -> int:
         "model": model,
         "experiment_fingerprint": fingerprint,
         "factory_root": str(FACTORY_ROOT),
+        "release": release, "judge_version": JUDGE_VERSION,
+        "result_scope": "research_only" if release.get("override") else "release_eligible",
         "n_sessions": len(sessions),
         "n_docs": len(store.docs),
         "elapsed_s": elapsed,

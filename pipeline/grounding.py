@@ -118,6 +118,10 @@ def run_grounding(questions: list, corpus_obj: dict) -> tuple[list, dict]:
 
     by_id = {s["session_id"]: s for s in _sessions_of(corpus_obj)}
     all_sig = all_signal_text(corpus_obj)
+    # Held-out leakage is invalid anywhere the solver can read, including a
+    # mislabelled filler. Other lines retain their signal-only evidence scope.
+    all_visible = "\n".join(d.get("content", "") for s in _sessions_of(corpus_obj)
+                            for d in s.get("docs", []))
 
     kept, drops = [], []
     tally = defaultdict(lambda: {"n": 0, "ok": 0})   # 按 line / cap 计数
@@ -129,7 +133,7 @@ def run_grounding(questions: list, corpus_obj: dict) -> tuple[list, dict]:
             status, reason = "drop", "无对应产线 / 该线未实现 ground()(fail-closed)"
         else:
             try:
-                status, reason = line.ground(q, ev, all_sig)
+                status, reason = line.ground(q, ev, all_visible if q.get("line") == "L9_induction" else all_sig)
             except Exception as e:
                 status, reason = "drop", f"ground() 异常:{type(e).__name__}:{str(e)[:60]}"
 
@@ -142,7 +146,11 @@ def run_grounding(questions: list, corpus_obj: dict) -> tuple[list, dict]:
             # 这是候选证据集合，不声称做最小证明集；但每个 ID 都来自声明时间窗。
             evidence_doc_ids = list(dict.fromkeys(
                 str(item["doc_id"]) for item in ev if item.get("doc_id")))
-            kept.append({**q, "evidence_doc_ids": evidence_doc_ids})
+            kept.append({**q, "evidence_doc_ids": evidence_doc_ids,
+                         "candidate_evidence_doc_ids": evidence_doc_ids,
+                         "evidence_scope": {"kind": "candidate_pool", "minimal_proof": "not_measured",
+                                            "necessary_document_count": None,
+                                            "difficulty_verified": False}})
         else:
             drops.append({**_key(q), "reason": reason})
 

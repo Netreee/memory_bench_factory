@@ -544,5 +544,7 @@ def build_to_target(run: Run, spec: TargetSpec, max_rounds: int = 2, order_subro
         raise WorldBlueprintError(f"闭环硬契约未满足:{unmet}")
     _update_run_metadata(
         run, config_remove=("augment", "render_only", "render_only_pairs"))       # ★清增量信号,免泄漏到后续 --only 重跑
+    from pipeline.factory import stage_quality
+    _run_stage(run, "quality", stage_quality, ART["quality"])
     _finalize_run(run)
     return last["kept"], "MET"

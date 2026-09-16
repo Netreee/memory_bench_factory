@@ -8,7 +8,6 @@ import {
   BrainCircuit,
   CheckCircle2,
   CircleStop,
-  Cpu,
   Database,
   FileText,
   Flame,
@@ -31,6 +30,7 @@ import {
 } from 'lucide-react';
 
 import { Button } from '@/components/ui/button';
+import { formatCount, qualityLabel, replayPath, unverifiedQuality, type QualitySnapshot } from '@/lib/live-run';
 
 const CONFIGURED_API_URL = process.env.NEXT_PUBLIC_MEMORY_FORGE_API ?? 'http://127.0.0.1:8791';
 const API_URL = typeof window === 'undefined'
@@ -47,6 +47,7 @@ const PIPELINE = [
   ['04', 'QUESTIONS', '题面生成'],
   ['05', 'CORPUS', '渲染剧情与证据'],
   ['06', 'GROUNDING', '证据接地验收'],
+  ['07', 'QUALITY', '发布资格检查'],
 ] as const;
 
 const DEFAULT_SCENARIO =
@@ -55,13 +56,16 @@ const DEFAULT_SCENARIO =
 type Health = { ok: boolean; live_ready?: boolean; engine?: string; model?: string };
 
 type StageName = (typeof PIPELINE)[number][1];
-type StageKey = 'input' | 'whitepaper' | 'world' | 'orders' | 'well_posed' | 'questions' | 'corpus' | 'grounding';
+type StageKey = 'input' | 'whitepaper' | 'world' | 'orders' | 'well_posed' | 'questions' | 'corpus' | 'grounding' | 'quality';
 type StageStatus = 'pending' | 'running' | 'succeeded' | 'failed' | 'cancelled';
 
 type RunSnapshot = {
   run_id: string;
   source: 'live' | 'recorded' | 'replay';
-  status: 'starting' | 'running' | 'succeeded' | 'failed' | 'cancelled';
+  status: 'starting' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'unknown';
+  generation_status: 'starting' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'unknown';
+  quality: QualitySnapshot;
+  eligible: boolean;
   current_stage: StageKey | '';
   current_index: number;
   created?: string;
@@ -73,18 +77,18 @@ type RunSnapshot = {
   output: string;
   stages: Array<{ name: StageKey; index: number; status: StageStatus; elapsed_s: number | null; artifact: string; ready: boolean }>;
   metrics: {
-    entities: number;
-    sessions: number;
-    events?: number;
-    orders: number;
-    well_posed: { n: number; kept: number; rate: number | null };
-    questions: number;
-    docs: number;
-    chars: number;
-    star_questions?: number;
-    signal_docs?: number;
-    continuity_conflicts?: number;
-    grounding: { n: number; grounded: number; survival: number | null };
+    entities: number | null;
+    sessions: number | null;
+    events?: number | null;
+    orders: number | null;
+    well_posed: { n: number | null; kept: number | null; rate: number | null };
+    questions: number | null;
+    docs: number | null;
+    chars: number | null;
+    star_questions?: number | null;
+    signal_docs?: number | null;
+    continuity_conflicts?: number | null;
+    grounding: { n: number | null; grounded: number | null; survival: number | null };
   };
   agents: Array<{ id: string; name: string; role: string; status: 'waiting' | 'active' | 'complete' }>;
   recent_calls: Array<{ i: number; ts: number; latency_ms: number; ok: boolean; step: string; label: string }>;
@@ -100,13 +104,13 @@ type RunSnapshot = {
       irreversible_cost?: string;
       tone?: string;
       format?: string;
-      target_questions?: number;
-      target_star_questions?: number;
+      target_questions?: number | null;
+      target_star_questions?: number | null;
       source_tiers?: string[];
       doc_genres: string[];
       active_lines: string[];
     };
-    world: { entity_names: string[]; n_sessions: number; event_count?: number };
+    world: { entity_names: string[]; n_sessions: number | null; event_count?: number | null };
     questions: Array<{ question: string; line?: string; capability?: string; source: string }>;
     corpus_sessions: Array<{ id: string; date: string; docs: number; types: string[] }>;
     grounding: { overall: { n?: number; grounded?: number; survival?: number }; questions: Array<{ question: string; line: string; capability: string }> };
@@ -123,6 +127,7 @@ type ReplayRun = {
   completed_stages: number;
   llm_calls: number;
   has_06: boolean;
+  quality: QualitySnapshot;
 };
 
 type ReplayEvent = {
@@ -155,6 +160,7 @@ const STAGE_LABELS: Record<StageKey, { index: string; name: StageName; cn: strin
   questions: { index: '04', name: 'QUESTIONS', cn: '题面生成' },
   corpus: { index: '05', name: 'CORPUS', cn: '证据渲染' },
   grounding: { index: '06', name: 'GROUNDING', cn: '接地验收' },
+  quality: { index: '07', name: 'QUALITY', cn: '发布资格' },
 };
 
 const WHITEPAPER_STEPS = [
@@ -167,7 +173,7 @@ const WHITEPAPER_STEPS = [
   { name: 'RED TEAM', role: '审查并封存规格' },
 ] as const;
 
-export function LiveStudio({ onReplay }: { onReplay: () => void }) {
+export function LiveStudio({ onShowcase }: { onShowcase: () => void }) {
   const fileInput = useRef<HTMLInputElement>(null);
   const [description, setDescription] = useState(DEFAULT_SCENARIO);
   const [fileName, setFileName] = useState('');
@@ -176,7 +182,7 @@ export function LiveStudio({ onReplay }: { onReplay: () => void }) {
   const [health, setHealth] = useState<Health | null>(null);
   const [screen, setScreen] = useState<'compose' | 'starting' | 'run'>('compose');
   const [runId, setRunId] = useState('');
-  const [snapshot, setSnapshot] = useState<RunSnapshot | null>(null);
+  const [liveSnapshot, setSnapshot] = useState<RunSnapshot | null>(null);
   const [submitError, setSubmitError] = useState('');
   const [selectedStage, setSelectedStage] = useState<StageKey | null>(null);
   const [composeMode, setComposeMode] = useState<'live' | 'replay'>('live');
@@ -186,6 +192,10 @@ export function LiveStudio({ onReplay }: { onReplay: () => void }) {
   const [replayCursor, setReplayCursor] = useState(0);
   const [replayPlaying, setReplayPlaying] = useState(false);
   const [replayClockKey, setReplayClockKey] = useState(0);
+  const snapshot = useMemo(
+    () => replayBundle ? buildReplaySnapshot(replayBundle, replayCursor) : liveSnapshot,
+    [replayBundle, replayCursor, liveSnapshot],
+  );
 
   useEffect(() => {
     const controller = new AbortController();
@@ -231,7 +241,7 @@ export function LiveStudio({ onReplay }: { onReplay: () => void }) {
   }, [composeMode]);
 
   useEffect(() => {
-    if (!runId || snapshot?.source === 'recorded' || snapshot?.source === 'replay' || ['succeeded', 'failed', 'cancelled'].includes(snapshot?.status ?? '')) return;
+    if (!runId || snapshot?.source === 'recorded' || snapshot?.source === 'replay' || ['succeeded', 'failed', 'cancelled', 'unknown'].includes(snapshot?.status ?? '')) return;
     let disposed = false;
     const poll = async () => {
       try {
@@ -260,12 +270,7 @@ export function LiveStudio({ onReplay }: { onReplay: () => void }) {
       if (next >= replayBundle.duration_ms) setReplayPlaying(false);
     }, 80);
     return () => window.clearInterval(timer);
-  }, [replayBundle, replayClockKey, replayPlaying]);
-
-  useEffect(() => {
-    if (!replayBundle) return;
-    setSnapshot(buildReplaySnapshot(replayBundle, replayCursor));
-  }, [replayBundle, replayCursor]);
+  }, [replayBundle, replayClockKey, replayPlaying, replayCursor]);
 
   const preview = useMemo(
     () => fileText.split(/\r?\n/).filter(Boolean).slice(0, 3).join('\n'),
@@ -324,6 +329,8 @@ export function LiveStudio({ onReplay }: { onReplay: () => void }) {
 
   const loadRecorded = async () => {
     setSubmitError('');
+    setReplayBundle(null);
+    setReplayPlaying(false);
     setScreen('starting');
     try {
       const response = await fetch(`${API_URL}/api/recorded`);
@@ -339,14 +346,16 @@ export function LiveStudio({ onReplay }: { onReplay: () => void }) {
     }
   };
 
-  const loadReplay = async () => {
-    if (!selectedReplayId) return;
+  const loadReplay = async (targetRunId = selectedReplayId) => {
+    if (!targetRunId) return;
+    const preserveCurrent = snapshot?.run_id === targetRunId;
     setSubmitError('');
     setScreen('starting');
     try {
-      const response = await fetch(`${API_URL}/api/replay/${encodeURIComponent(selectedReplayId)}`);
+      const response = await fetch(`${API_URL}${replayPath(targetRunId)}`);
       if (!response.ok) throw new Error('这个 Run 没有足够的回放记录');
       const bundle = await response.json() as ReplayBundle;
+      if (bundle.run_id !== targetRunId || bundle.final_snapshot.run_id !== targetRunId) throw new Error("回放记录与所选 Run 不一致");
       window.localStorage.removeItem('memory-forge-live-run');
       setRunId(bundle.run_id);
       setReplayBundle(bundle);
@@ -358,7 +367,7 @@ export function LiveStudio({ onReplay }: { onReplay: () => void }) {
       setScreen('run');
     } catch (error) {
       setSubmitError(error instanceof Error ? error.message : 'Replay 载入失败');
-      setScreen('compose');
+      setScreen(preserveCurrent ? 'run' : 'compose');
     }
   };
 
@@ -398,7 +407,7 @@ export function LiveStudio({ onReplay }: { onReplay: () => void }) {
         onSelectStage={setSelectedStage}
         onCancel={() => void cancelRun()}
         onNewRun={newRun}
-        onReplay={onReplay}
+        onReplay={() => void loadReplay(runId)}
         onRecorded={() => void loadRecorded()}
         replay={replayBundle ? {
           cursor: replayCursor,
@@ -437,19 +446,19 @@ export function LiveStudio({ onReplay }: { onReplay: () => void }) {
           <span>{health === null ? 'PROBING LOCAL ENGINE' : health.ok ? health.live_ready ? 'LIVE + REPLAY ONLINE' : 'REPLAY ENGINE ONLINE' : 'LOCAL ENGINE OFFLINE'}</span>
           <i className={health?.ok ? 'is-online' : ''} />
         </div>
-        <button type="button" className="studio-history" onClick={onReplay}>
+        <button type="button" className="studio-history" onClick={onShowcase}>
           <History size={14} /> 电影回放
         </button>
       </header>
 
       <section className="studio-hero">
         <div className="studio-copy">
-          <p className="studio-kicker"><span>{composeMode === 'live' ? 'LIVE / 06' : 'REPLAY / 60S'}</span>{composeMode === 'live' ? ' REAL PIPELINE · LOCAL ONLY' : ' EXISTING RUN · TIME COMPRESSED'}</p>
+          <p className="studio-kicker"><span>{composeMode === 'live' ? 'LIVE / 07' : 'REPLAY / 60S'}</span>{composeMode === 'live' ? ' REAL PIPELINE · LOCAL ONLY' : ' EXISTING RUN · TIME COMPRESSED'}</p>
           <h1>{composeMode === 'live' ? <>给它一个世界。<br /><em>看 Benchmark 被铸造。</em></> : <>选一段历史。<br /><em>让铸造过程再次发生。</em></>}</h1>
           <p className="studio-lede">{composeMode === 'live' ? '输入场景，交给一个 TXT 样例。接下来每一次发光、每一个数字，都由本地真实流水线触发。' : 'Replay 不启动模型，也不需要上传日志。选择一个已有 Run，系统会用它的真实阶段和调用时间重建 60 秒回放。'}</p>
           <div className="studio-contract">
             <span><ShieldCheck size={14} /> {composeMode === 'live' ? 'TXT ONLY' : 'RUN ID ONLY'}</span>
-            <span><Gauge size={14} /> {composeMode === 'live' ? 'STOP AT 06' : '60S COMPRESSED'}</span>
+            <span><Gauge size={14} /> {composeMode === 'live' ? 'QUALITY AT 07' : '60S COMPRESSED'}</span>
             <span><Activity size={14} /> REAL EVENTS</span>
           </div>
         </div>
@@ -495,12 +504,12 @@ export function LiveStudio({ onReplay }: { onReplay: () => void }) {
               <History size={12} /> 直接查看已完成 Run <span>RECORDED</span>
             </button>
           </> : <>
-            <div className="replay-run-list" role="radiogroup" aria-label="选择历史 Run">
+            <div className="replay-run-list">
               {replayRuns.map((run) => (
-                <button type="button" role="radio" aria-checked={selectedReplayId === run.run_id} className={selectedReplayId === run.run_id ? 'is-selected' : ''} key={run.run_id} onClick={() => setSelectedReplayId(run.run_id)}>
-                  <i>{run.has_06 ? <CheckCircle2 /> : <OctagonAlert />}</i>
-                  <div><strong>{run.title || run.run_id}</strong><span>{run.run_id} · {run.completed_stages}/8 STAGES</span></div>
-                  <b>{run.has_06 ? '06 READY' : run.status.toUpperCase()}</b>
+                <button type="button" aria-pressed={selectedReplayId === run.run_id} className={selectedReplayId === run.run_id ? 'is-selected' : ''} key={run.run_id} onClick={() => setSelectedReplayId(run.run_id)}>
+                  <i>{run.quality?.eligible ? <CheckCircle2 /> : <OctagonAlert />}</i>
+                  <div><strong>{run.title || run.run_id}</strong><span>{run.run_id} · {run.completed_stages}/{PIPELINE.length} STAGES</span></div>
+                  <b>{qualityLabel(run.quality)}</b>
                 </button>
               ))}
               {!replayRuns.length && <div className="replay-list-empty"><LoaderCircle />正在读取本地 Run…</div>}
@@ -518,7 +527,7 @@ export function LiveStudio({ onReplay }: { onReplay: () => void }) {
       <section className="studio-pipeline" aria-label="真实流水线预检">
         <div className="pipeline-intro">
           <span>{composeMode === 'live' ? 'EXECUTION CONTRACT' : 'REPLAY SOURCE'}</span>
-          <strong>00 → 06</strong>
+          <strong>00 → 07</strong>
           <p>{composeMode === 'live' ? '本次不会启动评测 Arena。' : '不启动 worker，不重复调用模型。'}</p>
         </div>
         <div className="pipeline-track">
@@ -564,7 +573,7 @@ function RunConsole({
   replay: { cursor: number; duration: number; originalDuration: number; playing: boolean; onToggle: () => void; onRestart: () => void } | null;
 }) {
   const status = snapshot?.status ?? 'starting';
-  const isTerminal = ['succeeded', 'failed', 'cancelled'].includes(status);
+  const isTerminal = ['succeeded', 'failed', 'cancelled', 'unknown'].includes(status);
   const isReplay = snapshot?.source === 'replay';
   const isLive = snapshot?.source === 'live' && !isTerminal;
   const stages = snapshot?.stages ?? STAGE_ORDER_FALLBACK;
@@ -584,12 +593,14 @@ function RunConsole({
   const railStatus = isHistoricalInspection
     ? `${STAGE_LABELS[displayStage].index} ACTIVE`
     : snapshot?.status === 'succeeded'
-      ? '06 SEALED'
+      ? 'EXECUTION COMPLETE'
       : `${STAGE_LABELS[currentStage].index} ACTIVE`;
   const metrics = snapshot?.metrics;
   const wellPosedRate = metrics?.well_posed.rate == null ? null : Math.round(metrics.well_posed.rate * 100);
   const groundedRate = metrics?.grounding.survival == null ? null : Math.round(metrics.grounding.survival * 100);
   const benchmarkTitle = snapshot?.views.whitepaper.title;
+  const quality = snapshot?.quality ?? unverifiedQuality();
+  const generationComplete = snapshot?.generation_status === 'succeeded';
 
   return (
     <main className="live-app" data-status={status}>
@@ -650,16 +661,16 @@ function RunConsole({
         <section className={`live-main-stage ${isHistoricalInspection ? 'is-inspection' : ''}`}>
           <div className="live-scene-heading">
             <div>
-              <p>{snapshot?.status === 'succeeded' && !selectedStage ? 'DELIVERY / 出厂' : `${STAGE_LABELS[displayStage].index} / ${STAGE_LABELS[displayStage].name}`}</p>
-              <h1>{snapshot?.status === 'succeeded' && !selectedStage ? '题库已通过最后一道闸' : STAGE_LABELS[displayStage].cn}</h1>
+              <p>{generationComplete && !selectedStage ? 'GENERATION / 生成结果' : `${STAGE_LABELS[displayStage].index} / ${STAGE_LABELS[displayStage].name}`}</p>
+              <h1>{generationComplete && !selectedStage ? `生成完成 · ${qualityLabel(quality)}` : STAGE_LABELS[displayStage].cn}</h1>
             </div>
             {!isHistoricalInspection && <div className="live-scene-state">
-              <span>{snapshot?.status === 'succeeded' && !selectedStage ? 'ARTIFACT READY' : snapshot?.stages.find((stage) => stage.name === displayStage)?.status.toUpperCase() ?? 'STARTING'}</span>
+              <span>{generationComplete && !selectedStage ? (quality.eligible ? 'QUALITY PASSED' : 'ARTIFACTS FOR REVIEW') : snapshot?.stages.find((stage) => stage.name === displayStage)?.status.toUpperCase() ?? 'STARTING'}</span>
             </div>}
           </div>
 
           <div className="live-scene-canvas" key={`${displayStage}-${snapshot?.run_id ?? 'starting'}-${snapshot?.status ?? 'starting'}`}>
-            {!snapshot || starting ? <IgnitionView /> : snapshot.status === 'succeeded' && !selectedStage ? (
+            {!snapshot || starting ? <IgnitionView /> : generationComplete && !selectedStage ? (
               <DeliveryView snapshot={snapshot} onReplay={onReplay} />
             ) : snapshot.status === 'failed' && !selectedStage ? (
               <FailureView snapshot={snapshot} onRecorded={onRecorded} />
@@ -685,34 +696,35 @@ function RunConsole({
 
         <aside className="live-telemetry">
           <div className="live-telemetry-heading"><span>BENCHMARK OUTPUT</span><Radio size={13} /></div>
-          <LiveMetric label="WORLD NODES" value={metrics?.entities ?? 0} note={`${metrics?.events ?? 0} key events`} />
-          <LiveMetric label="STORY CHAPTERS" value={metrics?.sessions ?? 0} note="complete causal arc" />
-          <LiveMetric label="EVIDENCE DOCS" value={metrics?.docs ?? 0} note={`${(metrics?.chars ?? 0).toLocaleString()} chars`} />
-          <LiveMetric label="BENCH QUESTIONS" value={metrics?.questions ?? snapshot?.views.questions.length ?? 0} note={`${metrics?.star_questions ?? 0} star questions`} />
-          <LiveMetric label="WELL-POSED" value={metrics?.well_posed.kept ?? 0} note={wellPosedRate == null ? 'waiting for 03A' : `${wellPosedRate}% valid`} />
+          <LiveMetric label="WORLD NODES" value={metrics?.entities} note={`${formatCount(metrics?.events)} key events`} />
+          <LiveMetric label="STORY CHAPTERS" value={metrics?.sessions} note="observed periods" />
+          <LiveMetric label="EVIDENCE DOCS" value={metrics?.docs} note={`${formatCount(metrics?.chars)} chars`} />
+          <LiveMetric label="BENCH QUESTIONS" value={metrics?.questions} note={`${formatCount(metrics?.star_questions)} star questions`} />
+          <LiveMetric label="WELL-POSED" value={metrics?.well_posed.kept} note={wellPosedRate == null ? 'waiting for 03A' : `${wellPosedRate}% valid`} />
           <LiveMetric
             label="GROUNDED"
-            value={metrics?.grounding.grounded ?? 0}
+            value={metrics?.grounding.grounded}
             note={groundedRate == null ? 'waiting for 06' : `${groundedRate}% survival`}
-            accent={snapshot?.status === 'succeeded'}
+            accent={quality.eligible}
           />
           <div className="live-runtime-note">
             <Timer size={14} />
-            <p>{benchmarkTitle ? <><strong>{benchmarkTitle}</strong>{metrics?.continuity_conflicts ?? 0} 个意外连续性冲突 · 单主角完整故事弧。</> : isReplay ? <><strong>这是历史重放</strong>阶段、产物与指标均来自所选 Run。</> : <><strong>真实构建进行中</strong>所有数字只在对应产物落盘后更新。</>}</p>
+            <p>{benchmarkTitle ? <><strong>{benchmarkTitle}</strong>{formatCount(metrics?.continuity_conflicts)} 个连续性冲突记录。</> : isReplay ? <><strong>这是历史重放</strong>阶段、产物与指标均来自所选 Run。</> : <><strong>真实构建进行中</strong>所有数字只在对应产物落盘后更新。</>}</p>
           </div>
+          <div className="live-message" aria-live="polite">质量：{qualityLabel(quality)}<br />{quality.scope.length ? `已检查：${quality.scope.join("、")}` : "尚无有效验收记录"}</div>
           {message && <div className="live-message">{message}</div>}
         </aside>
       </div>
 
       <footer className="live-controls">
-        <div className="live-progress"><span><i style={{ width: `${progress}%` }} /></span><b>{replay ? `${formatDuration(replay.cursor / 1000)} / 01:00` : `${timelineCompleted} / 8 COMPLETE`}</b></div>
+        <div className="live-progress"><span><i style={{ width: `${progress}%` }} /></span><b>{replay ? `${formatDuration(replay.cursor / 1000)} / 01:00` : `${timelineCompleted} / ${PIPELINE.length} COMPLETE`}</b></div>
         <p>{snapshot?.source !== 'recorded' && <><i className={isLive ? 'is-live' : ''} />{isReplay ? `TIME COMPRESSED · ${snapshot?.step_now ?? '准备重放'}` : snapshot?.step_now ?? '正在分配本地工作进程'}</>}</p>
         <div>
           {replay && <Button variant="ghost" onClick={replay.onRestart}><RotateCcw />从头重放</Button>}
           {replay && <Button className="live-replay-button" onClick={replay.onToggle}>{replay.playing ? <Pause /> : <Play />}{replay.playing ? '暂停' : replay.cursor >= replay.duration ? '再次播放' : '继续'}</Button>}
           {isLive && <Button variant="ghost" onClick={onCancel}><CircleStop />停止任务</Button>}
           {isTerminal && <Button variant="ghost" onClick={onNewRun}><RotateCcw />新建任务</Button>}
-          {snapshot?.status === 'succeeded' && !replay && <Button className="live-replay-button" onClick={onReplay}><Sparkles />进入电影回放</Button>}
+          {generationComplete && !replay && <Button className="live-replay-button" onClick={onReplay}><Sparkles />回放本次生成</Button>}
         </div>
       </footer>
     </main>
@@ -735,7 +747,7 @@ function buildReplaySnapshot(bundle: ReplayBundle, cursor: number): RunSnapshot 
   const started = visible.filter((event) => event.type === 'stage_started');
   const currentStage = (started.at(-1)?.stage || 'input') as StageKey;
   const calls = visible.filter((event) => event.type === 'call');
-  const phraseCalls = calls.filter((event) => event.step === 'phrase').length;
+
   const atEnd = cursor >= bundle.duration_ms;
   const stageDone = (stage: StageKey) => completed.has(stage);
   const replayQuestions = calls
@@ -748,6 +760,9 @@ function buildReplaySnapshot(bundle: ReplayBundle, cursor: number): RunSnapshot 
     ...final,
     source: 'replay',
     status: atEnd ? final.status : 'running',
+    generation_status: atEnd ? final.generation_status : stageDone('grounding') ? 'succeeded' : 'running',
+    quality: atEnd || stageDone('quality') ? final.quality : unverifiedQuality(),
+    eligible: (atEnd || stageDone('quality')) && final.eligible,
     current_stage: atEnd ? '' : currentStage,
     current_index: atEnd ? -1 : final.stages.findIndex((stage) => stage.name === currentStage),
     elapsed_s: Math.round((cursor / bundle.duration_ms) * bundle.original_duration_s),
@@ -755,24 +770,24 @@ function buildReplaySnapshot(bundle: ReplayBundle, cursor: number): RunSnapshot 
     llm_calls: calls.length,
     llm_errors: calls.filter((event) => event.ok === false).length,
     step_now: calls.at(-1)?.label || `${STAGE_LABELS[currentStage].cn} · 历史重放`,
-    stages: final.stages.map((stage) => ({
+    stages: atEnd ? final.stages : final.stages.map((stage) => ({
       ...stage,
       status: stageDone(stage.name) ? 'succeeded' : stage.name === currentStage && !atEnd ? 'running' : 'pending',
       ready: stageDone(stage.name),
     })),
     metrics: {
-      entities: stageDone('world') ? final.metrics.entities : 0,
-      sessions: stageDone('world') ? final.metrics.sessions : 0,
-      events: stageDone('world') ? final.metrics.events : 0,
-      orders: stageDone('orders') ? final.metrics.orders : 0,
-      well_posed: stageDone('well_posed') ? final.metrics.well_posed : { n: 0, kept: 0, rate: null },
-      questions: stageDone('questions') ? final.metrics.questions : phraseCalls,
-      docs: stageDone('corpus') ? final.metrics.docs : 0,
-      chars: stageDone('corpus') ? final.metrics.chars : 0,
-      star_questions: stageDone('questions') ? final.metrics.star_questions : 0,
-      signal_docs: stageDone('corpus') ? final.metrics.signal_docs : 0,
-      continuity_conflicts: stageDone('grounding') ? final.metrics.continuity_conflicts : 0,
-      grounding: stageDone('grounding') ? final.metrics.grounding : { n: 0, grounded: 0, survival: null },
+      entities: stageDone('world') ? final.metrics.entities : null,
+      sessions: stageDone('world') ? final.metrics.sessions : null,
+      events: stageDone('world') ? final.metrics.events : null,
+      orders: stageDone('orders') ? final.metrics.orders : null,
+      well_posed: stageDone('well_posed') ? final.metrics.well_posed : { n: null, kept: null, rate: null },
+      questions: stageDone('questions') ? final.metrics.questions : null,
+      docs: stageDone('corpus') ? final.metrics.docs : null,
+      chars: stageDone('corpus') ? final.metrics.chars : null,
+      star_questions: stageDone('questions') ? final.metrics.star_questions : null,
+      signal_docs: stageDone('corpus') ? final.metrics.signal_docs : null,
+      continuity_conflicts: stageDone('grounding') ? final.metrics.continuity_conflicts : null,
+      grounding: stageDone('grounding') ? final.metrics.grounding : { n: null, grounded: null, survival: null },
     },
     agents: final.agents.map((agent) => ({
       ...agent,
@@ -789,7 +804,7 @@ function buildReplaySnapshot(bundle: ReplayBundle, cursor: number): RunSnapshot 
     views: {
       input: final.views.input,
       whitepaper: stageDone('whitepaper') ? final.views.whitepaper : { entity_noun: '', doc_genres: [], active_lines: [] },
-      world: stageDone('world') ? final.views.world : { entity_names: [], n_sessions: 0 },
+      world: stageDone('world') ? final.views.world : { entity_names: [], n_sessions: null },
       questions: visibleQuestions,
       corpus_sessions: stageDone('corpus') ? final.views.corpus_sessions : [],
       grounding: stageDone('grounding') ? final.views.grounding : { overall: {}, questions: [] },
@@ -803,6 +818,7 @@ function RunStageView({ stage, snapshot }: { stage: StageKey; snapshot: RunSnaps
   if (stage === 'world') return <WorldBuildView snapshot={snapshot} />;
   if (stage === 'orders' || stage === 'well_posed' || stage === 'questions') return <QuestionBuildView snapshot={snapshot} stage={stage} />;
   if (stage === 'corpus') return <CorpusBuildView snapshot={snapshot} />;
+  if (stage === 'quality') return <QualityView snapshot={snapshot} />;
   return <GroundingBuildView snapshot={snapshot} />;
 }
 
@@ -840,9 +856,9 @@ function CouncilView({ snapshot }: { snapshot: RunSnapshot }) {
   const [reducedMotion, setReducedMotion] = useState(false);
   const showcaseMode = stage?.status === 'succeeded';
   const stepCount = WHITEPAPER_STEPS.length;
-  const questionCount = snapshot.metrics.questions || view.target_questions || 0;
-  const starQuestionCount = snapshot.metrics.star_questions || view.target_star_questions || 0;
-  const gatesReady = snapshot.metrics.well_posed.n > 0 && snapshot.metrics.grounding.n > 0;
+  const questionCount = formatCount(snapshot.metrics.questions ?? view.target_questions);
+  const starQuestionCount = formatCount(snapshot.metrics.star_questions ?? view.target_star_questions);
+  const gatesReady = (snapshot.metrics.well_posed.n ?? 0) > 0 && (snapshot.metrics.grounding.n ?? 0) > 0;
 
   const steps = [
     {
@@ -850,7 +866,7 @@ function CouncilView({ snapshot }: { snapshot: RunSnapshot }) {
       signal: 'SCENARIO LOCK',
       title: view.title ? `《${view.title}》` : '正在锁定场景的核心矛盾',
       note: view.central_paradox || '从输入场景中提炼能够驱动整个世界的核心悖论。',
-      tags: ['游戏剧情 Benchmark', `${snapshot.metrics.sessions || 6} 章世界`, '核心悖论'],
+      tags: ['游戏剧情 Benchmark', `${formatCount(snapshot.metrics.sessions)} 章世界`, '核心悖论'],
     },
     {
       ...WHITEPAPER_STEPS[1],
@@ -862,8 +878,8 @@ function CouncilView({ snapshot }: { snapshot: RunSnapshot }) {
     {
       ...WHITEPAPER_STEPS[2],
       signal: 'WORLD GRAPH',
-      title: `${snapshot.metrics.entities} 个世界节点，${snapshot.metrics.events ?? 0} 个关键事件`,
-      note: `把人物、阵营、地点、关键物件与世界机制编织成连续 ${snapshot.metrics.sessions} 章的因果图。`,
+      title: `${formatCount(snapshot.metrics.entities)} 个世界节点，${formatCount(snapshot.metrics.events)} 个关键事件`,
+      note: `把人物、阵营、地点、关键物件与世界机制编织成连续 ${formatCount(snapshot.metrics.sessions)} 章的因果图。`,
       tags: ['霜脊城', '冬眠钟', '霜狼之牙', '事件因果链'],
     },
     {
@@ -885,18 +901,18 @@ function CouncilView({ snapshot }: { snapshot: RunSnapshot }) {
       signal: 'QUESTION FORGE',
       title: `${questionCount} 道问题，其中 ${starQuestionCount} 道明星题`,
       note: '每道问题同时冻结答案口径、必要证据与严格评分原子。',
-      tags: [`${snapshot.metrics.orders || questionCount} 能力订单`, `${questionCount} 道题`, `${starQuestionCount} 道明星题`],
+      tags: [`${snapshot.metrics.orders ?? questionCount} 能力订单`, `${questionCount} 道题`, `${starQuestionCount} 道明星题`],
     },
     {
       ...WHITEPAPER_STEPS[6],
       signal: 'RED TEAM REVIEW',
       title: gatesReady
-        ? `${snapshot.metrics.well_posed.kept}/${snapshot.metrics.well_posed.n} 良定义 · ${snapshot.metrics.grounding.grounded}/${snapshot.metrics.grounding.n} 全部接地`
+        ? `${snapshot.metrics.well_posed.kept}/${snapshot.metrics.well_posed.n} 良定义 · ${snapshot.metrics.grounding.grounded}/${snapshot.metrics.grounding.n} 接地`
         : `目标：${questionCount} 道题全部通过双重机械闸`,
       note: gatesReady
-        ? `连续性、真伪物件与知识边界完成红审；意外连续性冲突 ${snapshot.metrics.continuity_conflicts ?? 0}。`
+        ? `接地检查已有结果；发布资格：${qualityLabel(snapshot.quality)}。`
         : '白皮书已写入连续性、真伪物件、知识边界与证据闭包的验收标准。',
-      tags: ['单主角 PASS', '物件链 PASS', '知识边界 PASS', '终局代价 PASS'],
+      tags: [qualityLabel(snapshot.quality), ...snapshot.quality.scope],
     },
   ];
 
@@ -910,10 +926,9 @@ function CouncilView({ snapshot }: { snapshot: RunSnapshot }) {
 
   useEffect(() => {
     if (!showcaseMode || reducedMotion) {
-      setShowcaseStep(showcaseMode ? stepCount : 0);
-      return;
+      const timer = window.setTimeout(() => setShowcaseStep(showcaseMode ? stepCount : 0), 0);
+      return () => window.clearTimeout(timer);
     }
-    setShowcaseStep(0);
     let nextStep = 0;
     let timer = 0;
     const advance = () => {
@@ -921,7 +936,10 @@ function CouncilView({ snapshot }: { snapshot: RunSnapshot }) {
       setShowcaseStep(nextStep);
       timer = window.setTimeout(advance, nextStep === stepCount ? 2100 : 1100);
     };
-    timer = window.setTimeout(advance, 1300);
+    timer = window.setTimeout(() => {
+      setShowcaseStep(0);
+      timer = window.setTimeout(advance, 1300);
+    }, 0);
     return () => window.clearTimeout(timer);
   }, [reducedMotion, showcaseMode, stepCount]);
 
@@ -937,10 +955,10 @@ function CouncilView({ snapshot }: { snapshot: RunSnapshot }) {
   const activeStep = steps[activeIndex];
   const progress = isSealed ? 100 : ((activeIndex + 1) / stepCount) * 100;
   const finalTags = [
-    `${snapshot.metrics.sessions} 章`,
-    `${snapshot.metrics.entities} 个世界节点`,
-    `${snapshot.metrics.docs} 篇证据文档`,
-    gatesReady ? `${snapshot.metrics.grounding.grounded}/${snapshot.metrics.grounding.n} 全部接地` : `${questionCount} 道目标问题`,
+    `${formatCount(snapshot.metrics.sessions)} 章`,
+    `${formatCount(snapshot.metrics.entities)} 个世界节点`,
+    `${formatCount(snapshot.metrics.docs)} 篇证据文档`,
+    gatesReady ? `${snapshot.metrics.grounding.grounded}/${snapshot.metrics.grounding.n} 接地` : `${questionCount} 道目标问题`,
   ];
 
   return (
@@ -996,7 +1014,7 @@ function WorldBuildView({ snapshot }: { snapshot: RunSnapshot }) {
           </div>
         ))}
       </div>
-      <div className="world-counter"><span>WORLD STATE</span><strong>{snapshot.metrics.entities}</strong><small>WORLD NODES</small><b>{snapshot.metrics.sessions} STORY CHAPTERS</b></div>
+      <div className="world-counter"><span>WORLD STATE</span><strong>{formatCount(snapshot.metrics.entities)}</strong><small>WORLD NODES</small><b>{formatCount(snapshot.metrics.sessions)} STORY CHAPTERS</b></div>
       <ArtifactChip name="02_world.json" ready={snapshot.stages[2]?.ready} />
     </div>
   );
@@ -1007,11 +1025,11 @@ function QuestionBuildView({ snapshot, stage }: { snapshot: RunSnapshot; stage: 
   return (
     <div className="question-live-view">
       <div className="question-flow">
-        <div><Boxes /><strong>{snapshot.metrics.orders}</strong><span>ORDERS</span></div>
+        <div><Boxes /><strong>{formatCount(snapshot.metrics.orders)}</strong><span>ORDERS</span></div>
         <i><Zap /></i>
-        <div className={stage === 'well_posed' ? 'is-active' : ''}><ShieldCheck /><strong>{gate.kept}</strong><span>WELL-POSED</span></div>
+        <div className={stage === 'well_posed' ? 'is-active' : ''}><ShieldCheck /><strong>{formatCount(gate.kept)}</strong><span>WELL-POSED</span></div>
         <i><Zap /></i>
-        <div className={stage === 'questions' ? 'is-active' : ''}><BrainCircuit /><strong>{snapshot.metrics.questions || snapshot.views.questions.length}</strong><span>QUESTIONS</span></div>
+        <div className={stage === 'questions' ? 'is-active' : ''}><BrainCircuit /><strong>{formatCount(snapshot.metrics.questions)}</strong><span>QUESTIONS</span></div>
       </div>
       <div className="live-question-stack">
         {snapshot.views.questions.length ? snapshot.views.questions.slice(-4).map((question, index) => (
@@ -1033,7 +1051,7 @@ function CorpusBuildView({ snapshot }: { snapshot: RunSnapshot }) {
       <div className="corpus-vault">
         <Database />
         <span>WORLD EVIDENCE</span>
-        <strong>{snapshot.metrics.docs}</strong>
+        <strong>{formatCount(snapshot.metrics.docs)}</strong>
         <small>REAL DOCUMENTS</small>
         <i />
       </div>
@@ -1060,10 +1078,10 @@ function GroundingBuildView({ snapshot }: { snapshot: RunSnapshot }) {
         <strong>{result.survival == null ? '—' : `${Math.round(result.survival * 100)}%`}</strong>
       </div>
       <div className="grounding-ledger">
-        <div><span>CANDIDATES</span><strong>{result.n || snapshot.metrics.questions}</strong></div>
-        <div><span>GROUNDED</span><strong>{result.grounded}</strong></div>
-        <div><span>REJECTED</span><strong>{Math.max(0, result.n - result.grounded)}</strong></div>
-        <p>{snapshot.stages[7]?.ready ? '证据逐字匹配完成，出厂题库已经封存。' : '纯代码接地闸执行中；不会调用额外 LLM。'}</p>
+        <div><span>CANDIDATES</span><strong>{formatCount(result.n)}</strong></div>
+        <div><span>GROUNDED</span><strong>{formatCount(result.grounded)}</strong></div>
+        <div><span>REJECTED</span><strong>{result.n == null || result.grounded == null ? "未测" : Math.max(0, result.n - result.grounded)}</strong></div>
+        <p>{snapshot.stages[7]?.ready ? '接地检查已有结果；发布资格由 07 验收记录决定。' : '纯代码接地闸执行中；不会调用额外 LLM。'}</p>
       </div>
       <ArtifactChip name="06_grounded_questions.json" ready={snapshot.stages[7]?.ready} />
     </div>
@@ -1075,18 +1093,29 @@ function DeliveryView({ snapshot, onReplay }: { snapshot: RunSnapshot; onReplay:
   return (
     <div className="delivery-view">
       <div className="delivery-halo"><CheckCircle2 /><i /><i /><i /></div>
-      <p>RUN COMPLETE · STOPPED AT 06</p>
-      <h2>{grounding.grounded}<span> 道接地题</span></h2>
+      <p>GENERATION COMPLETE · {qualityLabel(snapshot.quality)}</p>
+      <h2>{formatCount(grounding.grounded)}<span> 道接地题</span></h2>
       <div className="delivery-metrics">
-        <span><b>{snapshot.metrics.entities}</b> 世界节点</span>
-        <span><b>{snapshot.metrics.sessions}</b> 剧情章</span>
-        <span><b>{snapshot.metrics.docs}</b> 证据文档</span>
+        <span><b>{formatCount(snapshot.metrics.entities)}</b> 世界节点</span>
+        <span><b>{formatCount(snapshot.metrics.sessions)}</b> 剧情章</span>
+        <span><b>{formatCount(snapshot.metrics.docs)}</b> 证据文档</span>
         <span><b>{grounding.survival == null ? '—' : `${Math.round(grounding.survival * 100)}%`}</b> 接地率</span>
       </div>
-      <div className="delivery-artifact"><FolderOpen /><div><small>SEALED ARTIFACT</small><strong>{snapshot.output}</strong></div><ShieldCheck /></div>
+      <div className="delivery-artifact"><FolderOpen /><div><small>{snapshot.quality.eligible ? "QUALIFIED ARTIFACT" : "REVIEW ARTIFACT"}</small><strong>{snapshot.output}</strong></div><ShieldCheck /></div>
+      <QualityView snapshot={snapshot} />
       <Button className="delivery-replay" onClick={onReplay}><Sparkles />将本次成果切入电影化回放</Button>
     </div>
   );
+}
+
+function QualityView({ snapshot }: { snapshot: RunSnapshot }) {
+  const quality = snapshot.quality ?? unverifiedQuality();
+  return <div className="live-message" aria-live="polite">
+    <strong>发布资格：{qualityLabel(quality)}</strong>
+    <p>{quality.eligible ? '已通过本批声明范围的检查。' : '当前产物保留供检查，不能按合格题库发布。'}</p>
+    <p>{quality.scope.length ? `检查范围：${quality.scope.join('、')}` : '检查范围尚未记录。'}</p>
+    {quality.issues.length > 0 && <p>{quality.issues.length} 项问题待处理。</p>}
+  </div>;
 }
 
 function FailureView({ snapshot, onRecorded }: { snapshot: RunSnapshot; onRecorded: () => void }) {
@@ -1117,8 +1146,8 @@ function ArtifactChip({ name, ready }: { name: string; ready?: boolean }) {
   return <div className={`artifact-chip ${ready ? 'is-ready' : ''}`}><FileText /><span>{name}</span><b>{ready ? 'READY' : 'AWAITING'}</b></div>;
 }
 
-function LiveMetric({ label, value, note, accent = false }: { label: string; value: string | number; note: string; accent?: boolean }) {
-  return <div className={`live-metric ${accent ? 'is-accent' : ''}`}><span>{label}</span><strong>{value}</strong><small>{note}</small></div>;
+function LiveMetric({ label, value, note, accent = false }: { label: string; value: string | number | null | undefined; note: string; accent?: boolean }) {
+  return <div className={`live-metric ${accent ? 'is-accent' : ''}`}><span>{label}</span><strong>{typeof value === "string" ? value : formatCount(value)}</strong><small>{note}</small></div>;
 }
 
 function formatDuration(seconds: number) {

@@ -19,11 +19,16 @@ from typing import Any
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
+from dotenv import dotenv_values
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
+
+from pipeline.quality import quality_snapshot
+
 RUNS_DIR = ROOT / "output" / "runs"
 DEFAULT_ALLOWED_ORIGINS = ["http://127.0.0.1:3000", "http://localhost:3000"]
-STAGE_ORDER = ["input", "whitepaper", "world", "orders", "well_posed", "questions", "corpus", "grounding"]
+STAGE_ORDER = ["input", "whitepaper", "world", "orders", "well_posed", "questions", "corpus", "grounding", "quality"]
 STAGE_ARTIFACTS = {
     "input": "00_input.json",
     "whitepaper": "01_whitepaper.json",
@@ -33,6 +38,7 @@ STAGE_ARTIFACTS = {
     "questions": "04_questions.json",
     "corpus": "05_corpus.json",
     "grounding": "06_grounded_questions.json",
+    "quality": "07_release.json",
 }
 STEP_LABELS = {
     "council.observe": "议会正在理解样例",
@@ -42,6 +48,8 @@ STEP_LABELS = {
     "council.style": "文风专家正在建立语言约束",
     "council.traps": "陷阱专家正在注入干扰",
     "council.critique": "审查者正在校验白皮书",
+    "council.world": "世界架构师正在编织故事契约",
+    "council.world_review": "世界审稿人正在闭合因果链",
     "world.batch": "正在生成世界实体",
     "world.structure": "正在编织世界关系",
     "world.repair": "机械校验正在修复世界",
@@ -115,6 +123,21 @@ app.add_middleware(
 
 JOBS: dict[str, Job] = {}
 JOB_LOCK = threading.Lock()
+
+
+def _live_configuration() -> tuple[bool, str]:
+    """只检查 Live 所需字段是否存在，不加载客户端，也不返回任何秘密值。"""
+    file_values = dotenv_values(ROOT / ".env") if (ROOT / ".env").exists() else {}
+    # Match load_dotenv(override=False): an explicit empty environment value is not replaced.
+    api_key = os.environ.get("OPENAI_API_KEY", file_values.get("OPENAI_API_KEY"))
+    model = os.environ.get("MODEL", file_values.get("MODEL"))
+    configured = bool(
+        api_key
+        and model
+        and not str(api_key).startswith("replace-with-")
+        and not str(model).startswith("replace-with-")
+    )
+    return configured, str(model or "not-configured")
 
 
 def _normalize_run_id(value: str) -> str:
@@ -201,6 +224,15 @@ def _artifact_views(run_dir: Path, prompt: dict) -> dict:
     grounding_report = _read_json(run_dir / "06_grounding_report.json", {}) or {}
 
     entities = world.get("entities") or {}
+    orders_obj = _read_json(run_dir / "03_orders.json", None)
+    well_report = _read_json(run_dir / "03_well_posed_report.json", None)
+    artifact_counts = {
+        "entities": len(entities) if (run_dir / "02_world.json").is_file() and "entities" in world else None,
+        "sessions": world.get("n_sessions"),
+        "events": len(world["events"]) if isinstance(world.get("events"), list) else None,
+        "orders": len(orders_obj) if isinstance(orders_obj, list) else None,
+        "questions": len(questions_obj) if isinstance(_read_json(run_dir / "04_questions.json"), list) else None,
+    }
     if isinstance(entities, dict):
         entity_names = [_safe_text(name, 32) for name in list(entities)[:12]]
     elif isinstance(entities, list):
@@ -210,6 +242,11 @@ def _artifact_views(run_dir: Path, prompt: dict) -> dict:
 
     corpus = corpus_obj.get("corpus", corpus_obj) if isinstance(corpus_obj, dict) else {}
     sessions = corpus.get("sessions", []) if isinstance(corpus, dict) else []
+    if isinstance(_read_json(run_dir / "05_corpus.json"), dict) and "sessions" in corpus:
+        docs = [doc for session in sessions if isinstance(session, dict)
+                for doc in (session.get("docs") or []) if isinstance(doc, dict)]
+        artifact_counts["docs"] = len(docs)
+        artifact_counts["chars"] = sum(len(str(doc.get("content") or "")) for doc in docs)
     session_views = []
     for session in sessions[-10:]:
         if not isinstance(session, dict):
@@ -239,6 +276,10 @@ def _artifact_views(run_dir: Path, prompt: dict) -> dict:
     } for item in grounded_obj[-8:] if isinstance(item, dict) and item.get("question")]
 
     profile = whitepaper.get("domain_profile") or {}
+    story = whitepaper.get("story_contract") or {}
+    style = whitepaper.get("style_spec") or {}
+    capability_targets = whitepaper.get("capability_targets") or {}
+    source_authority = whitepaper.get("source_authority") or []
     active_lines = [
         _safe_text(item.get("line"), 40)
         for item in (whitepaper.get("active_lines") or [])
@@ -246,17 +287,38 @@ def _artifact_views(run_dir: Path, prompt: dict) -> dict:
     ]
     few_shot = input_obj.get("few_shot") or []
     return {
+        "counts": artifact_counts,
+        "well_posed": (well_report or {}).get("overall", {}) if isinstance(well_report, dict) else {},
         "input": {
             "description": _safe_text(input_obj.get("description"), 420),
             "sample_name": _safe_text(few_shot[0].get("title"), 120) if few_shot else "",
             "sample_chars": len(str(few_shot[0].get("content") or "")) if few_shot else 0,
         },
         "whitepaper": {
+            "title": _safe_text(whitepaper.get("title"), 100),
+            "scenario_id": _safe_text(whitepaper.get("scenario_id"), 80),
             "entity_noun": _safe_text(profile.get("entity_noun"), 40),
+            "protagonist": _safe_text(story.get("protagonist"), 60),
+            "story_arc": _safe_text(story.get("arc"), 260),
+            "central_paradox": _safe_text(story.get("central_paradox"), 260),
+            "irreversible_cost": _safe_text(story.get("irreversible_cost"), 260),
+            "tone": _safe_text(style.get("tone"), 180),
+            "format": _safe_text(style.get("format"), 180),
+            "target_questions": capability_targets.get("total_q"),
+            "target_star_questions": capability_targets.get("star_questions"),
+            "source_tiers": [
+                _safe_text(item.get("meaning"), 100)
+                for item in source_authority[:4]
+                if isinstance(item, dict) and item.get("meaning")
+            ],
             "doc_genres": [_safe_text(value, 48) for value in (profile.get("doc_genres") or [])[:6]],
             "active_lines": active_lines,
         },
-        "world": {"entity_names": entity_names, "n_sessions": int(world.get("n_sessions") or 0)},
+        "world": {
+            "entity_names": entity_names,
+            "n_sessions": world.get("n_sessions"),
+            "event_count": artifact_counts["events"],
+        },
         "questions": question_views,
         "corpus_sessions": session_views,
         "grounding": {
@@ -266,24 +328,32 @@ def _artifact_views(run_dir: Path, prompt: dict) -> dict:
     }
 
 
+def _known_count(value: Any) -> int | None:
+    """Unknown or malformed measurements stay unknown; observed zero remains zero."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if value < 0 or not float(value).is_integer():
+        return None
+    return int(value)
+
+
 def _safe_algo(manifest: dict, views: dict, prompt: dict) -> dict:
-    """只放行面板需要的聚合指标。"""
+    """Only report observed totals, never preview sizes or LLM attempt counts."""
     algo = manifest.get("algo") or {}
-    well = (algo.get("well_posed") or {}).get("overall") or {}
+    counts = views.get("counts") or {}
+    well = (algo.get("well_posed") or {}).get("overall") or views.get("well_posed") or {}
     grounding = (algo.get("grounding") or {}).get("overall") or views["grounding"]["overall"]
+    quality = algo.get("quality") or {}
+    def count(key: str) -> int | None:
+        observed = _known_count(counts.get(key))
+        return observed if observed is not None else _known_count(algo.get(key))
     return {
-        "entities": int(algo.get("entities") or len(views["world"]["entity_names"])),
-        "sessions": int(algo.get("sessions") or views["world"]["n_sessions"]),
-        "orders": int(algo.get("orders") or 0),
-        "well_posed": {"n": int(well.get("n") or 0), "kept": int(well.get("well_posed") or 0), "rate": well.get("pass_rate")},
-        "questions": int(algo.get("questions") or prompt["step_counts"].get("phrase") or len(views["questions"])),
-        "docs": int(algo.get("docs") or sum(item["docs"] for item in views["corpus_sessions"])),
-        "chars": int(algo.get("chars") or 0),
-        "grounding": {
-            "n": int(grounding.get("n") or 0),
-            "grounded": int(grounding.get("grounded") or 0),
-            "survival": grounding.get("survival"),
-        },
+        **{key: count(key) for key in ("entities", "sessions", "events", "orders", "questions", "docs", "chars")},
+        "well_posed": {"n": _known_count(well.get("n")), "kept": _known_count(well.get("well_posed")), "rate": well.get("pass_rate")},
+        "star_questions": _known_count(quality.get("star_questions")),
+        "signal_docs": _known_count(quality.get("signal_documents")),
+        "continuity_conflicts": _known_count(quality.get("unintended_continuity_conflicts")),
+        "grounding": {"n": _known_count(grounding.get("n")), "grounded": _known_count(grounding.get("grounded")), "survival": grounding.get("survival")},
     }
 
 
@@ -300,18 +370,22 @@ def _run_snapshot(run_id: str, *, recorded: bool = False) -> dict:
     views = _artifact_views(run_dir, prompt)
     stage_meta = manifest.get("stages") or {}
     current = str(manifest.get("current_stage") or "")
-    status = str(overlay.get("status") or manifest.get("status") or "starting")
+    raw_status = str(overlay.get("status") or manifest.get("status") or "starting")
+    status = {"done": "succeeded", "manual_failed": "failed", "error": "failed"}.get(raw_status, raw_status)
+    if status not in {"starting", "running", "succeeded", "failed", "cancelled"}:
+        status = "unknown"
 
     with JOB_LOCK:
         job = JOBS.get(run_id)
     if job and job.cancelled:
         status = "cancelled"
-    elif job and job.process.poll() is not None and status == "running" and not (run_dir / "06_grounded_questions.json").exists():
+    elif job and job.process.poll() is not None and status in {"starting", "running"}:
         status = "failed"
 
-    grounded_file = _read_json(run_dir / "06_grounded_questions.json", None)
-    if status == "done":
-        status = "succeeded" if isinstance(grounded_file, list) and len(grounded_file) > 0 else "failed"
+    quality = quality_snapshot(run_dir)
+    generation_complete = all((stage_meta.get(name) or {}).get("done")
+                              for name in STAGE_ORDER if name != "quality")
+    generation_status = "succeeded" if generation_complete or status == "succeeded" else status
 
     stages = []
     current_index = STAGE_ORDER.index(current) if current in STAGE_ORDER else -1
@@ -351,6 +425,11 @@ def _run_snapshot(run_id: str, *, recorded: bool = False) -> dict:
         "run_id": run_id,
         "source": "recorded" if recorded else "live",
         "status": status,
+        "execution_status": status,
+        "generation_status": generation_status,
+        "recorded_status": raw_status,
+        "quality": quality,
+        "eligible": quality["eligible"],
         "current_stage": current,
         "current_index": current_index,
         "created": manifest.get("created"),
@@ -490,36 +569,49 @@ def _terminate_job(run_id: str, job: Job) -> None:
 
 @app.get("/api/health")
 def health() -> dict:
-    """返回本地引擎健康状态；只暴露模型名，不暴露端点或 Key。"""
-    try:
-        import config
-        model = str(getattr(config, "MODEL", "configured"))
-    except Exception:
-        model = "configured"
-    return {"ok": True, "engine": "memory-forge-local", "model": model, "stop_at": "06_grounding"}
+    """区分回放服务与真实 Live 是否就绪，且绝不在健康检查时加载密钥。"""
+    live_ready, model = _live_configuration()
+    return {
+        "ok": True,
+        "live_ready": live_ready,
+        "engine": "memory-forge-local",
+        "model": model,
+        "stop_at": "07_quality",
+    }
 
 
 @app.get("/api/runs")
 def replayable_runs() -> dict:
-    """列出本地已有 Run；Replay 的输入只是其中一个 run_id。"""
+    """列出全部有 manifest 的历史 Run；精选七场景优先，其余保留归档状态。"""
     rows = []
     if RUNS_DIR.exists():
         for run_dir in sorted(RUNS_DIR.iterdir(), reverse=True):
             manifest = _read_json(run_dir / "manifest.json", {}) or {}
-            if not manifest or manifest.get("status") == "running":
+            if not manifest:
                 continue
             stages = manifest.get("stages") or {}
             rows.append({
                 "run_id": run_dir.name,
                 "scenario": _safe_text(manifest.get("scenario"), 40),
+                "title": _safe_text((_read_json(run_dir / "01_whitepaper.json", {}) or {}).get("title"), 100),
                 "status": manifest.get("status") or "unknown",
+                "quality": quality_snapshot(run_dir),
                 "created": manifest.get("created"),
                 "completed_stages": sum(1 for value in stages.values() if (value or {}).get("done")),
                 "llm_calls": _prompt_summary(run_dir)["count"],
                 "has_06": (run_dir / "06_grounded_questions.json").exists(),
             })
-            if len(rows) >= 40:
-                break
+    preferred = {
+        "game_showcase__20260906-053636": 0,
+        "office__20260717-064826": 1,
+        "game__20260625-112210": 2,
+        "agent__20260624-214306": 3,
+        "cs__20260625-134047": 4,
+        "companion__20260624-234524": 5,
+        "assistant__20260625-143946": 6,
+        "kb__20260625-032549": 7,
+    }
+    rows.sort(key=lambda row: (preferred.get(row["run_id"], 99), row["run_id"]))
     return {"runs": rows}
 
 
@@ -550,6 +642,9 @@ def replay_run(run_id: str) -> dict:
 @app.post("/api/runs", status_code=202)
 def create_run(request: RunRequest) -> dict:
     """创建一个真实 Run；MVP 同时只允许一个 Live 任务。"""
+    live_ready, _ = _live_configuration()
+    if not live_ready:
+        raise HTTPException(status_code=503, detail="真实 Live 尚未配置；历史 Replay 仍可使用")
     active = _active_job()
     if active:
         raise HTTPException(status_code=409, detail={"message": "已有 Live Run 正在运行", "run_id": active[0]})
@@ -595,8 +690,8 @@ async def cancel_run(run_id: str) -> dict:
 
 @app.get("/api/recorded")
 def recorded_run() -> dict:
-    """返回明确标记为 RECORDED 的历史成功 Run，供现场兜底和电影回放。"""
-    preferred = "office__20260717-064826"
+    """返回标记为 RECORDED 的历史产物；是否合格由独立 quality 字段表达。"""
+    preferred = "game_showcase__20260906-053636"
     if (RUNS_DIR / preferred).is_dir():
         return _run_snapshot(preferred, recorded=True)
     for run_dir in sorted(RUNS_DIR.iterdir(), reverse=True) if RUNS_DIR.exists() else []:

@@ -235,10 +235,10 @@ class ConflictLine(ProductionLine):
         #   合理系统答"最新官方值"会被误判(D 首点:Q117/136 等)。gold = 该周官方值,与此锚一致。
         sess = aux.get("session")
         unit = aux.get("time_unit") or "周"
-        wk = f"截至第{week_label(sess)}{unit}(以该时点的官方记录为准)," if sess is not None else ""
-        s = (f"{wk}关于【{ent}】的「{fld}」,记忆里有两份说法对不上:一份出自【{aux.get('authoritative_source', '正式记录')}】,"
-             f"另一份出自【{aux.get('rumor_source', '小道消息')}】。问该时点到底应认定为哪一个——"
-             f"★按【来源可靠度】裁决(正式记录 > 小道消息),只回最终认定的那个值。")
+        wk = f"截至第{week_label(sess)}{unit}，" if sess is not None else ""
+        s = (f"{wk}关于【{ent}】的「{fld}」，来自【{aux.get('authoritative_source', '正式记录')}】"
+             f"和【{aux.get('rumor_source', '小道消息')}】的说法不一致。"
+             f"按来源可靠度裁决，该时点「{fld}」的最终取值是什么？请回答具体值。")
         hide = [str(aux.get("authoritative_value")), str(aux.get("rumor_value"))]   # 两值都在语料,题面不剧透
         return s, hide
 
@@ -316,7 +316,9 @@ if __name__ == "__main__":
     c0 = ws.conflicts[0]
     ck("intent 隐藏权威值+小道值", c0["authoritative_value"] in hide and c0["rumor_value"] in hide)
     ck("题面不含两值", c0["authoritative_value"] not in intent and c0["rumor_value"] not in intent)
-    ck("题面点明按来源可靠度裁决", "可靠度" in intent and "正式记录" in intent)
+    ck("题面点明来源可靠度并要求具体值",
+       "可靠度" in intent and c0["authoritative_source"] in intent
+       and c0["rumor_source"] in intent and "具体值" in intent)
     # ★FixD:题面必须锚到矛盾那一周(防"未锁周 + 官方值漂移"→合理系统答最新官方被误判)
     from pipeline.world_state import week_label as _wl
     ck("FixD:L5 题面带周锚(截至第N周)",

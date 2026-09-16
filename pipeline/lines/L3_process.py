@@ -111,9 +111,9 @@ class ProcessLine(ProductionLine):
         shown = sorted(gt, key=lambda e: str(e.get("field", "")))
         evs = "、".join((f"「{e.get('field','')}」变为 {e.get('value')}" if e.get("value")
                          else f"「{e.get('field','')}」停止统计") for e in shown)
-        s = (f"把【{ent}】发生的这几件事,按【发生时间先后】排序:{evs}。"
-             f"★只给事件本身;绝不给任何日期/周号/先后提示;正确顺序不能出现在题面。")
-        hide = [str(e["date"]) for e in gt if e.get("date")]          # 日期是时序线索,必须隐藏
+        s = f"请把【{ent}】发生的下列事件按发生时间先后排序：{evs}。"
+        # 业务字段的日期值是事件身份的一部分，不能当成发生时间删掉。
+        hide = [str(e["date"]) for e in gt if e.get("date") and str(e["date"]) not in evs]
         return s, hide
 
     # ── ★边 A 闸:良定义(docs/anchors/edge_a/L3_well_posed.md,已 QA)──

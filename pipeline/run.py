@@ -122,6 +122,7 @@ class Stage:
     needs: list            # 依赖的前序 stage 名(driver 据此校验能否从此起跑)
     fn: Callable           # fn(run) -> None
     artifact: str          # 产物文件名(NN_<name>.json)
+    is_current: Callable | None = None  # Optional content/version freshness check.
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -421,7 +422,7 @@ def drive(run: Run, stages: list, from_stage=None, to_stage=None, only=None, for
                     raise SystemExit(f"✗ stage『{nm}』依赖的前序『{need}』"
                                      f"状态为 {state.get('status', 'incomplete')}。"
                                      f"先从 --from {need} 补跑下游。")
-            if run.is_done(nm) and not force:
+            if run.is_done(nm) and not force and (st.is_current is None or st.is_current(run)):
                 run.log(f"⏭  跳过 {nm}(已完成;--force 重跑)")
                 continue
             invalidated = _dependent_stage_names(nm, stages) if force else None

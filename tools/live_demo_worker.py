@@ -26,7 +26,7 @@ def _safe_error(exc: BaseException) -> dict:
 
 
 def main() -> None:
-    """读取一次性请求文件，动态注册场景，并真实执行到 grounding（06）。"""
+    """读取一次性请求文件，动态注册场景，并真实执行到 quality（07）。"""
     parser = argparse.ArgumentParser()
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--request", required=True)
@@ -53,16 +53,17 @@ def main() -> None:
         tag="local-live-demo",
         config_meta={
             "from": None,
-            "to": "grounding",
+            "to": "quality",
             "only": None,
             "target_tokens": target_tokens,
+            "question_budget": max(1, int(os.getenv("MEMORY_FORGE_DEMO_QUESTION_BUDGET", "30"))),
             "preset": "live-demo",
         },
     )
-    run.log(f"=== LIVE DEMO {args.run_id} / target={target_tokens} / stop=06 ===")
+    run.log(f"=== LIVE DEMO {args.run_id} / target={target_tokens} / stop=07 ===")
 
     try:
-        drive(run, factory.STAGES, to_stage="grounding")
+        drive(run, factory.STAGES, to_stage="quality")
     except BaseException as exc:
         error_path = run.dir / ".live_error.json"
         error_path.write_text(json.dumps(_safe_error(exc), ensure_ascii=False), encoding="utf-8")

@@ -152,6 +152,7 @@ function render(d){
   else if(sd.status==="done")stat=`✓ acc=${accH(sd.acc)} <span style="color:#666">${fmt(et)}</span>`;
   else if(sd.status==="judging")stat=`✅${sd.done} → jdg ${sd.judged}/${sd.total} ~${liveAcc} <span style="color:#666">${fmt(et)}</span>`;
   else stat=`ans ${sd.done}/${sd.total} <span style="color:#666">${fmt(et)}</span>`;
+  if(sd.incomplete)stat+=` <span class="skip">待复判 ${sd.incomplete}</span>`;
   h+=`<div class="sr"><span class="sn"><span class="tag ${sd.status||"pending"}" style="margin-right:4px">${sd.status||"pending"}</span>${s}=${LB[s]||s}</span>`
     +`<div class="bar"><div class="fill fans" style="width:${pa}%"></div><div class="fill fjdg" style="width:${pj}%"></div></div>`
     +`<span class="ss">${stat}</span></div>`;
@@ -178,9 +179,13 @@ function render(d){
  if(d.disc){
   let ds=d.disc;
   h+='<div class="card"><h3>区分度</h3>';
+  if(ds.status==="incomplete"){
+   h+='<div>判分未完成；暂不判断排名、区分度或题库难度。</div></div>';
+  }else{
   if(ds.ranking)h+=`<div>排名: ${ds.ranking.map(s=>s+"="+(ds.overall[s]*100).toFixed(0)+"%").join(" > ")}</div>`;
   h+=`<div>总分离差: ${(ds.ov_spread*100).toFixed(0)}% | 余量: ${(ds.headroom*100).toFixed(0)}%</div>`;
   h+=`<div>${ds.discriminates?"✓ 有区分度":"⚠ 区分度弱"}</div></div>`;
+  }
  }
 
  // feed
@@ -190,7 +195,7 @@ function render(d){
   ff.forEach(f=>{
    let m=f.ok===null?"∅":f.ok?"✓":"✗";
    let c=f.ok===null?"skip":f.ok?"ok":"fail";
-   h+=`<div class="fi"><span class="${c}">${m}</span> [${f.s}] ${f.ln}/${esc(f.cap)} <span style="color:#666">pred=</span>${esc(f.pred)} <span style="color:#666">gold=</span>${esc(f.gold)}</div>`;
+   h+=`<div class="fi"><span class="${c}">${m}</span> [${f.s}] ${f.ln}/${esc(f.cap)} ${esc(f.verdict||"")} <span style="color:#666">pred=</span>${esc(f.pred)} <span style="color:#666">gold=</span>${esc(f.gold)}</div>`;
   });
   h+="</div></div>";
  }

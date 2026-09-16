@@ -30,10 +30,11 @@ def render_protocol(about: dict) -> str:
         out.append(f"- {r}")
     sm = ap.get("gold_sentinel_map") or {}
     if sm:
-        out.append(
-            f"- 拒答措辞:从未涉及→『{sm.get('INSUFFICIENT', '无此项')}』;"
-            f"已停统→『{sm.get('forgotten=true', '已停止统计')}』。"
-        )
+        refusal = (f"- 拒答措辞:从未涉及→『{sm.get('INSUFFICIENT', '无此项')}』;"
+                   f"已停统→『{sm.get('forgotten=true', '已停止统计')}』")
+        if "out_of_scope" in sm:
+            refusal += f";超出记录时间范围→『{sm['out_of_scope']}』"
+        out.append(refusal + "。")
     out.append(
         "- 个人/角色不具备案件级属性;问及某实体它本身没有的属性 → 答『无此项/查无』,"
         "不得经关系链折算到关联实体的值。"

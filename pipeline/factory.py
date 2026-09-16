@@ -150,16 +150,17 @@ SCENARIOS = {
 
 ART = {"input": "00_input.json", "whitepaper": "01_whitepaper.json", "world": "02_world.json",
        "orders": "03_orders.json", "questions": "04_questions.json", "corpus": "05_corpus.json",
-       "grounding": "06_grounded_questions.json"}
+       "grounding": "06_grounded_questions.json", "quality": "07_release.json"}
 CORPUS_CKPT = "05_corpus.ckpt.json"
-CORPUS_RENDER_CONTRACT_VERSION = 3
+CORPUS_RENDER_CONTRACT_VERSION = 4
 
 # ★作答协议(B类①修复):benchmark 出厂【显式声明】None 的两类语义 + 期望作答,治"None 未定义→理性系统被误判"。
 #   契约层一处声明(非逐题补丁),所有 None 题共享;eval 侧据此把 gold 哨兵映射到人类作答。
 ANSWER_PROTOCOL = {
-    "version": 4,
+    "version": 5,
     "rules": [
         "普通问题:答该项在【题面所指时点】的具体值。",
+        "直接给出简短最终答案。状态、类别及闭选项使用资料中的原值或合同明示别名；不要自行合并相近业务状态。",
         "【截至最新一期】:锚点 = 该实体最后一次有效记录(不是全局最后一周),沿用其最近有效值(carry-forward)。"
         "全程在场的实体折到全局最后一期,早退场的实体折到它最后出现那一期——这是【同一条沿用规则】碰上不同寿命,不是两套口径。",
         "【整体趋势题】整体趋势 = 【首末净方向】(看整段、以首期 vs 末期的净变化为准);中途或末期的【局部反跳不改判】。只回『上升』或『下降』。"
@@ -168,13 +169,18 @@ ANSWER_PROTOCOL = {
         "★不得经关系链折算到关联实体的值(如问『某律师的争议焦点』:争议焦点是案件的属性、律师本身没有 → 查无,不要去取他经办案件的争议焦点)。",
         "【从未涉及/不存在】:所问项在本场景根本没有(gold 标记 INSUFFICIENT,产线 ABS)→ 期望答『无此项/查无此记录』。",
         "【曾有但已显式停止统计】:所问项曾被跟踪、现已停更(gold forgotten=True,产线 FORGET)→ 期望答『已停止统计/不再跟踪』。",
+        "【所问时间超出资料范围】:不能把已知历史值外推到未记录的未来时点，答『信息不足/不在记录范围内』。这与从未有记录、已停止统计不同。",
         "【停统前的最后值】:若问的是『停止统计前最后一次』(产线 PREEXPIRE)→ 这是另一类问法,照常答停掉那一刻的值(非 None)。",
+        "只评分问题明确要求的主答案；排序题比较完整事件及先后。未要求的附带日期和解释不会自动获得事实正确性认证。",
     ],
     "attribute_ownership_no_fold": True,    # ★个人/角色不具案件级属性,问及判查无、不经关系折算(run112358 D:Q50-56 拒答属性归属未声明 → 此处声明)
     "trend_means_net_first_to_last": True,  # ★L7 趋势=首末净方向、末期反跳不改判(run110317 D 点"假二选一":协议没定义非单调如何裁 → 此处定义,二选一即公平、recency 陷阱保住)
     "latest_means_carry_forward": True,     # ★"最新一期"=该实体末次有效记录沿用,统一口径(run160053 D 点的"双标"实为读者侧表面歧义,gold 本就单一真源 latest_valid)
     "two_none_types_distinguished": True,   # ★区分"从未存在"(ABS)vs"曾有已停"(FORGET)是考点
-    "gold_sentinel_map": {"INSUFFICIENT": "无此项/查无此记录", "forgotten=true": "已停止统计/不再跟踪"},
+    "scoring_scope": "primary_answer",
+    "additional_facts": "not_assessed",
+    "gold_sentinel_map": {"INSUFFICIENT": "无此项/查无此记录", "forgotten=true": "已停止统计/不再跟踪",
+                          "out_of_scope": "信息不足/不在记录范围内"},
 }
 
 
@@ -231,6 +237,8 @@ def stage_whitepaper(run: Run):
         run.write("01_seed_audit.json", wp["seed_audit"])
     if run.scenario == "game":
         _pin_game_primary(wp)
+    wp["quality_contract"] = {"version": 1, "corpus_review": True,
+                              "release_requires": "question_corpus_and_world_contracts"}
     run.write(ART["whitepaper"], wp)
     run.set_algo(active_lines=[l.get("line") for l in wp.get("active_lines", [])],
                  medium=wp.get("output_medium") or wp.get("domain_profile", {}).get("medium"))
@@ -261,13 +269,22 @@ def stage_orders(run: Run):
     wp = run.read(ART["whitepaper"]); ws = WorldState.from_dict(run.read(ART["world"]))
     validate_seed_identity(run, wp)
     validate_seed_world(wp, ws)
-    quotas = run.manifest["config"].get("quotas")           # ★闭环 driver 经 config 喂各线配额;普通 drive 路径无此键 → None → run_lines 回退 total_q(向后兼容)
-    orders = run_lines(wp, ws, run.log, quotas=quotas)
+    cfg = run.manifest["config"]
+    quotas = cfg.get("quotas")
+    # Closed-loop floors own their supply plan; ordinary runs use a total budget.
+    # Historical runs without this config retain their explicit legacy behavior.
+    budget = cfg.get("question_budget") if quotas is None else None
+    supply = {}
+    orders = run_lines(wp, ws, run.log, quotas=quotas, question_budget=budget, stats=supply)
+    from pipeline.question_contract import attach_question_contract, bind_question_world
+    orders = [attach_question_contract(bind_question_world(order, ws), wp)
+              for order in orders]
     run.write(ART["orders"], orders)
+    run.write("03_supply_report.json", supply)
     by_line: dict = {}
     for o in orders:
         by_line[o.get("line", "?")] = by_line.get(o.get("line", "?"), 0) + 1
-    run.set_algo(orders=len(orders), orders_by_line=by_line)
+    run.set_algo(orders=len(orders), orders_by_line=by_line, question_supply=supply)
 
 
 def stage_well_posed(run: Run):
@@ -292,6 +309,12 @@ def stage_well_posed(run: Run):
 def stage_questions(run: Run):
     orders = run.read(ART["orders"]); wp = run.read(ART["whitepaper"])
     pack = validate_seed_identity(run, wp)
+    # The compiled question contract and the solver's published instructions
+    # move together, including when regenerating questions in an older run.
+    about = run.read("00_about.json")
+    if about.get("answer_protocol") != ANSWER_PROTOCOL:
+        about["answer_protocol"] = ANSWER_PROTOCOL
+        run.write("00_about.json", about)
     qs = phrase_questions(orders, wp, run.tracer, run.log)
     if pack is not None:
         provenance = run.read(ART["input"])["seed"]
@@ -322,6 +345,9 @@ def _corpus_checkpoint_identity(wp: dict, world: dict, target: int,
 
 def stage_corpus(run: Run):
     wp = run.read(ART["whitepaper"]); world = run.read(ART["world"])
+    # Resuming an old world still uses the current corpus contract. This copy
+    # does not silently rewrite the frozen whitepaper or the world.
+    wp = {**wp, "quality_contract": {"version": 1, "corpus_review": True}}
     ws = WorldState.from_dict(world)
     validate_seed_identity(run, wp)
     validate_seed_world(wp, ws)
@@ -349,8 +375,19 @@ def stage_corpus(run: Run):
             raise WorldBlueprintError(
                 "game narrative delta 的既有 corpus 未精确覆盖全部章节，拒绝把局部语料当完整基线")
     delta_mode = requested_delta
-    if requested_delta and ws.narrative:
+    refresh_reasons = []
+    if requested_delta and run.has(ART["corpus"]):
+        from pipeline.corpus_contract import validate_corpus
+        previous_quality = validate_corpus(ws, run.read(ART["corpus"]))
+        if previous_quality["status"] != "passed":
+            refresh_reasons = sorted({issue["code"] for issue in previous_quality["issues"]})
+            delta_mode = False
+            run.log(f"  ⓘ 旧正文验收与当前世界不一致，增量请求升级为全量重渲:{refresh_reasons}")
+    if delta_mode and ws.narrative:
         run.log("  ⓘ game Story Ledger 定向补渲：只追加指定范围，收口仍复核全部 canonical event")
+    run.set_algo(render_strategy={"requested": "delta" if requested_delta else "full",
+                                 "effective": "delta" if delta_mode else "full",
+                                 "refresh_reasons": refresh_reasons})
     target = int(run.manifest["config"].get("target_tokens", 1_000_000))
     only = set(cfg.get("render_only") or []) if delta_mode else None
     pairs = ({(item[0], int(item[1])) for item in (cfg.get("render_only_pairs") or [])
@@ -363,8 +400,13 @@ def stage_corpus(run: Run):
             corpus, done = st["corpus"], set(st["done_weeks"])
             run.log(f"  ↻ 续渲:已完成 {len(done)} 周")
         else:
-            corpus, done = {"sessions": []}, set()
-            run.log("  ⓘ 渲染 checkpoint 与当前输入不匹配，忽略并从空语料开始")
+            if delta_mode and run.has(ART["corpus"]):
+                st = run.read(ART["corpus"])
+                corpus, done = st["corpus"], set(st["done_weeks"])
+                run.log("  ⓘ 渲染 checkpoint 不匹配，增量改从已发布完整语料开始")
+            else:
+                corpus, done = {"sessions": []}, set()
+                run.log("  ⓘ 渲染 checkpoint 与当前输入不匹配，忽略并从空语料开始")
     elif delta_mode and run.has(ART["corpus"]):             # 非剧情闭环的增量渲染从上一版成品起步
         st = run.read(ART["corpus"])
         corpus, done = st["corpus"], set(st["done_weeks"])
@@ -444,6 +486,25 @@ def stage_grounding(run: Run):
 
 
 
+def stage_quality(run: Run):
+    """Release is separate from generation completion and mechanical grounding."""
+    from pipeline.quality import evaluate_release, ReleaseError
+    report = evaluate_release(run.dir)
+    run.write(ART["quality"], report)
+    run.set_algo(quality={"version": report["version"], "status": report["status"],
+                          "eligible": report["eligible"], "scope": report["scope"],
+                          "issue_count": len(report["issues"])})
+    if not report["eligible"]:
+        codes = list(dict.fromkeys(issue["code"] for issue in report["issues"]))
+        raise ReleaseError(f"质量验收未通过:{codes}；中间产物仅供审计")
+    run.log(f"  ✓ 发布资格通过:{report['checks']['coverage']['final_count']} 题；输入与检查版本已绑定")
+
+
+def _quality_is_current(run: Run) -> bool:
+    from pipeline.quality import quality_snapshot
+    return quality_snapshot(run.dir)["eligible"]
+
+
 STAGES = [
     Stage("input",      [],                       stage_input,      ART["input"]),
     Stage("whitepaper", ["input"],                stage_whitepaper, ART["whitepaper"]),
@@ -453,6 +514,8 @@ STAGES = [
     Stage("questions",  ["orders"],               stage_questions,  ART["questions"]),
     Stage("corpus",     ["whitepaper", "world"],  stage_corpus,     ART["corpus"]),
     Stage("grounding",  ["questions", "corpus"],  stage_grounding,  ART["grounding"]),  # ★命门3:gold↔语料 汇合校验
+    Stage("quality", ["world", "questions", "corpus", "grounding"], stage_quality, ART["quality"],
+          is_current=_quality_is_current),
 ]
 
 
@@ -474,6 +537,8 @@ def main():
     ap.add_argument("--scenario", default=None)
     ap.add_argument("--seed-pack", help="策展种子 JSON；增强 input→whitepaper，后续阶段保持同一合同")
     ap.add_argument("--target-mtokens", type=float, default=None, help="目标 token(M);新 run 缺省 1.0,续 run 沿用")
+    ap.add_argument("--question-budget", type=int, default=None,
+                    help="普通流程总订单上限；新 run 缺省 30，续 run 沿用；不承诺最终存活题数")
     ap.add_argument("--tag", default=None, help="人类标签(进 manifest,不影响 run_id)")
     ap.add_argument("--from", dest="from_stage", default=None, help=f"从哪个 stage 起跑 {list(ART)}")
     ap.add_argument("--to", dest="to_stage", default=None, help="跑到哪个 stage 止")
@@ -493,6 +558,10 @@ def main():
 
     if a.list_runs:
         _print_runs(); return
+    if a.question_budget is not None and a.question_budget < 1:
+        ap.error("--question-budget 必须为正整数")
+    if a.question_budget is not None and a.min_questions is not None:
+        ap.error("--question-budget 与闭环 --min-questions 不能同时指定")
 
     if a.seed_pack and a.scenario:
         ap.error("--seed-pack 已定义场景，不能同时指定 --scenario")
@@ -516,6 +585,16 @@ def main():
 
     cfg = {"from": a.from_stage, "to": a.to_stage, "only": a.only}
     manifest_path = RUNS_DIR / run_id / "manifest.json"
+    if a.question_budget is not None:
+        previous = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else {}
+        if (previous.get("stages", {}).get("orders", {}).get("done")
+                and previous.get("config", {}).get("question_budget") != a.question_budget
+                and not (a.force and (a.only == "orders" or (a.only is None and
+                    a.from_stage in (None, "input", "whitepaper", "world", "orders"))))):
+            ap.error("修改已有订单预算需 --force --from orders（或 --force --only orders 后续跑），以失效旧的下游产物")
+        cfg["question_budget"] = a.question_budget
+    elif not manifest_path.exists() and a.min_questions is None:
+        cfg["question_budget"] = 30
     if seed_cfg and manifest_path.exists():
         try:
             previous = json.loads(manifest_path.read_text(encoding="utf-8"))

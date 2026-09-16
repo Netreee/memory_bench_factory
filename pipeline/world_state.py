@@ -27,7 +27,8 @@ def _to_num(s: Any) -> Optional[float]:
     """从 '2.5%' / '15次' / '1.8' / '1,050' 抽数值,抽不出返回 None。
     ★先剥千分位逗号(value_shape 审计 HIGH):'1,050' 旧版在逗号截断成 1.0,使累计量(会破千)的单调/值域
       跨周比较假阳/假阴。半/全角逗号都剥(累计工时这类大额字段 LLM 常写千分位)。"""
-    if s is None:
+    from pipeline.value_types import looks_like_date
+    if s is None or isinstance(s, bool) or looks_like_date(s):
         return None
     m = re.search(r"-?\d+\.?\d*", str(s).replace(",", "").replace("，", ""))
     return float(m.group()) if m else None
@@ -209,13 +210,24 @@ def gt_ku(ws: WorldState, entity: str, fld: str) -> str:
     return tl.latest_valid() if tl else INSUFFICIENT
 
 
-def gt_mr(ws: WorldState, entity: str, fld: str, agg: str = "max") -> dict:
-    """MR:跨 session 极值 + ★ argmax/argmin 都给(治 v8 漏 argmin 的 bug)。"""
+def gt_mr(ws: WorldState, entity: str, fld: str, agg: str = "max", *, schema: dict | None = None) -> dict:
+    """Typed extrema. Ties return the first witness, while the value is unique.
+
+    A malformed member invalidates the comparison; it is never discarded to
+    manufacture an apparently valid extremum from the remaining values.
+    """
+    from pipeline.value_types import ValueComparisonError, comparison_keys, field_schema
     tl = ws.timeline(entity, fld)
-    cand = [(s, d, v, _to_num(v)) for (s, d, v) in (tl.set_values() if tl else []) if _to_num(v) is not None]
-    if not cand:
+    values = tl.set_values() if tl else []
+    if agg not in ("max", "min") or not values:
         return {"value": INSUFFICIENT}
-    pick = (max if agg == "max" else min)(cand, key=lambda x: x[3])
+    try:
+        declaration = field_schema(ws, entity, fld) or schema or {}
+        _, keys = comparison_keys([value for _, _, value in values], declaration)
+    except ValueComparisonError:
+        return {"value": INSUFFICIENT}
+    index = (max if agg == "max" else min)(range(len(values)), key=lambda i: keys[i])
+    pick = values[index]
     return {"value": pick[2], "session": pick[0], "date": pick[1], "agg": agg}
 
 

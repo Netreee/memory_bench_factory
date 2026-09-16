@@ -33,6 +33,7 @@ pipeline.lines.L9_induction —— L9 条件归纳(IF-THEN 条件函数归纳:fu
 """
 from __future__ import annotations
 import random
+import re
 
 from pipeline.lines.base import ProductionLine
 from pipeline.world_state import (WorldState, _norm, _to_num, _date_of,
@@ -65,6 +66,41 @@ _ARM_XS = {
     "上报主管":       [68, 78, 92],     # x ≥ 60
 }
 _X_STAR = 47                          # held-out 探针值(∈中臂,∉实例集,距 30/60 均 ≥ margin)→ gold=升级为紧急工单
+
+
+def heldout_leakage(order: dict, texts: list[str]) -> bool:
+    """Find explicit held-out condition/action pairs, not unrelated numbers.
+
+    This bounded check covers literal canonical/instance action wording. It
+    does not claim to detect all paraphrases or generalized rule disclosure.
+    """
+    aux = order.get("aux") or {}
+    subject = _norm(aux.get("subject_noun", "工单"))
+    trigger = _norm(aux.get("trigger_field", ""))
+    x_star = _to_num(aux.get("x_star"))
+    if x_star is None or not trigger or not subject:
+        return False
+    actions = {_norm(action) for action in aux.get("options", [])}
+    actions.update(_norm(instance.get("surface_action")) for instance in aux.get("instances", []))
+    actions.discard("")
+    unit = _norm(aux.get("unit", ""))
+    for text in texts:
+        for clause in re.split(r"[。！？\n]", str(text)):
+            compact = _norm(clause)
+            if subject not in compact or trigger not in compact or not any(action in compact for action in actions):
+                continue
+            if any(marker in compact for marker in ("未说明", "无法确定", "没有决定", "不确定", "尚未决定")):
+                continue
+            for number in re.finditer(r"(?<![\d.])[+-]?\d+(?:\.\d+)?(?![\d.])", compact):
+                if _to_num(number.group()) != x_star:
+                    continue
+                prefix = compact[max(0, number.start() - len(trigger) - 12):number.start()]
+                if trigger not in prefix:
+                    continue
+                if unit and not compact[number.end():].startswith(unit):
+                    continue
+                return True
+    return False
 
 
 def _candidate_boundaries(xs: list[float]) -> list[float]:
@@ -271,16 +307,16 @@ class InductionLine(ProductionLine):
         return ("well_posed", "")
 
     def ground(self, order, evidence_docs, all_signal_text=""):
-        """接地:验【每个动作臂】都被语料里【某条实例的 surface 串就近其 inst_id】渲到(归纳可行);
-        且 held-out x* 不逐字出现在语料(真外推,非检索)。gold(canon)不验在不在语料——它就该缺席。"""
+        """Verify arm witnesses and reject an explicit held-out condition/action pair."""
         from pipeline.grounding import attributed
         aux = order.get("aux") or {}
         insts = aux.get("instances") or []
         docs = [d["content"] for d in evidence_docs]
         x_star = str(aux.get("x_star"))
         options = aux.get("options") or []
-        # x* 不该逐字在语料(held-out;若出现则退化成检索题)
-        joined = "\n".join(docs)
+        visible = docs + ([all_signal_text] if all_signal_text else [])
+        if heldout_leakage(order, visible):
+            return ("drop", f"held-out 条件与处置结果已直接出现在正文:x*={x_star}")
         # 每臂至少一条实例 surface 就近其 inst_id
         witnessed = set()
         for i in insts:

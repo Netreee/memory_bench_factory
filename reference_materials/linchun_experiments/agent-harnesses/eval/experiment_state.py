@@ -28,7 +28,7 @@ def find_factory_root(explicit: str = "", *, start: Path | None = None) -> Path:
 
 def question_hash(question: dict) -> str:
     """题面、答案、评分合同和题号均参与续跑身份。"""
-    fields = ("qid", "line", "capability", "entity", "field", "question", "gt", "aux", "strict_scoring")
+    fields = ("qid", "line", "capability", "entity", "field", "question", "gt", "aux", "strict_scoring", "question_contract")
     return digest({key: question.get(key) for key in fields})
 
 
@@ -64,10 +64,15 @@ def load_records(path: Path, fingerprint: str) -> dict[str, dict]:
     return records
 
 
-def is_reusable(rec: dict) -> bool:
+def is_reusable(rec: dict, judge_version: str | None = None) -> bool:
     """调用、判分失败和缺失答案均应重试，而非复用为错误答案。"""
     pred = rec.get("pred")
+    grade = rec.get("judgement") or {}
     return (not rec.get("error") and not rec.get("judge_error")
+            and grade.get("verdict") in {"correct", "incorrect"}
+            and bool(grade.get("version")) and (judge_version is None or grade["version"] == judge_version)
+            and type(grade.get("correct")) is bool and grade["correct"] is rec.get("correct")
+            and grade["correct"] == (grade["verdict"] == "correct")
             and rec.get("judgeable") is True and type(rec.get("correct")) is bool
             and isinstance(pred, str) and bool(pred.strip())
             and not (pred.lstrip().startswith("[") and "ERROR" in pred))

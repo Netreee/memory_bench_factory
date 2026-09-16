@@ -9,6 +9,9 @@ pipeline.lines —— 产线注册表(redesign 宪法/纲领的代码落地,唯�
 """
 from __future__ import annotations
 import re
+import math
+import json
+from collections import Counter
 
 from pipeline.lines.base import ProductionLine, Order
 from pipeline.lines.L1_timeline import TimelineLine
@@ -91,10 +94,114 @@ def feasible_lines(ws, profile: dict) -> list[tuple[str, bool, str]]:
 # ── 注册表级产线编排(stage_world / stage_orders / 闭环 driver 共用;原 run_factory_v2 搬入)─────
 # ★派发:run_lines 遍历白皮书激活线 → line.enumerate 点菜(配额驱动 + feasible 门控)。
 #   叠基质:prepare_lines 各线把所需基质叠进共享世界(命门1)。两者都只依赖本表的 line_for。
-def run_lines(wp, ws, log=print, quotas=None) -> list[dict]:
+def _budgeted_lines(wp, ws, budget: int, log, stats: dict | None) -> list[dict]:
+    """Allocate a total budget before selection; never refill a short line with L6.
+
+    Candidate enumeration is bounded and its limit is reported. A pool at the
+    limit is not advertised as the exhaustive supply. Invalid and duplicate
+    candidates cannot consume a selected slot.
+    """
+    if isinstance(budget, bool) or not isinstance(budget, int) or budget < 0:
+        raise ValueError("question_budget must be a nonnegative integer")
+    profile = wp.get("domain_profile", {})
+    planned, seen, unknown = [], set(), []
+    for item in wp.get("active_lines", []):
+        line = line_for(item.get("line"))
+        if line is None:
+            unknown.append(item.get("line")); continue
+        if line.id in seen:
+            continue
+        seen.add(line.id)
+        weight = item.get("weight", 1)
+        if isinstance(weight, bool) or not isinstance(weight, (int, float)) or not math.isfinite(weight) or weight < 0:
+            raise ValueError(f"Invalid active-line weight for {line.id}: {weight!r}")
+        planned.append((line, float(weight), False))
+    for line in LINES:
+        if getattr(line, "auto_activate", False) and line.id not in seen and line.feasible(ws, profile)[0]:
+            planned.append((line, 1.0, True))
+            seen.add(line.id)
+    total_weight = sum(weight for _, weight, _ in planned)
+    # Normalize before multiplying to avoid overflow for finite large weights.
+    if not math.isfinite(total_weight):
+        largest = max((weight for _, weight, _ in planned), default=1)
+        planned = [(line, weight / largest, auto) for line, weight, auto in planned]
+        total_weight = sum(weight for _, weight, _ in planned)
+    shares = [budget * (weight / total_weight) if total_weight else 0 for _, weight, _ in planned]
+    allocations = [math.floor(share) for share in shares]
+    remainder = budget - sum(allocations) if total_weight else 0
+    priority = sorted(range(len(planned)), key=lambda i: (-(shares[i] - allocations[i]), i))
+    for index in priority[:remainder]:
+        allocations[index] += 1
+    limit = max(1000, min(10000, budget * 20))
+    report = {"mode": "total_budget", "question_budget": budget,
+              "legacy_total_q": wp.get("capability_targets", {}).get("total_q"),
+              "candidate_limit_per_line": limit, "selection": "eligible_capability_round_robin",
+              "unimplemented_lines": unknown, "lines": []}
+    selected = []
+    for (line, weight, auto), allocated in zip(planned, allocations):
+        feasible, reason = line.feasible(ws, profile)
+        row = {"line": line.id, "weight": weight, "auto_activated": auto, "allocated": allocated,
+               "feasible": feasible, "feasibility_reason": reason, "candidates": 0, "eligible": 0,
+               "selected": 0, "duplicate_candidates": 0, "rejected": {}, "pool_at_limit": False}
+        eligible, identities, rejected = [], set(), Counter()
+        if feasible and allocated > 0:
+            candidates = line.enumerate(ws, limit, wp)
+            row["candidates"] = len(candidates)
+            row["pool_at_limit"] = len(candidates) >= limit
+            for order in candidates:
+                status, why = line.well_posed(order, ws)
+                if status != "well_posed":
+                    rejected[why or status] += 1
+                    continue
+                # Exclude render/provenance metadata from identity; qid semantics
+                # remain the responsibility of question_contract downstream.
+                identity = json.dumps({key: order.get(key) for key in
+                    ("line", "capability", "entity", "field", "gt", "aux")},
+                    sort_keys=True, ensure_ascii=False)
+                if identity in identities:
+                    row["duplicate_candidates"] += 1
+                    continue
+                identities.add(identity)
+                eligible.append(order)
+            pools = {}
+            for order in eligible:
+                pools.setdefault(order.get("capability", ""), []).append(order)
+            picked, offset = [], 0
+            while len(picked) < allocated:
+                round_items = [pool[offset] for pool in pools.values() if len(pool) > offset]
+                if not round_items:
+                    break
+                picked.extend(round_items[:allocated - len(picked)])
+                offset += 1
+            selected.extend(picked)
+            row["selected"] = len(picked)
+        row["eligible"] = len(eligible)
+        row["rejected"] = dict(rejected)
+        row["shortfall"] = allocated - row["selected"]
+        row["shortfall_reason"] = ("infeasible_substrate" if not feasible else
+            "bounded_candidate_supply" if row["pool_at_limit"] else "eligible_supply_exhausted") if row["shortfall"] else None
+        report["lines"].append(row)
+    report["selected"] = len(selected)
+    report["shortfall"] = budget - len(selected)
+    if not total_weight:
+        report["shortfall_reason"] = "no_positive_weight_lines"
+    if stats is not None:
+        stats.clear(); stats.update(report)
+    log(f"  总题预算 {budget}: 选中 {len(selected)}, 缺口 {report['shortfall']}; 各线缺口不转移")
+    for row in report["lines"]:
+        log(f"    {row['line']}: 配额 {row['allocated']}, 合法候选 {row['eligible']}, 选中 {row['selected']}"
+            + (f", 缺口原因 {row['shortfall_reason']}" if row["shortfall"] else ""))
+    return selected
+
+
+def run_lines(wp, ws, log=print, quotas=None, *, question_budget=None, stats=None) -> list[dict]:
     """按白皮书激活的产线,line_for 鲁棒匹配 → 调 line.enumerate 点菜。
     ★配额驱动(closed_loop_targetspec §7):`quotas={line_id: 配额}`(由 invert_rate 反推),缺省回退 total_q。
     ★feasible 接线(盲审 B6:零件原本没装上):基质喂不饱的线跳过 + 日志,不无效产 0 单、不死循环。"""
+    if question_budget is not None:
+        if quotas is not None:
+            raise ValueError("question_budget and per-line quotas are mutually exclusive")
+        return _budgeted_lines(wp, ws, question_budget, log, stats)
     active = [l.get("line") for l in wp.get("active_lines", [])]
     profile = wp.get("domain_profile", {})
     default_target = int(wp.get("capability_targets", {}).get("total_q", 40))
@@ -128,6 +235,11 @@ def run_lines(wp, ws, log=print, quotas=None) -> list[dict]:
     log(f"  产线已跑: {fired or '无'}")
     if skipped:
         log(f"  ⓘ 白皮书激活但跳过: {skipped}")
+    if stats is not None:
+        stats.clear()
+        stats.update({"mode": "explicit_quotas" if quotas else "legacy_per_line",
+                      "legacy_total_q": default_target, "selected": len(orders_out),
+                      "fired": fired, "skipped": skipped})
     return orders_out
 
 

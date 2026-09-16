@@ -24,7 +24,7 @@ def _after(date: str, days: int = 5) -> str:
 # ════════════════════════════════════════════════════════════════════════════
 # 点菜枚举(从 order_gen._candidates / generate_orders 逐字搬迁,行为不变)
 # ════════════════════════════════════════════════════════════════════════════
-def _candidates(ws: WorldState, cap: str) -> list[Order]:
+def _candidates(ws: WorldState, cap: str, wp=None) -> list[Order]:
     cap = cap.upper()
     out: list[Order] = []
 
@@ -52,10 +52,18 @@ def _candidates(ws: WorldState, cap: str) -> list[Order]:
                                          aux={"at_week": N, "value": v, "framing": "decision_time"}))
 
             elif cap == "MR":
-                if len([1 for (_, _, v) in sv if _to_num(v) is not None]) >= 2:
+                from pipeline.value_types import ValueComparisonError, comparison_keys, field_schema
+                try:
+                    schema = field_schema(ws, ent, fld, wp)
+                    value_kind, _ = comparison_keys([v for _, _, v in sv], schema)
+                except ValueComparisonError:
+                    continue
+                if len(sv) >= 2:
                     for agg in ("max", "min"):
-                        out.append(Order("MR", ent, fld, gt=gt_mr(ws, ent, fld, agg),
-                                         evidence_sessions=sessions, aux={"agg": agg}))
+                        out.append(Order("MR", ent, fld, gt=gt_mr(ws, ent, fld, agg, schema=schema),
+                                         evidence_sessions=sessions,
+                                         aux={"agg": agg, "value_schema": schema,
+                                              "ans_kind": value_kind}))
 
             elif cap == "TR":
                 chs = [o for o in tl.change_ops() if o.op in (SET, UPDATE) and o.prev is not None]
@@ -97,9 +105,11 @@ def _candidates(ws: WorldState, cap: str) -> list[Order]:
                 for (_s, _d, v) in sv:
                     dr = gt_duration(ws, ent, fld, v)
                     if isinstance(dr, dict) and dr.get("weeks", 0) >= 2 and dr["end"] < (ws.n_sessions or 99):
+                        end_op = next(op for op in tl._sorted() if op.session == dr["end"])
                         out.append(Order("DURATION", ent, fld, gt=dr,
                                          evidence_sessions=list(range(dr["start"], dr["end"] + 1)),  # ★全跨度:含中间周,让模型能确认"没变过"
-                                         aux={"value": v}))
+                                         aux={"value": v, "duration_end_op": end_op.op,
+                                              "duration_end_value": end_op.value}))
                         break
 
             elif cap == "PREEXPIRE":
@@ -136,7 +146,7 @@ class TimelineLine(ProductionLine):
         """按 `_CAP_WEIGHT` 比例把 `target` 配额分到各能力(供给受限处从余量补);target = L1 配额
         (反推来;缺省 200 = 尽量全产)。耗尽仍不足 target = 世界供给到顶 → run_lines 据此判 'short' 去长世界。"""
         rng = random.Random(0)
-        cands = {c: _candidates(ws, c) for c in self._CAP_WEIGHT}
+        cands = {c: _candidates(ws, c, wp) for c in self._CAP_WEIGHT}
         for c in cands:
             rng.shuffle(cands[c])
         total_w = sum(self._CAP_WEIGHT.values())
@@ -160,9 +170,14 @@ class TimelineLine(ProductionLine):
         out = []
         for o in picked[:target]:
             aux = dict(o.aux)
-            aux.setdefault("ans_kind", field_kind(o.field, sample_field_value(ws, o.entity, o.field), profile))
+            from pipeline.value_types import field_schema
+            declaration = field_schema(ws, o.entity, o.field, wp)
+            if declaration:
+                aux["value_schema"] = declaration
+            aux.setdefault("ans_kind", declaration.get("kind") or field_kind(o.field, sample_field_value(ws, o.entity, o.field), profile))
             aux["time_unit"] = ws.period_unit()
-            out.append({"line": self.id, "capability": o.capability, "entity": o.entity, "field": o.field,
+            out.append({"line": self.id, "capability": o.capability, "entity": o.entity,
+                        "entity_type": ws.entity_types.get(o.entity), "field": o.field,
                         "gt": o.gt, "evidence_sessions": o.evidence_sessions, "aux": aux})
         return out
 
@@ -175,7 +190,9 @@ class TimelineLine(ProductionLine):
         if cap == "KU":
             return gt_ku(ws, ent, fld)
         if cap == "MR":
-            return gt_mr(ws, ent, fld, aux.get("agg", "max"))
+            return gt_mr(ws, ent, fld, aux.get("agg", "max"), schema=aux.get("value_schema"))
+        if cap == "DURATION":
+            return gt_duration(ws, ent, fld, aux.get("value"))
         if cap == "TR":
             tl = ws.timeline(ent, fld)
             chs = [op for op in tl.change_ops() if op.op in (SET, UPDATE) and op.prev is not None] if tl else []
@@ -197,24 +214,31 @@ class TimelineLine(ProductionLine):
     def intent(self, o: dict) -> tuple[str, list]:
         cap, ent, fld, aux, gt = (o.get("capability"), o.get("entity", ""), o.get("field", ""),
                                   o.get("aux", {}) or {}, o.get("gt"))
-        hide = [str(gt)]
+        scalar = gt.get("value") if isinstance(gt, dict) else gt
+        hide = [str(scalar)] if scalar is not None else []
         q = interrogative(aux.get("ans_kind"))     # ★Fix2:疑问词由字段 kind 派生(person→是谁/number→是多少/其它→是什么)
         unit = aux.get("time_unit") or "周"
         if cap == "IE":
-            s = (f"复盘第 {week_label(aux.get('at_week'))} {unit}那次——问【当时】{ent} 的「{fld}」{q}"
-                 f"(制造'当时 vs 现在'对照;答案不进题面)。")
+            s = f"第 {week_label(aux.get('at_week'))} {unit}时，【{ent}】的「{fld}」{q}？"
         elif cap == "KU":
-            s = f"问截至最新一期,{ent} 的「{fld}」{q}(不要暗示是第几周)。"
+            s = f"截至最新一期，【{ent}】的「{fld}」{q}？"
         elif cap == "TR":
-            s = f"问 {ent} 的「{fld}」是在哪一{unit}【首次】发生变化的(只问时间序号,不写变化前后的值)。"
+            s = f"【{ent}】的「{fld}」首次发生变化是在第几{unit}？请回答期数。"
         elif cap == "MR":
-            s = f"问在全部记录{unit}里,{ent} 的「{fld}」{'最高/最大' if aux.get('agg') == 'max' else '最低/最小'}是多少。"
+            if aux.get("ans_kind") == "date" or (aux.get("value_schema") or {}).get("kind") == "date":
+                s = f"在全部记录中，【{ent}】的「{fld}」{'最晚' if aux.get('agg') == 'max' else '最早'}日期是哪一天？"
+            else:
+                s = f"在全部记录中，【{ent}】的「{fld}」{'最大' if aux.get('agg') == 'max' else '最小'}值是多少？"
         elif cap == "PREEXPIRE":
-            s = f"问那个【已停止统计】的「{fld}」,{ent} 在停掉【前】最后一次{q}(题面不写该值)。"
+            s = f"【{ent}】的「{fld}」在停止统计前最后一次记录的值{q}？"
         elif cap == "FORGET":
-            s = f"问截至最新,{ent} 的「{fld}」{q}(它可能已停止统计)。"
+            s = f"截至最新一期，【{ent}】的「{fld}」{q}？"
         elif cap == "ABS":
-            s = f"问 {ent} 的「{fld}」是多少(此字段本场景根本不存在,考拒答)。"
+            subject = f"【{ent}】" if ent else "现有记录"
+            s = f"{subject}的「{fld}」{q}？"
+        elif cap == "DURATION":
+            s = f"【{ent}】的「{fld}」保持为「{aux.get('value')}」持续了多少{unit}？"
+            hide = []
         else:
             s = f"问 {ent} 的「{fld}」是多少。"
         return s, hide
@@ -227,6 +251,17 @@ class TimelineLine(ProductionLine):
         from pipeline.world_state import _norm
         cap, ent = order.get("capability"), order.get("entity", "")
         docs = [d["content"] for d in evidence_docs]
+        if cap == "DURATION":
+            gt, aux = order.get("gt") or {}, order.get("aux") or {}
+            start_docs = [d["content"] for d in evidence_docs if d.get("session") == gt.get("start")]
+            end_docs = [d["content"] for d in evidence_docs if d.get("session") == gt.get("end")]
+            if not attributed(aux.get("value"), ent, start_docs):
+                return "drop", "DURATION 起点目标值无正文见证"
+            if aux.get("duration_end_op") in (DELETE, EXPIRE):
+                ended = any(attributed(marker, ent, end_docs) for marker in STOP_MARKERS)
+            else:
+                ended = attributed(aux.get("duration_end_value"), ent, end_docs)
+            return ("grounded", "DURATION 起止事件均有正文见证") if ended else ("drop", "DURATION 终点取代/停用事件无正文见证")
         if cap == "ABS":                                 # 反向:字段全语料不出现 = 缺失为真
             fld = order.get("field", "")
             if fld and _norm(fld) in _norm(all_signal_text):
@@ -262,8 +297,13 @@ class TimelineLine(ProductionLine):
         gt, aux = order.get("gt"), (order.get("aux") or {})
         ev = order.get("evidence_sessions") or []
 
-        def _eq(a, b) -> bool:                       # 与判分同口径(_norm 相等)
-            return _norm(a) == _norm(b)
+        def _eq(a, b) -> bool:
+            from pipeline.value_types import field_schema, values_equal, ValueComparisonError
+            try:
+                declaration = field_schema(ws, ent, fld) or aux.get("value_schema") or {}
+                return values_equal(a, b, declaration)
+            except ValueComparisonError:
+                return False
 
         def _is_sentinel(v) -> bool:
             return v in (INVALID, INSUFFICIENT, None, "") or _norm(v) == ""
@@ -316,7 +356,7 @@ class TimelineLine(ProductionLine):
                 return ("drop", f"well_posed:MR agg 非法:{agg}")
             if not isinstance(gt, dict) or "value" not in gt or "session" not in gt:  # W3
                 return ("drop", f"well_posed:MR 类型错配:gt 应为 {{value,session,...}},得 {gt}")
-            r = gt_mr(ws, ent, fld, agg)                                     # {value,session,date,agg}
+            r = gt_mr(ws, ent, fld, agg, schema=aux.get("value_schema"))
             if _is_sentinel(r.get("value")):                               # W2
                 return ("drop", "well_posed:MR gold 悬空:无数值候选")
             if not (_eq(r["value"], gt["value"]) and r["session"] == gt["session"]
@@ -326,6 +366,28 @@ class TimelineLine(ProductionLine):
             if gt["session"] not in ev:                                    # W9:证据可读(fail-closed)
                 return ("drop", f"well_posed:MR 证据缺锚:极值 session{gt['session']} 不在 evidence")
             return ("well_posed", "")
+
+        if cap == "DURATION":
+            target = aux.get("value")
+            r = gt_duration(ws, ent, fld, target)
+            if not isinstance(gt, dict) or not isinstance(r, dict):
+                return "drop", "well_posed:DURATION 目标值或结构缺失"
+            if any(not isinstance(gt.get(key), int) or isinstance(gt.get(key), bool) for key in ("start", "end", "weeks")):
+                return "drop", "well_posed:DURATION 起止与时长必须是整数"
+            if gt != r or r["weeks"] < 2 or not (0 <= r["start"] < r["end"] < ws.n_sessions):
+                return "drop", "well_posed:DURATION 起止/时长与世界不符或区间未闭合"
+            occurrences = [op for op in tl._sorted() if op.op in (SET, UPDATE) and _eq(op.value, target)]
+            if len(occurrences) != 1:
+                return "drop", "well_posed:DURATION 目标值出现多个区间，题面未消歧"
+            end_ops = [op for op in tl._sorted() if op.session == r["end"]]
+            if len(end_ops) != 1 or end_ops[0].op not in (UPDATE, SET, DELETE, EXPIRE):
+                return "drop", "well_posed:DURATION 终点事件不唯一或不受支持"
+            end = end_ops[0]
+            if aux.get("duration_end_op") != end.op or aux.get("duration_end_value") != end.value:
+                return "drop", "well_posed:DURATION 终点见证与世界不符"
+            if not set(range(r["start"], r["end"] + 1)).issubset(ev):
+                return "drop", "well_posed:DURATION 证据未覆盖完整起止区间"
+            return "well_posed", ""
 
         # ── TR —— 首次变更(哪一周)──
         if cap == "TR":

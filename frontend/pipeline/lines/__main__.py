@@ -1,5 +1,11 @@
-"""注册表自检入口:python -m pipeline.lines(逻辑收敛在 __init__._selftest,避免两处各抄一份)。"""
+"""Compatibility entry point; implementation: pipeline.lines.__main__."""
+from pathlib import Path
 import sys
-from pipeline.lines import _selftest
 
-sys.exit(_selftest())
+_ROOT = Path(__file__).resolve().parents[3]
+if not (_ROOT / "backend_bootstrap.py").is_file():
+    raise ImportError("Memory Forge backend is missing. Keep frontend inside the complete repository checkout.")
+sys.path.insert(0, str(_ROOT))
+from backend_bootstrap import forward_module
+
+forward_module(__name__, "pipeline.lines.__main__")

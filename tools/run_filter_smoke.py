@@ -82,22 +82,29 @@ def main():
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--top-k", type=int, default=3, help="关键词基线读取的文档上限")
     parser.add_argument("--model", help="本次生成和作答模型；默认沿用项目配置")
+    parser.add_argument("--allow-unverified", action="store_true", help="明确把重新裁剪的烟测题库作为研究输入，不能产生正式成绩")
     parser.add_argument("--judge-mode", choices=["deterministic", "llm"], default="deterministic",
                         help="默认用项目评分器的确定性分支，节省判分调用；llm 启用原有语义判分")
     args = parser.parse_args()
     if args.limit < 1 or args.workers < 1 or args.top_k < 1:
         parser.error("limit、workers 和 top-k 必须为正数")
+    if not args.allow_unverified:
+        parser.error("烟测会生成未取得发布资格的子集；须显式 --allow-unverified，并将结果仅作研究验证")
 
     import config
     if args.model:
         config.MODEL = args.model
     if args.frozen_source:
         args.run = generate_questions(args.frozen_source, args.limit)
-    from eval.judge import is_judgeable, judge_answer
+    from eval.judge import is_judgeable, judge_record
+    from eval.grading import JUDGE_VERSION
+    from pipeline.quality import require_release
     from eval.question_filter import export_filtered_benchmark, filter_questions, question_key
     artifacts = load_harness_module("artifacts")
     memory = load_harness_module("memory_store")
     corpus, questions, about = artifacts.load_run(args.run)
+    release = require_release(args.run / "06_grounded_questions.json", allow_unverified=args.allow_unverified,
+                              corpus_path=args.run / "05_corpus.json")
     # 明确按能力和原顺序选取少量可判分题，降低初次验证成本。
     candidates = [q for q in questions if is_judgeable(q) and q.get("capability") != "L10_admission"]
     candidates.sort(key=lambda q: q.get("capability") != "IE")
@@ -129,7 +136,10 @@ def main():
                 {"role": "system", "content": "你是记忆问答助手。仅根据提供的资料回答，只给简短最终答案。资料不足时明确拒答。\n" + protocol},
                 {"role": "user", "content": f"【资料】\n{context}\n\n【问题】{q['question']}"}],
                 model=model, temperature=0, max_tokens=4096)
-            record["correct"] = bool(judge_answer(q, record["pred"], use_llm=args.judge_mode == "llm"))
+            record["judgement"] = judge_record(q, record["pred"], use_llm=args.judge_mode == "llm")
+            record["correct"] = record["judgement"]["correct"]
+            if record["judgement"]["verdict"] == "error":
+                record["judge_error"] = record["judgement"]["reason"]
         except Exception as exc:
             record["error"] = f"{type(exc).__name__}: {str(exc)[:160]}"
         record["elapsed_s"] = round(time.monotonic() - t0, 3)
@@ -148,6 +158,7 @@ def main():
     for records in results.values():
         records.sort(key=lambda row: order[question_key(row)])
     payload = {"bench": str(bench.resolve()), "source_run": str(args.run.resolve()),
+               "release": release, "result_scope": "research_only", "judge_version": JUDGE_VERSION,
                "model": model, "systems": systems, "judge_mode": args.judge_mode,
                "results": {s: {"records": rows} for s, rows in results.items()},
                "source_hashes": {name: hashlib.sha256((args.run / name).read_bytes()).hexdigest()
@@ -161,7 +172,7 @@ def main():
     checks = {}
     for name, ratio in (("drop_all", 0.0), ("keep_half", 0.5), ("keep_all", 1.0)):
         report = export_filtered_benchmark(bench, results, args.out / name,
-            keep_easy_ratio=ratio, seed=7, result_paths=[path])
+            keep_easy_ratio=ratio, seed=7, result_paths=[path], allow_unverified=args.allow_unverified)
         kept = json.loads((args.out / name / "06_grounded_questions.json").read_text(encoding="utf-8"))
         expected_n = len(selected) - len(easy_indices) + int(len(easy_indices) * ratio)
         assert len(kept) == expected_n, (name, len(kept), expected_n)
@@ -187,7 +198,7 @@ def main():
             kept, _ = filter_questions(selected, faulty)
             assert selected[i] in kept
             checks[f"{field}_retained"] = True
-    errors = sum(bool(r.get("error")) for rows in results.values() for r in rows)
+    errors = sum(bool(r.get("error") or r.get("judge_error")) for rows in results.values() for r in rows)
     checks.update({"actual_all_correct": len(easy_indices),
                    "errors": errors, "answer_call_attempts": len(selected) * len(systems),
                    "judge_mode": args.judge_mode, "removal_exercised": bool(easy_indices),

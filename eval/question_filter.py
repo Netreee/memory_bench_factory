@@ -1,4 +1,4 @@
-"""根据已有逐题判分剔除全员答对题；纯离线、仅使用标准库。
+"""根据已有逐题判分剔除全员答对题；纯离线，不发起模型调用。
 
 python -m eval.question_filter --bench 06_grounded_questions.json \
     --results results.json --out-dir filtered --keep-easy-ratio 0.2
@@ -7,16 +7,18 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter, defaultdict
+from copy import deepcopy
 from fractions import Fraction
 import hashlib
 import json
 import math
 from pathlib import Path
 import shutil
+from eval.grading import JUDGE_VERSION, is_scored
 
 
 DISPOSITIONS = ("removed_easy", "kept_easy_sample", "kept_not_all_correct", "kept_incomplete")
-IDENTITY_FIELDS = ("line", "capability", "question", "gt", "aux", "strict_scoring")
+IDENTITY_FIELDS = ("line", "capability", "question", "gt", "aux", "strict_scoring", "question_contract")
 
 
 def question_key(item: dict) -> str:
@@ -55,6 +57,13 @@ def _invalid_reason(record: dict) -> str | None:
         return "evaluation_error"
     if record.get("judgeable", True) is not True:
         return "not_judgeable"
+    grade = record.get("judgement")
+    if not isinstance(grade, dict):
+        return "missing_judgement_provenance"
+    if grade.get("verdict") in {"error", "unjudgeable"}:
+        return "judge_" + grade["verdict"]
+    if not is_scored(record):
+        return "invalid_or_stale_judgement"
     if type(record.get("correct")) is not bool:
         return "invalid_judgement"
     pred = record.get("pred")
@@ -142,7 +151,7 @@ def filter_questions(questions: list[dict], results: dict[str, list[dict]], *,
         by_line[str(item["line"])].append(item)
         by_capability[str(item["capability"])].append(item)
     report = {
-        "schema_version": 1, "rule": "all_selected_systems_correct",
+        "schema_version": 2, "rule": "all_selected_systems_correct", "judge_version": JUDGE_VERSION,
         "systems": systems, "keep_easy_ratio": keep_easy_ratio, "seed": seed,
         "preserve_capabilities": sorted(preserved),
         "sampling": "floor(n_easy * keep_easy_ratio); seeded SHA-256 order",
@@ -151,7 +160,7 @@ def filter_questions(questions: list[dict], results: dict[str, list[dict]], *,
         "by_line": {key: counts(rows) for key, rows in sorted(by_line.items())},
         "by_capability": {key: counts(rows) for key, rows in sorted(by_capability.items())},
         "unmatched_result_rows": unmatched,
-        "judgement_basis": "supplied_correct_labels_without_rejudging",
+        "judgement_basis": "validated_versioned_primary_judgements_without_rejudging",
         "items": items,
     }
     return kept, report
@@ -212,11 +221,12 @@ def _markdown_report(report: dict) -> str:
              f"简单题保留比例：{report['keep_easy_ratio']}；种子：{report['seed']}；向下取整保留 {c['kept_easy_sample']} 道简单题。", "",
              f"缺测、异常、重复记录或人工暂缓筛选的 {c['kept_incomplete']} 题保留待核查。", "",
              f"暂缓筛选的能力：{', '.join(report['preserve_capabilities']) or '无'}。", "",
+             f"导出用途：{report.get('result_scope', 'unknown')}；发布检查：{report.get('release', {}).get('status', 'not_run')}。", "",
              "| 能力 | 原题数 | 剔除 | 保留 | 待核查 |", "| --- | ---: | ---: | ---: | ---: |"]
     for capability, row in report["by_capability"].items():
         lines.append(f"| {capability} | {row['input']} | {row['removed_easy']} | {row['kept']} | {row['kept_incomplete']} |")
-    lines += ["", "筛选依据是所选系统已有的 correct 布尔标记，本步骤不重新作答或判分。",
-              "全员答对仅指本次所选系统；保留结果未重新证明题目有效性，判分错误需先修正再重跑筛选。",
+    lines += ["", "筛选依据是所选系统当前版本的结构化判分；缺失来源、判分异常和旧版本标签进入待复核，本步骤不重新作答或判分。",
+              "全员答对仅指本次所选系统；筛后发布检查保留原交付数量约束，判分错误仍需先修正再重跑筛选。",
               "逐题判分、去留原因、输入文件 SHA-256 见 filter_report.json。", ""]
     return "\n".join(lines)
 
@@ -225,29 +235,80 @@ def export_filtered_benchmark(bench: Path, results: dict[str, list[dict]], out_d
                               keep_easy_ratio: float = 0.0, seed: int = 0,
                               preserve_capabilities: tuple[str, ...] | list[str] = (),
                               corpus: Path | None = None, about: Path | None = None,
-                              result_paths: list[Path] = ()) -> dict:
-    """在新目录导出筛选题库、报告和原语料/协议，不覆盖任何已有目录。"""
+                              result_paths: list[Path] = (), allow_unverified: bool = False) -> dict:
+    """导出独立派生题库并重验发布资格，保留源交付约束和研究用途边界。"""
     bench, out_dir = Path(bench), Path(out_dir)
     questions = load_questions(bench)
+    from pipeline.quality import require_release, evaluate_release
+    release = require_release(bench, allow_unverified=allow_unverified, corpus_path=corpus)
     filtered, report = filter_questions(questions, results, keep_easy_ratio=keep_easy_ratio, seed=seed,
                                         preserve_capabilities=preserve_capabilities)
+    report["source_release"] = release
     copies = {}
-    for name, supplied in (("05_corpus.json", corpus), ("00_about.json", about)):
+    for name, supplied in (("01_whitepaper.json", None), ("02_world.json", None),
+                           ("04_questions.json", None), ("05_corpus.json", corpus), ("00_about.json", about)):
         path = Path(supplied) if supplied is not None else bench.parent / name
         if supplied is not None or path.exists():
             if not path.is_file():
                 raise ValueError(f"配套文件不存在: {path}")
             copies[name] = path
-    inputs = [bench, *map(Path, result_paths), *copies.values()]
+    source_manifest_path = bench.parent / "manifest.json"
+    source_manifest = _read_json(source_manifest_path) if source_manifest_path.exists() else {}
+    if not isinstance(source_manifest, dict):
+        raise ValueError("源 manifest 必须为对象")
+    targetspec = deepcopy((source_manifest.get("algo") or {}).get("targetspec") or {})
+    if not isinstance(targetspec, dict):
+        raise ValueError("源 targetspec 必须为对象")
+    source_receipt_path = bench.parent / "07_release.json"
+    provenance_files = [p for p in (source_manifest_path, source_receipt_path) if p.is_file()]
+    inputs = list(dict.fromkeys([bench, *map(Path, result_paths), *copies.values(), *provenance_files]))
     report["input_files"] = [{"path": str(path.resolve()),
                               "sha256": hashlib.sha256(path.read_bytes()).hexdigest()} for path in inputs]
-    report["outputs"] = ["06_grounded_questions.json", "filter_report.json", "filter_report.md", *copies]
+    research_only = bool(release.get("override"))
+    provenance = {"operation": "filter_all_selected_systems_correct", "source_directory": str(bench.parent.resolve()),
+                  "source_benchmark": str(bench.resolve()), "source_release_eligible": release.get("eligible") is True,
+                  "research_only": research_only, "input_files": deepcopy(report["input_files"])}
+    manifest = {"schema_version": 1, "status": "research_only" if research_only else "derived_pending_quality",
+                "evaluation_mode": "unverified_research" if research_only else "release_required",
+                "algo": {"targetspec": targetspec}, "derived_from": provenance,
+                "filter": {"systems": report["systems"], "keep_easy_ratio": keep_easy_ratio, "seed": seed,
+                           "preserve_capabilities": report["preserve_capabilities"], "counts": report["counts"]}}
+    if research_only:
+        manifest["release_policy"] = {"inherited_research_only": True,
+                                      "source_status": release.get("status"),
+                                      "source_benchmark_sha256": hashlib.sha256(bench.read_bytes()).hexdigest(),
+                                      "source_receipt_sha256": hashlib.sha256(source_receipt_path.read_bytes()).hexdigest()
+                                      if source_receipt_path.is_file() else None}
+    report["derived_from"] = provenance
+    report["outputs"] = ["06_grounded_questions.json", "manifest.json", "07_release.json",
+                         "filter_report.json", "filter_report.md", *copies]
     # exist_ok=False 阻止覆盖源目录和旧导出；所有解析、参数校验在创建目录前完成。
     out_dir.mkdir(parents=True, exist_ok=False)
     (out_dir / "06_grounded_questions.json").write_text(
         json.dumps(filtered, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     for name, source in copies.items():
         shutil.copyfile(source, out_dir / name)
+    def write_json(name, value):
+        (out_dir / name).write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    write_json("manifest.json", manifest)
+    receipt = evaluate_release(out_dir)
+    receipt["derived_from"] = provenance
+    if not filtered:
+        receipt["issues"].append({"code": "empty_filtered_benchmark"})
+        receipt.update(status="failed", eligible=False)
+    if research_only:
+        if not any(issue.get("code") == "unverified_source_derivation" for issue in receipt["issues"]):
+            receipt["issues"].append({"code": "unverified_source_derivation",
+                                      "message": "A research override source cannot certify a derived release."})
+        receipt.update(status="failed", eligible=False)
+    else:
+        manifest["status"] = "done" if receipt["eligible"] else "quality_failed"
+    write_json("manifest.json", manifest)
+    write_json("07_release.json", receipt)
+    report["release"] = receipt
+    report["result_scope"] = ("research_only" if research_only else
+                              "release_eligible" if receipt["eligible"] else "filtered_release_failed")
     (out_dir / "filter_report.json").write_text(
         json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     (out_dir / "filter_report.md").write_text(_markdown_report(report), encoding="utf-8")
@@ -268,6 +329,7 @@ def main(argv=None) -> int:
     parser.add_argument("--out-dir", required=True, type=Path, help="尚不存在的输出目录")
     parser.add_argument("--corpus", type=Path, help="默认复制 bench 同目录的 05_corpus.json")
     parser.add_argument("--about", type=Path, help="默认复制 bench 同目录的 00_about.json")
+    parser.add_argument("--allow-unverified", action="store_true", help="仅历史研究：允许未取得发布资格的输入")
     args = parser.parse_args(argv)
     try:
         system_files = {}
@@ -283,10 +345,12 @@ def main(argv=None) -> int:
         paths = [args.results] if args.results else [system_files[s] for s in results]
         report = export_filtered_benchmark(args.bench, results, args.out_dir,
             keep_easy_ratio=args.keep_easy_ratio, seed=args.seed, corpus=args.corpus,
-            about=args.about, result_paths=paths, preserve_capabilities=args.preserve_capability)
+            about=args.about, result_paths=paths, preserve_capabilities=args.preserve_capability,
+            allow_unverified=args.allow_unverified)
     except (OSError, ValueError) as exc:
         parser.error(str(exc))
-    print(json.dumps({"out_dir": str(args.out_dir), **report["counts"]}, ensure_ascii=False))
+    print(json.dumps({"out_dir": str(args.out_dir), "result_scope": report["result_scope"],
+                      "release_status": report["release"]["status"], **report["counts"]}, ensure_ascii=False))
     return 0
 
 

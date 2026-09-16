@@ -269,7 +269,7 @@ class RefusalLine(ProductionLine):
             s = f"{ent} 现在的「{fld}」{q}"                          # ★现在时强预设(诱去答停前值)
         else:  # T1_adjacent(邻字段,也是兜底)
             s = f"{ent} 的「{fld}」{q}"
-        return s, []          # 拒答题不藏证据:诱饵【要】在语料里;藏的是"不可答",本就不写题面
+        return s + "？", []    # 时间/现在时与普通字段查询均为合同中的必需槽位。
 
     # ── ★命门3 接地:验【诱饵就近探针 E】(题够诱、E 在场)+【真答案不误接 F】(拒答成立)。骑 ABS 反向判先例 ──
     def ground(self, order, evidence_docs, all_signal_text=""):

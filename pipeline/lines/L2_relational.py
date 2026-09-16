@@ -102,6 +102,38 @@ def _l2_difficulty(hops: int, cross_week: bool) -> str:
     return "T2" if cross_week else "T1"
 
 
+def relation_path_metrics(ws: WorldState, start: str, path: list[str], at_week: int) -> dict:
+    """Measure resolved reads, without treating identity reads as graph edges.
+
+    These are structural metrics, not a claim that every cited document is
+    necessary. Existing hops/difficulty fields remain historical definitions.
+    """
+    from pipeline.value_types import field_schema
+    evidence = gt_multihop(ws, start, path, at_week).get("path_evidence", [])
+    typed = bool(ws.world_blueprint and not ws.world_blueprint.get("legacy_adapter"))
+    identities, edges, visited = [], [], {start}
+    for index, step in enumerate(evidence):
+        source, target = step["entity"], step["value"]
+        visited.add(source)
+        if target == source:
+            identities.append(index)
+            continue
+        declaration = field_schema(ws, source, step["field"]) if typed else {}
+        if target in ws.entities:
+            edges.append({"from": source, "field": step["field"], "to": target,
+                          "declared_reference": declaration.get("kind") == "reference" if typed else None})
+            visited.add(target)
+    sessions = sorted({step["set_session"] for index, step in enumerate(evidence) if index not in identities})
+    return {"path_metrics_version": 1, "field_reads": len(evidence), "relation_hops": len(edges),
+            "declared_reference_hops": sum(edge["declared_reference"] is True for edge in edges) if typed else None,
+            "undeclared_relation_hops": sum(edge["declared_reference"] is False for edge in edges) if typed else None,
+            "identity_reads": len(identities), "identity_read_indices": identities,
+            "distinct_entities": len(visited), "resolved_relation_edges": edges,
+            "non_identity_read_sessions": sessions,
+            "relation_basis": "resolved_entity_values",
+            "difficulty_basis": "legacy_field_reads"}
+
+
 def _apportion_by_tier(tagged: list[dict], ratio: dict, target: int) -> list[dict]:
     """按档配额(如 T1:T2:T3=3:3:2)把 target 分到各难度档;某档供给不足从余档补(高配额优先)。
     与 L1 配额驱动同款:ratio 是【配比权重】非硬上限。tagged 每项 aux.difficulty 已 stamp。"""
@@ -251,11 +283,20 @@ class RelationalLine(ProductionLine):
             last = path[-1] if path else None               # ★Fix2:末跳字段的 kind 决定疑问词(样本值=gt 答案)
             aux["hops"] = hops
             aux["difficulty"] = _l2_difficulty(hops, cross)
+            aux.update(relation_path_metrics(ws, o.entity, path, aux.get("at_week")))
             aux["bridge_hidden"] = aux["difficulty"] != "T1"    # ★T2/T3 桥须隐藏(渲染侧钩子:桥事实不与起点同现)
             aux["distractor_n"] = self._answer_siblings(ws, o, path)
-            aux.setdefault("ans_kind", field_kind(last, o.gt, profile))
+            from pipeline.value_types import field_schema
+            evidence = gt_multihop(ws, o.entity, path, aux.get("at_week")).get("path_evidence", [])
+            terminal = evidence[-1] if evidence else {}
+            declaration = field_schema(ws, terminal.get("entity"), last, wp)
+            if declaration:
+                aux["value_schema"] = declaration
+            aux.setdefault("ans_kind", declaration.get("kind") or field_kind(last, o.gt, profile))
             aux["time_unit"] = ws.period_unit()
             tagged.append({"line": self.id, "capability": "L2_multihop", "entity": o.entity,
+                           "entity_type": ws.entity_types.get(o.entity),
+                           "answer_entity_type": ws.entity_types.get(terminal.get("entity")), "answer_field": last,
                            "field": o.field, "gt": o.gt, "evidence_sessions": o.evidence_sessions, "aux": aux})
         # 同一条确定性良定义合同最终还会在全局边 A 闸复核；这里先过滤，避免已知
         # 会被拒绝的候选占掉 target 名额，造成“全池 66 条合法却只选中 3 条”的假短缺。
@@ -342,7 +383,14 @@ class RelationalLine(ProductionLine):
         if mh.get("answer") in (INSUFFICIENT, INVALID, None) \
                 or len(mh.get("path_evidence", [])) < len(path):
             return ("drop", f"链在第{W}周断裂于 {mh.get('broke_at')}(该周此关系不成立)")
-        if _norm(mh["answer"]) != _norm(gold):
+        from pipeline.value_types import field_schema, values_equal, ValueComparisonError
+        terminal = mh["path_evidence"][-1]
+        try:
+            declaration = field_schema(ws, terminal["entity"], terminal["field"]) or aux.get("value_schema") or {}
+            equal = values_equal(mh["answer"], gold, declaration)
+        except ValueComparisonError:
+            equal = False
+        if not equal:
             return ("drop", f"gold 与世界@第{W}周重算不符:世界='{mh['answer']}' gold='{gold}'(查无实据/锚不统一)")
 
         # ── INV-4 撤下:桥指代唯一已由【名键结构(无同名实体)+ INV-2 链不断 + INV-3 唯一重算】共同保证 ──

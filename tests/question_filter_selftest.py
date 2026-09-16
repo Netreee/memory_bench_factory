@@ -8,6 +8,7 @@ from contextlib import redirect_stderr, redirect_stdout
 import copy
 import importlib.util
 import io
+import hashlib
 import json
 from pathlib import Path
 import subprocess
@@ -20,6 +21,7 @@ from unittest.mock import Mock, patch
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 from eval.question_filter import export_filtered_benchmark, filter_questions, load_results, question_key
+from eval.grading import JUDGE_VERSION
 
 
 def question(number=0):
@@ -32,7 +34,14 @@ def question(number=0):
 
 def record(q, correct=True, **changes):
     """模拟 harness 逐题判分，不执行模型调用。"""
-    return {**copy.deepcopy(q), "pred": "回答", "judgeable": True, "correct": correct, **changes}
+    grade = {"version": JUDGE_VERSION, "verdict": "correct" if correct is True else "incorrect" if correct is False else "error",
+             "correct": correct, "path": "offline_fixture", "reason": "test fixture"}
+    return {**copy.deepcopy(q), "pred": "回答", "judgeable": True, "correct": correct, "judgement": grade, **changes}
+
+
+def set_correct(row, correct):
+    row["correct"] = correct
+    row["judgement"].update(correct=correct, verdict="correct" if correct else "incorrect")
 
 
 class QuestionFilterTest(unittest.TestCase):
@@ -41,9 +50,9 @@ class QuestionFilterTest(unittest.TestCase):
         self.results = {s: [record(q) for q in self.qs] for s in ("A", "B", "C")}
 
     def test_remove_only_all_correct(self):
-        self.results["B"][1]["correct"] = False
+        set_correct(self.results["B"][1], False)
         for rows in self.results.values():
-            rows[2]["correct"] = False
+            set_correct(rows[2], False)
         kept, report = filter_questions(self.qs, self.results)
         self.assertEqual(kept, self.qs[1:3])
         self.assertEqual(report["counts"]["removed_easy"], 8)
@@ -133,7 +142,7 @@ class QuestionFilterTest(unittest.TestCase):
         self.assertEqual(kept, [])
         self.assertEqual(report["counts"]["all_correct"], 0)
         for row in self.results["A"]:
-            row["correct"] = False
+            set_correct(row, False)
         kept, _ = filter_questions(self.qs, self.results)
         self.assertEqual(kept, self.qs)
 
@@ -150,7 +159,7 @@ class QuestionFilterTest(unittest.TestCase):
         self.assertEqual(report["preserve_capabilities"], ["IE"])
 
     def test_reports_count_every_question_exactly_once(self):
-        self.results["A"][0]["correct"] = False
+        set_correct(self.results["A"][0], False)
         self.results["C"].pop()
         _, report = filter_questions(self.qs, self.results, keep_easy_ratio=0.25)
         self.assertEqual(report["counts"], {"input": 10, "kept": 4, "removed_easy": 6,
@@ -176,10 +185,17 @@ class FileFixture(unittest.TestCase):
     def run_cli(self, *args):
         """用独立 Python 进程验证用户可直接执行的离线命令。"""
         return subprocess.run([sys.executable, "-X", "utf8", "-m", "eval.question_filter",
-            "--bench", str(self.bench), *map(str, args)], cwd=ROOT, capture_output=True, text=True, encoding="utf-8")
+            "--bench", str(self.bench), "--allow-unverified", *map(str, args)], cwd=ROOT, capture_output=True, text=True, encoding="utf-8")
 
 
 class FileAndCliTest(FileFixture):
+    def test_unreleased_input_is_blocked_without_explicit_override(self):
+        from pipeline.quality import ReleaseError
+        out = self.base / "not-released"
+        with self.assertRaises(ReleaseError):
+            export_filtered_benchmark(self.bench, self.results, out)
+        self.assertFalse(out.exists())
+
     def test_aggregate_cli_exports_reusable_bundle_and_hashes(self):
         before = {p: p.read_bytes() for p in self.base.iterdir()}
         out = self.base / "filtered"
@@ -220,7 +236,7 @@ class FileAndCliTest(FileFixture):
     def test_existing_directory_cannot_overwrite_inputs(self):
         before = self.bench.read_bytes()
         with self.assertRaises(FileExistsError):
-            export_filtered_benchmark(self.bench, self.results, self.base)
+            export_filtered_benchmark(self.bench, self.results, self.base, allow_unverified=True)
         self.assertEqual(self.bench.read_bytes(), before)
 
     def test_invalid_ratio_creates_no_output(self):
@@ -265,7 +281,7 @@ class MultiSystemIntegrationTest(FileFixture):
         scored = self.qs[:-1]
         systems = SimpleNamespace(make_system=Mock(return_value=Mock()))
         argv = ["multi_system", "--bench", str(self.bench), "--corpus", str(self.base / "05_corpus.json"),
-                "--systems", "fake1,fake2", "--keep-easy-ratio", "0.5"]
+                "--systems", "fake1,fake2", "--keep-easy-ratio", "0.5", "--allow-unverified"]
         with patch.dict(sys.modules, {"eval.memory_systems": systems}), \
              patch.object(module, "ROOT", self.base), \
              patch.object(module, "load_corpus", return_value=[("s1", "2026-09-01", "context")]), \
@@ -291,6 +307,121 @@ class MultiSystemIntegrationTest(FileFixture):
                 module.main()
             corpus.assert_not_called()
             evaluate.assert_not_called()
+
+    def test_release_guard_runs_before_solver(self):
+        from pipeline.quality import ReleaseError
+        module = self.load_harness()
+        with patch.object(sys, "argv", ["multi_system", "--bench", str(self.bench), "--corpus", str(self.base / "05_corpus.json")]), \
+             patch.object(module, "run_system") as evaluate, patch.object(module, "load_corpus") as corpus:
+            with self.assertRaises(ReleaseError):
+                module.main()
+            evaluate.assert_not_called()
+            corpus.assert_not_called()
+
+
+class DerivedReleaseTest(unittest.TestCase):
+    def make_source(self, directory, *, floor=1):
+        from pipeline.corpus_contract import review_documents, attach_receipts
+        from pipeline.question_contract import attach_question_contract, bind_question_world
+        from pipeline.quality import evaluate_release
+        from pipeline.world_state import WorldState, Timeline, Op, SET, UPDATE
+        blueprint = {"entity_types": [{"id": "record", "fields": [{"name": "状态", "kind": "status"}]}]}
+        ws = WorldState({"测试报告": {"状态": Timeline([Op(0, "2025-01-06", SET, "待接收"),
+                        Op(1, "2025-01-13", UPDATE, "已登记", "待接收")])}}, n_sessions=2,
+                        entity_types={"测试报告": "record"}, world_blueprint=blueprint)
+        wp = {"world_blueprint": blueprint, "active_lines": [{"line": "L1_timeline", "weight": 1}]}
+        orders = [
+            {"capability": "IE", "gt": {"value": "待接收", "at_week": 0},
+             "aux": {"at_week": 0, "value": "待接收"}, "evidence_sessions": [0]},
+            {"capability": "KU", "gt": "已登记", "aux": {"at_week": 1}, "evidence_sessions": [1]},
+        ]
+        source, final, sessions = [], [], []
+        for order in orders:
+            order.update(line="L1_timeline", entity="测试报告", field="状态")
+            q = attach_question_contract(bind_question_world(order, ws), wp)
+            q["question"] = q["question_contract"]["canonical_question"]
+            source.append(q)
+            ids = [f"doc{s}" for s in q["evidence_sessions"]]
+            final.append({**q, "candidate_evidence_doc_ids": ids, "evidence_doc_ids": ids})
+        reviewer = SimpleNamespace(chat_json=Mock(return_value={"verdict": "pass", "unsupported_claims": []}))
+        for session, value in enumerate(("待接收", "已登记")):
+            docs = [{"doc_id": f"doc{session}", "is_filler": False, "content": f"测试报告的状态为{value}。"}]
+            review = review_documents(reviewer, ws, session, docs)
+            attach_receipts(docs, review, session)
+            sessions.append({"session_id": session, "docs": docs})
+        target = {"min_questions": floor, "per_line_min": {"L1_timeline": floor}, "requested_questions": 2}
+        artifacts = {"01_whitepaper.json": wp, "02_world.json": ws.to_dict(), "04_questions.json": source,
+                     "06_grounded_questions.json": final, "05_corpus.json": {"corpus": {"sessions": sessions}},
+                     "00_about.json": {}, "manifest.json": {"status": "done", "algo": {"targetspec": target}}}
+        for name, content in artifacts.items():
+            (directory / name).write_text(json.dumps(content, ensure_ascii=False), encoding="utf-8")
+        receipt = evaluate_release(directory)
+        self.assertTrue(receipt["eligible"], receipt["issues"])
+        (directory / "07_release.json").write_text(json.dumps(receipt, ensure_ascii=False), encoding="utf-8")
+        results = {system: [record(final[0]), record(final[1], correct=False)] for system in ("A", "B")}
+        return directory / "06_grounded_questions.json", results, target
+
+    def test_valid_subset_has_own_release_and_preserves_bound_inputs(self):
+        from pipeline.quality import require_release, INPUTS
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp)
+            bench, results, target = self.make_source(source)
+            old_receipt = (source / "07_release.json").read_bytes()
+            out = source / "filtered"
+            report = export_filtered_benchmark(bench, results, out)
+            self.assertTrue(require_release(out / "06_grounded_questions.json")["eligible"])
+            self.assertEqual(report["result_scope"], "release_eligible")
+            self.assertEqual(report["release"]["checks"]["coverage"]["final_count"], 1)
+            manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(manifest["algo"]["targetspec"], target)
+            for name in INPUTS:
+                if name != "06_grounded_questions.json":
+                    self.assertEqual((out / name).read_bytes(), (source / name).read_bytes())
+            self.assertNotEqual((out / "07_release.json").read_bytes(), old_receipt)
+            expected_hash = hashlib.sha256(old_receipt).hexdigest()
+            self.assertIn({"path": str((source / "07_release.json").resolve()), "sha256": expected_hash},
+                          manifest["derived_from"]["input_files"])
+
+    def test_floor_violation_and_empty_subset_fail_release(self):
+        from pipeline.quality import require_release, ReleaseError
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp)
+            bench, results, target = self.make_source(source, floor=2)
+            for empty in (False, True):
+                if empty:
+                    for rows in results.values():
+                        set_correct(rows[1], True)
+                out = source / ("empty" if empty else "below-floor")
+                report = export_filtered_benchmark(bench, results, out)
+                self.assertEqual(report["result_scope"], "filtered_release_failed")
+                self.assertFalse(report["release"]["eligible"])
+                self.assertIn("empty_filtered_benchmark" if empty else "delivery_target_unmet",
+                              {issue["code"] for issue in report["release"]["issues"]})
+                manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+                self.assertEqual(manifest["algo"]["targetspec"], target)
+                with self.assertRaises(ReleaseError):
+                    require_release(out / "06_grounded_questions.json")
+
+    def test_research_source_cannot_upgrade_on_export_or_recheck(self):
+        from pipeline.quality import require_release, evaluate_release, ReleaseError
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp)
+            bench, results, _ = self.make_source(source)
+            (source / "07_release.json").unlink()
+            out = source / "research"
+            report = export_filtered_benchmark(bench, results, out, allow_unverified=True)
+            self.assertEqual(report["result_scope"], "research_only")
+            self.assertFalse(report["release"]["eligible"])
+            manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+            self.assertTrue(manifest["release_policy"]["inherited_research_only"])
+            self.assertNotIn(manifest["status"], ("rejected", "manual_failed"))
+            repeated = evaluate_release(out)
+            self.assertFalse(repeated["eligible"])
+            self.assertIn("unverified_source_derivation", {issue["code"] for issue in repeated["issues"]})
+            self.assertNotIn("explicit_semantic_rejection", {issue["code"] for issue in repeated["issues"]})
+            (out / "07_release.json").write_text(json.dumps(repeated), encoding="utf-8")
+            with self.assertRaises(ReleaseError):
+                require_release(out / "06_grounded_questions.json")
 
 
 if __name__ == "__main__":

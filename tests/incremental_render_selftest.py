@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 import sys
+from copy import deepcopy
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from pipeline.world_state import WorldState, Timeline, Op, SET, _date_of, name_collisions
@@ -123,6 +124,39 @@ ck("delta scope:self-relation 固定补 source owner",
    ["E1部", 2] in touched_pairs and ["E0部", 2] not in touched_pairs)
 ck("delta scope:新实体不重复进入 old-entity 精准 pair",
    all(pair[0] != "E3部" for pair in touched_pairs))
+
+# ── ⑤ release receipt 对增量扩容的约束（固定桩仅模拟审阅通过，不证明模型能力） ──
+from pipeline.corpus_contract import review_documents, attach_receipts, validate_corpus
+
+
+class _ReviewPass:
+    def chat_json(self, step, *args, **kwargs):
+        assert step == "corpus.review"
+        return {"verdict": "pass", "unsupported_claims": []}
+
+
+receipt_ws = _ws(1, 2)
+receipt_corpus = {"sessions": []}
+for sid in range(2):
+    documents = [{"doc_id": f"receipt-{sid}", "title": "当期记录",
+                  "content": f"E0部本期f为v0_{sid}。"}]
+    report = review_documents(_ReviewPass(), receipt_ws, sid, documents)
+    attach_receipts(documents, report, sid)
+    receipt_corpus["sessions"].append({"session_id": sid, "date": _date_of(sid), "docs": documents})
+ck("receipt:同一世界的固定审阅样例可验证", validate_corpus(receipt_ws, receipt_corpus)["status"] == "passed")
+untouched = deepcopy(receipt_corpus)
+render_corpus({"domain_profile": {}, "quality_contract": {"corpus_review": True}},
+              receipt_ws, 0, tracer=_BoomTracer(), corpus=receipt_corpus, done_weeks={0, 1},
+              save_cb=lambda: None, log=lambda *a: None, only_entities={"GHOST"})
+ck("receipt:同世界无事实增量保留旧正文与审阅记录", receipt_corpus == untouched)
+ck("receipt:同世界增量后审阅仍有效", validate_corpus(receipt_ws, receipt_corpus)["status"] == "passed")
+expanded_ws = deepcopy(receipt_ws)
+expanded_ws.entities["新部门"] = {"f": Timeline([Op(0, _date_of(0), SET, "新增值", None)])}
+expanded_review = validate_corpus(expanded_ws, receipt_corpus)
+stale_ids = {issue.get("doc_id") for issue in expanded_review["issues"]
+             if issue.get("code") == "missing_or_stale_document_review"}
+ck("receipt:扩容不能静默复用旧完整context审阅", stale_ids == {"receipt-0", "receipt-1"})
+ck("receipt:检测扩容失效不改写旧语料", receipt_corpus == untouched)
 
 npass = sum(1 for ok, _ in checks if ok)
 for ok, name in checks:

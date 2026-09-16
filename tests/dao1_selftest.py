@@ -657,12 +657,14 @@ ord49 = {"line": "L5_conflict", "capability": "L5_conflict", "entity": "周涛",
                               "authoritative_source": "官方通报", "rumor_value": "周正", "rumor_source": "走廊传闻"}}
 phrased = phrase_questions([ord49], {"domain_profile": {}}, _PronounTracer(), log=lambda *a: None)
 ck("⑫a phraser 丢主语→退回含『周涛』的 intent(不出悬空代词题)", phrased and "周涛" in phrased[0]["question"])
-# ⑫b 实体名在题面里则不动(正常 phrase 不误伤)
+# ⑫b 主语存在仍须保住时点，不能沿用“主语在就全部放行”的旧合同。
 class _OkTracer:
     def chat_json(self, tag, messages, **kw):
         return {"question": "周涛的督导合伙人按官方记录是哪位？"} if tag == "phrase" else {"docs": []}
 ph_ok = phrase_questions([ord49], {"domain_profile": {}}, _OkTracer(), log=lambda *a: None)
-ck("⑫b 正常含主语题面不被兜底改写", ph_ok[0]["question"] == "周涛的督导合伙人按官方记录是哪位？")
+ck("⑫b 含主语但丢时点→恢复第5周且保留订单",
+   len(ph_ok) == 1 and "第5周" in ph_ok[0]["question"]
+   and ph_ok[0]["question_validation"]["mode"] == "canonical_template")
 # ⑫c 润色协议失败不应杀死已经通过良定义闸的订单；产线 intent 是题面真源。
 class _EmptyPhraseTracer:
     def chat_json(self, tag, messages, **kw):
@@ -670,10 +672,11 @@ class _EmptyPhraseTracer:
 ph_empty = phrase_questions([ord49], {"domain_profile": {}}, _EmptyPhraseTracer(), log=lambda *a: None)
 ck("⑫c phraser 空正文→保留完整 intent，不侵蚀订单 floor",
    len(ph_empty) == 1 and "周涛" in ph_empty[0]["question"])
-# ⑫c 协议加属性归属声明(v4)
+# ⑫d v5 保留属性归属约束，并明示主答案与附带事实的评分边界。
 from pipeline.factory import ANSWER_PROTOCOL as _AP
-ck("⑫d 协议 v4 + 属性归属声明", _AP["version"] == 4 and _AP.get("attribute_ownership_no_fold") is True
-   and any("不得经关系链折算" in r for r in _AP["rules"]))
+ck("⑫d 协议 v5 + 属性归属和评分范围声明", _AP["version"] == 5 and _AP.get("attribute_ownership_no_fold") is True
+   and any("不得经关系链折算" in r for r in _AP["rules"])
+   and _AP.get("scoring_scope") == "primary_answer" and _AP.get("additional_facts") == "not_assessed")
 
 # ════════ ⑦ L4 _choice_field 叠词去重 ════════
 # typed world 冻结后仍需允许 L5 派生“只增证据”侧信道；不得改 canonical 轨迹。

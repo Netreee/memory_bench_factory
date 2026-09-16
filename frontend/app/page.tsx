@@ -39,7 +39,7 @@ export default function Home() {
   );
 
   if (surface === 'studio') {
-    return <LiveStudio onReplay={() => setSurface('replay')} />;
+    return <LiveStudio onShowcase={() => setSurface('replay')} />;
   }
 
   return <ReplayDeck onExit={() => setSurface('studio')} />;

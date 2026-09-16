@@ -83,13 +83,12 @@ class ConsolidationLine(ProductionLine):
     requires: list[str] = ["multi_event_timelines"]   # 需演化字段(趋势/变动才有料),口径同 L3
 
     def feasible(self, ws, profile: dict) -> tuple[bool, str]:
-        """有【imprint 种下的】趋势字段 ∨ 有跨实体对比机会 → 可产。两者都缺 → 跳(避免无效产 0 单)。"""
-        has_s1 = bool(getattr(ws, "_trended_fields", None))   # ★只认 imprint planted 的趋势(见 _enum_trend)
-        has_s2 = any(len(c) >= 2 for c in self._field_candidates(ws).values())
-        tags = (["S1趋势"] if has_s1 else []) + (["S2对比"] if has_s2 else [])
+        """Use the actual candidate constructors, including trend and margin rules."""
+        n_s1, n_s2 = len(self._enum_trend(ws)), len(self._enum_compare(ws))
+        tags = ([f"S1趋势={n_s1}"] if n_s1 else []) + ([f"S2对比={n_s2}"] if n_s2 else [])
         if tags:
             return True, f"可产归纳型:{'/'.join(tags)}"
-        return False, "无清晰趋势字段、无跨实体对比机会(长跨度归纳无料)"
+        return False, "趋势候选=0、比较候选=0：未满足已声明趋势准入或变更次数差距；不修改世界补造供给"
 
     # prepare:无 —— L7 不造新世界,只对既有演化字段做整段归纳
 
@@ -103,6 +102,8 @@ class ConsolidationLine(ProductionLine):
         return owners
 
     def enumerate(self, ws, target: int = 200, wp=None) -> list[dict]:
+        if target <= 0:
+            return []
         rng = random.Random(_SEED)
         out = self._enum_trend(ws) + self._enum_compare(ws)
         rng.shuffle(out)

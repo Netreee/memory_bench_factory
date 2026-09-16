@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from collections import defaultdict
@@ -39,7 +40,8 @@ from eval.embed_cache import cached_embed, cache_size
 from eval import qa_cache
 from eval.question_filter import export_filtered_benchmark, validate_options as validate_filter_options
 from eval.baseline_r1 import unified_answer
-from eval.judge import judge, judge_answer, is_judgeable, gold_display, judge_spec, classify_refusal, judge_l2_partial
+from eval.judge import judge, judge_record, judgement, is_judgeable, gold_display, judge_spec, classify_refusal, literal_match
+from eval.grading import JUDGE_VERSION, is_scored
 
 # ── 默认评测集(office_v3) ───────────────────────────────────────────────────
 DEFAULT_BENCH = ROOT / "output" / "factory_v2_office_v3" / "06_questions.json"
@@ -119,14 +121,17 @@ class _EvalProbe:
         with self._lk:
             sd = self._d["sys"][name]
             sd["judged"] = i
-            if rec.get("correct") is not None:
+            if is_scored(rec):
                 sd["j_real"] = sd.get("j_real", 0) + 1
                 if rec["correct"]:
                     sd["correct"] = sd.get("correct", 0) + 1
+            else:
+                sd["incomplete"] = sd.get("incomplete", 0) + 1
             self._feed.append({
                 "s": name, "i": i, "ln": (rec.get("line") or "")[:2],
                 "cap": rec.get("capability", ""),
                 "ok": rec.get("correct"),
+                "verdict": (rec.get("judgement") or {}).get("verdict"),
                 "pred": str(rec.get("pred", ""))[:40],
                 "gold": str(rec.get("gold_set", ""))[:40],
             })
@@ -137,6 +142,7 @@ class _EvalProbe:
         sd["status"] = "done"
         sd["elapsed_s"] = round(elapsed, 1)
         sd["acc"] = agg["overall"].get("acc")
+        sd["incomplete"] = agg.get("n_incomplete", 0)
         sd["by_line"] = {ln: d["acc"] for ln, d in agg.get("by_line", {}).items()
                          if d.get("acc") is not None}
         self._flush()
@@ -174,7 +180,7 @@ def header(sid, date) -> str:
 
 def load_protocol(about_path: Path) -> str:
     """读 00_about.json 的 answer_protocol,渲染成给被测系统的【答题约定】文本。
-    这是随题库交付的作答契约(carry-forward / 趋势=首末净方向 / 两类拒答),
+    这是随题库交付的作答契约；v5 区分未记录、已停统与范围外，旧协议保持兼容。
     三系统同等注入 → 公平;给规则不等于给答案。读不到则返回空串(不注入)。"""
     try:
         ap = json.loads(Path(about_path).read_text(encoding="utf-8")).get("answer_protocol", {})
@@ -187,8 +193,11 @@ def load_protocol(about_path: Path) -> str:
         out.append(f"- {r}")
     sm = ap.get("gold_sentinel_map", {})
     if sm:
-        out.append(f"- 拒答措辞:从未涉及→『{sm.get('INSUFFICIENT', '无此项')}』;"
-                   f"已停统→『{sm.get('forgotten=true', '已停止统计')}』。")
+        refusal = (f"- 拒答措辞:从未涉及→『{sm.get('INSUFFICIENT', '无此项')}』;"
+                   f"已停统→『{sm.get('forgotten=true', '已停止统计')}』")
+        if "out_of_scope" in sm:
+            refusal += f";超出记录时间范围→『{sm['out_of_scope']}』"
+        out.append(refusal + "。")
     # 属性归属(L6 拒答题 gold 所依赖的约定;披露=公平测试'能否遵守约定',非泄答案)
     out.append("- 个人/角色不具备案件级属性;问及某实体它本身没有的属性 → 答『无此项/查无』,"
                "不得经关系链折算到关联实体的值。")
@@ -285,24 +294,35 @@ def build_full_context(docs: list, budget: int = FULLCTX_CHAR_BUDGET) -> tuple:
 # ─────────────────────────────────────────────────────────────────────────────
 def run_system(name: str, questions: list, sys_instance, workers: int = WORKERS,
                verbose: bool = True, protocol: str = "",
-               probe=None, bench_id: str = None, resume: bool = True) -> list:
+               probe=None, bench_id: str = None, resume: bool = True,
+               cache_context: dict | None = None) -> list:
     """对一个系统跑全部题,返回 records(每题一条,含 pred/correct/judgeable)。
     sys_instance:已 ingest 好的 MemorySystem 实例。
     protocol:随题库交付的【答题约定】,同等注入三系统的作答提示。
     bench_id+resume:QA 断点续传——已判过的题从盘加载、跳过(干净结果才入盘,错的下轮重试)。"""
-    done = qa_cache.load(bench_id, name) if (resume and bench_id) else {}
+    context = {**(cache_context or {}), "model": getattr(config, "MODEL", None), "protocol": protocol,
+               "system_class": type(sys_instance).__module__ + "." + type(sys_instance).__qualname__,
+               "top_k": TOP_K, "qa_max_tokens": QA_MAX_TOKENS, "fullctx_budget": FULLCTX_CHAR_BUDGET,
+               "api_endpoint_hash": qa_cache.digest(getattr(config, "BASE_URL", None)),
+               "system_env_hash": qa_cache.digest({k: v for k, v in os.environ.items()
+                   if k.startswith(("MEM0_", "MEMOS_", "ZEP_", "SIMPLEMEM_", "AMEM_", "EMBED_", "LLM_"))})}
+    # A caller that cannot identify its corpus must not reuse cached answers.
+    bid = qa_cache.bench_id(questions, {"supplied_id": bench_id, **context}) if bench_id and context.get("corpus_hash") else None
+    done = qa_cache.load(bid, name) if (resume and bid) else {}
+    predictions = qa_cache.load_predictions(bid, name) if (resume and bid) else {}
     if verbose:
         print(f"\n[{name}] 提问 {len(questions)} 题 ..."
               + (f"(断点续传:已有 {len(done)} 题,本轮跳过)" if done else ""))
 
     # ── 每题的求解函数(题与题独立 → pmap 并行) ──
     def solve(q: dict) -> dict:
-        qh = qa_cache.qhash(q)
+        qh = qa_cache.qhash(q, context)
+        prediction_key = qa_cache.qhash(q, context, grading=False)
         if qh in done:                       # 续传:已判过 → 直接用盘上结果,不调 LLM
             r = dict(done[qh]); r["_qh"] = qh; r["_resumed"] = True
             return r
         mode, _, _ = judge_spec(q)
-        rec = {
+        rec = {**q,
             "_qh": qh,
             "qid": q.get("qid"),
             "line": q["line"], "capability": q["capability"],
@@ -312,15 +332,22 @@ def run_system(name: str, questions: list, sys_instance, workers: int = WORKERS,
             "gold_set": gold_display(q), "mode": mode,
             "judgeable": is_judgeable(q),
         }
+        if prediction_key in predictions:
+            rec.update({k: v for k, v in predictions[prediction_key].items() if k in ("pred", "bridge_extracted")})
+            rec["_prediction_resumed"] = True
+            return rec
         try:
-            context = sys_instance.retrieve(q["question"], top_k=TOP_K)
-            rec["pred"] = unified_answer(q["question"], context, protocol=protocol,
+            retrieved_context = sys_instance.retrieve(q["question"], top_k=TOP_K)
+            rec["pred"] = unified_answer(q["question"], retrieved_context, protocol=protocol,
                                          max_tokens=QA_MAX_TOKENS)
             diag = sys_instance.get_diagnostics()
             if diag.get("bridge"):
                 rec["bridge_extracted"] = diag["bridge"]
+            if bid:
+                qa_cache.append_prediction(bid, name, {**rec, "_qh": prediction_key})
         except Exception as e:
             rec["pred"] = f"[SOLVE_ERROR:{type(e).__name__}:{str(e)[:50]}]"
+            rec["error"] = f"{type(e).__name__}:{str(e)[:160]}"
         return rec
 
     if probe:
@@ -341,27 +368,30 @@ def run_system(name: str, questions: list, sys_instance, workers: int = WORKERS,
             return rec
         pred = rec["pred"]
         if not rec["judgeable"]:
-            rec["correct"] = None
+            grade = judgement("unjudgeable", "contract", "missing or unsupported grading contract")
         elif isinstance(pred, str) and pred.startswith("[") and "ERROR" in pred:
-            rec["correct"] = False
+            grade = judgement("error", "solver", "solver failed")
             rec["error"] = pred
         else:
             try:
-                qd = {"capability": rec["capability"], "gt": rec.get("gt"),
-                      "question": rec["question"], "aux": rec.get("aux"),
-                      "strict_scoring": rec.get("strict_scoring")}
-                rec["correct"] = bool(judge_answer(qd, pred, use_llm=True))
+                grade = judge_record(rec, pred, use_llm=True)
                 if rec["capability"] == "L6_refusal":       # ★三分桶(报表用):refuse/lure/other
                     lure = ((rec.get("aux") or {}).get("lure") or {}).get("value")
                     rec["refusal_bucket"] = classify_refusal(pred, lure)
                 if rec["capability"] == "L2_multihop":      # ★L2 部分 credit:gt=1.0 / 桥=0.5 / 否则 0
-                    rec["partial"] = judge_l2_partial(qd, pred, use_llm=True)
+                    # Reuse the primary grade; never issue a second judge call.
+                    rec["partial"] = (1.0 if grade["correct"] is True else
+                                      0.5 if grade["correct"] is False and literal_match(pred, [(rec.get("aux") or {}).get("bridge")]) else
+                                      0.0 if grade["correct"] is False else None)
             except Exception as e:
-                rec["correct"] = False
-                rec["judge_error"] = f"{type(e).__name__}:{str(e)[:60]}"
+                grade = judgement("error", "judge_exception", f"{type(e).__name__}:{str(e)[:160]}")
+        rec["judgement"] = grade
+        rec["correct"] = grade["correct"]
+        if grade["verdict"] == "error":
+            rec["judge_error"] = grade["reason"]
         # 干净结果才入盘续传;带 error/judge_error 的(端点抖动所致)不存 → 下轮重试
-        if bench_id and "error" not in rec and "judge_error" not in rec:
-            qa_cache.append(bench_id, name, rec)
+        if bid and is_scored(rec):
+            qa_cache.append(bid, name, rec)
         return rec
 
     if probe:
@@ -398,11 +428,11 @@ def run_system(name: str, questions: list, sys_instance, workers: int = WORKERS,
 # ─────────────────────────────────────────────────────────────────────────────
 def aggregate(records: list) -> dict:
     """按 line / capability 聚合。只统计 judgeable 题。"""
-    jr = [r for r in records if r.get("judgeable")]
+    jr = [r for r in records if r.get("judgeable") and is_scored(r)]
     n_unjudge = len(records) - len(jr)
 
     def acc(rs):
-        rs = [r for r in rs if r.get("judgeable")]
+        rs = [r for r in rs if r.get("judgeable") and is_scored(r)]
         if not rs:
             return {"n": 0, "correct": 0, "acc": None}
         c = sum(1 for r in rs if r["correct"])
@@ -417,6 +447,8 @@ def aggregate(records: list) -> dict:
         "by_line": by_line,
         "by_capability": by_cap,
         "n_unjudgeable": n_unjudge,
+        "n_incomplete": n_unjudge,
+        "n_errors": sum(1 for r in records if (r.get("judgement") or {}).get("verdict") == "error"),
     }
 
 
@@ -467,13 +499,18 @@ def discrimination_summary(results: dict, sys_names: list) -> dict:
         return d["acc"] if d and d["acc"] is not None else None
 
     lines = _present_lines(results, sys_names)
+    overall = {s: results[s]["agg"]["overall"]["acc"] for s in sys_names}
+    incomplete = any(results[s]["agg"].get("n_incomplete", 0) or overall[s] is None for s in sys_names)
+    if incomplete:
+        return {"status": "incomplete", "spreads": {ln: None for ln in lines}, "ranking": [],
+                "overall": overall, "ov_spread": None, "max_line_spread": None,
+                "headroom": None, "best": None, "discriminates": None, "lines": lines}
     spreads = {}
     for ln in lines:
         accs = [la(s, ln) for s in sys_names]
         accs = [a for a in accs if a is not None]
         spreads[ln] = (max(accs) - min(accs)) if len(accs) >= 2 else None
 
-    overall = {s: (results[s]["agg"]["overall"]["acc"] or 0.0) for s in sys_names}
     ranking = sorted(sys_names, key=lambda s: overall[s], reverse=True)
     ov_vals = [overall[s] for s in sys_names]
     ov_spread = (max(ov_vals) - min(ov_vals)) if len(ov_vals) >= 2 else 0.0
@@ -483,7 +520,7 @@ def discrimination_summary(results: dict, sys_names: list) -> dict:
     max_line_spread = max((v for v in spreads.values() if v is not None), default=0.0)
     discriminates = (ov_spread >= 0.10) or (max_line_spread >= 0.20)
 
-    return {"spreads": spreads, "ranking": ranking, "overall": overall,
+    return {"status": "complete", "spreads": spreads, "ranking": ranking, "overall": overall,
             "ov_spread": ov_spread, "max_line_spread": max_line_spread,
             "headroom": headroom, "best": best, "discriminates": discriminates,
             "lines": lines}
@@ -531,6 +568,9 @@ def print_table(results: dict, sys_names: list):
     # 区分度
     ds = discrimination_summary(results, sys_names)
     print("\n--- ★ 区分度摘要 ---")
+    if ds["status"] == "incomplete":
+        print("  待复核：存在未完成判分，暂不计算系统排名或题库难度。")
+        return
     print("  总分排名: " + " > ".join(
         f"{s}({ds['overall'][s]:.0%})" for s in ds["ranking"]))
     print(f"  总分离差(max-min)= {ds['ov_spread']:.0%}  |  最高分余量(1-best)= {ds['headroom']:.0%}")
@@ -556,6 +596,9 @@ def write_report(results: dict, sys_names: list, meta: dict, out_path=None):
 
     L = []
     L.append("# 多系统记忆评测报告 — 七线\n")
+    if (meta.get("release") or {}).get("override"):
+        L.append("> 历史研究模式：显式绕过发布资格，以下仅为实验观察，不是正式 benchmark 成绩。\n")
+    L.append(f"- 判分版本：{JUDGE_VERSION}；error/unjudgeable 不进入能力分母。")
     L.append(f"- 评测集:`{meta['bench']}`(可判分 {meta['n_judgeable']}/{meta['n_total']} 题;"
              "七线全判:value=命中值 / refusal=拒答类 / order=时序一致)")
     L.append(f"- 语料:`{meta['corpus']}`({meta['n_sessions']} sessions / "
@@ -593,12 +636,13 @@ def write_report(results: dict, sys_names: list, meta: dict, out_path=None):
 
     # 区分度
     L.append("## 区分度判定(benchmark 能否考倒/分开记忆系统)\n")
-    L.append("- 总分排名: " + " > ".join(f"{s}({ds['overall'][s]:.0%})" for s in ds["ranking"]))
-    L.append(f"- 总分离差(max−min)= **{ds['ov_spread']:.0%}**;最高分余量(1−best)= **{ds['headroom']:.0%}**"
-             f"(best={ds['best']:.0%})")
+    L.append("- 总分排名: " + ("待复核" if ds["status"] == "incomplete" else " > ".join(f"{s}({ds['overall'][s]:.0%})" for s in ds["ranking"])))
+    if ds["status"] == "complete":
+        L.append(f"- 总分离差(max−min)= **{ds['ov_spread']:.0%}**;最高分余量(1−best)= **{ds['headroom']:.0%}**"
+                 f"(best={ds['best']:.0%})")
     L.append("- 逐线离差: " + "; ".join(
-        f"{ln.split('_')[0]}={(v if v is not None else 0):.0%}" for ln, v in ds["spreads"].items()))
-    L.append("- **判定**: " + ("✅ 有区分度——系统总分分得开,或存在强区分线(离差≥20%)。"
+        f"{ln.split('_')[0]}=" + (f"{v:.0%}" if v is not None else "待复核") for ln, v in ds["spreads"].items()))
+    L.append("- **判定**: " + ("待复核：未完成判分不能被解释为题库难度。" if ds["status"] == "incomplete" else "✅ 有区分度——系统总分分得开,或存在强区分线(离差≥20%)。"
                               if ds["discriminates"] else
                               "⚠️ 区分度弱——系统分数贴近(见 caveat:样本量/judge 噪声/协议)。"))
     L.append("")
@@ -610,8 +654,7 @@ def write_report(results: dict, sys_names: list, meta: dict, out_path=None):
     L.append("")
     L.append("## Caveat(诚实声明)\n")
     L.append("- **每线样本小**:多数线 7~13 题,单题翻转即改变该线百分比,结果为定性信号而非定量。")
-    L.append("- **拒答判分从宽**:L6(从未涉及)与 FORGET(已停统)本版都只判'是否拒答而非编造值',"
-             "未强制区分两类拒答措辞;故拒答类偏松(测的是'不编造'这一核心技能)。")
+    L.append("- **拒答合同**:新题按 abstention_kind 区分从未记录、已停止统计与范围外；旧题仅在显式研究模式保留宽松合同。")
     L.append("- **LLM-judge 噪声**:value 先字面后语义兜底,refusal/order 走 LLM 判;temperature=0 降低但不消除抖动。")
     trunc = meta.get("fullctx_truncated")
     if trunc is not None:
@@ -632,6 +675,8 @@ def L_interpret(results: dict, sys_names: list) -> list:
         return d["acc"] if d and d["acc"] is not None else None
 
     ds = discrimination_summary(results, sys_names)
+    if ds["status"] == "incomplete":
+        return ["判分尚未完成：error/unjudgeable 已排除能力分母；复判完成前不判断题库难度或系统排名。"]
     out = []
     rank_str = " > ".join(f"{s}={ds['overall'][s]:.0%}" for s in ds["ranking"])
     out.append(f"1. **总分排名** {rank_str};最高分 {ds['best']:.0%} → 余量 {ds['headroom']:.0%}"
@@ -667,6 +712,7 @@ def main():
     ap.add_argument("--bench", default=str(DEFAULT_BENCH), help="06_grounded_questions.json")
     ap.add_argument("--corpus", default=str(DEFAULT_CORPUS), help="05_corpus.json")
     ap.add_argument("--about", default="", help="00_about.json(答题协议);默认取 bench 同目录")
+    ap.add_argument("--allow-unverified", action="store_true", help="仅历史研究：允许无发布资格的输入，成绩不得作为正式结果")
     ap.add_argument("--no-protocol", action="store_true", help="不注入答题协议(消融对照)")
     ap.add_argument("--systems", default="A,B,C",
                     help="逗号分隔,如 A,B,C 或 simpleMem,mem0,zep,memos")
@@ -689,6 +735,8 @@ def main():
             ap.error(str(exc))
 
     all_q = _load_questions(args.bench)
+    from pipeline.quality import require_release
+    release = require_release(args.bench, allow_unverified=args.allow_unverified, corpus_path=args.corpus)
     questions = [q for q in all_q if is_judgeable(q)]   # 七线全判;弃不可判分(未知题类)
     n_unjudge = len(all_q) - len(questions)
 
@@ -709,9 +757,15 @@ def main():
     probe = _EvalProbe()
     probe.start(bench=args.bench, corpus=str(args.corpus), model=config.MODEL,
                 systems=sys_names, n_total=len(all_q), n_judgeable=len(questions),
-                protocol=proto_on)
+                protocol=proto_on, release=release)
 
     docs = load_corpus(args.corpus)
+    solver_sources = [*(ROOT / "eval" / "memory_systems").glob("*.py"),
+                      ROOT / "eval" / "memory_interface.py", ROOT / "eval" / "baseline_r1.py", ROOT / "config.py"]
+    cache_context = {"corpus_hash": qa_cache.digest(docs),
+                     "retrieval_source_hash": qa_cache.digest({str(p.relative_to(ROOT)): p.read_text(encoding="utf-8")
+                         for p in solver_sources if p.is_file()}),
+                     "protocol_enabled": proto_on}
     corpus_chars = sum(len(header(s, d)) + len(c) for s, d, c in docs)
 
     import collections as _c
@@ -766,7 +820,7 @@ def main():
     for s in sys_names:
         t = time.time()
         recs = run_system(s, questions, systems[s], workers=args.workers,
-                          protocol=protocol, probe=probe, bench_id=bid)
+                          protocol=protocol, probe=probe, bench_id=bid, cache_context=cache_context)
         agg = aggregate(recs)
         results[s] = {"records": recs, "agg": agg}
         probe.sys_done(s, agg, time.time() - t)
@@ -786,6 +840,8 @@ def main():
     out_json.parent.mkdir(parents=True, exist_ok=True)
     dump = {
         "bench": args.bench, "corpus": args.corpus, "model": config.MODEL,
+        "release": release, "judge_version": JUDGE_VERSION,
+        "result_scope": "research_only" if release.get("override") else "release_eligible",
         "systems": sys_names, "top_k": TOP_K, "fullctx_char_budget": FULLCTX_CHAR_BUDGET,
         "fullctx_truncated": fullctx_truncated, "protocol_injected": proto_on,
         "n_total": len(all_q), "n_judgeable": judgeable_n, "n_unjudgeable": n_unjudge,
@@ -799,6 +855,7 @@ def main():
     # 报告
     meta = {
         "bench": args.bench, "corpus": args.corpus,
+        "release": release,
         "n_total": len(all_q), "n_judgeable": judgeable_n,
         "n_sessions": len({s for s, _, _ in docs}),
         "n_docs": len(docs), "corpus_chars": corpus_chars,
@@ -811,7 +868,7 @@ def main():
             probe.run_dir / "filtered", keep_easy_ratio=keep_easy_ratio, seed=args.filter_seed,
             preserve_capabilities=args.preserve_capability,
             corpus=Path(args.corpus), about=about_path if about_path.is_file() else None,
-            result_paths=[out_json])
+            result_paths=[out_json], allow_unverified=args.allow_unverified)
         fc = filter_report["counts"]
         print(f"[筛题] 全员答对 {fc['all_correct']}，剔除 {fc['removed_easy']}，"
               f"保留 {fc['kept']} → {probe.run_dir / 'filtered'}")

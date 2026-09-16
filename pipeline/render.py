@@ -438,6 +438,8 @@ def render_corpus(wp, ws, target_tokens, tracer, corpus, done_weeks, save_cb, lo
     only_entities=set:★增量 delta(§10.1)——【只渲这些新实体的 signal】并【追加】到已有周 docs,
     ``only_entity_sessions`` 精确补渲被新关系/事件改变的旧实体周；不重灌 filler。"""
     story_ledger = getattr(ws, "narrative", None) or {}
+    quality_enabled = bool((wp.get("quality_contract") or {}).get("corpus_review"))
+    from pipeline.corpus_contract import canonical_context, review_documents, attach_receipts
     story_scenes = replay_story_ledger(ws, story_ledger) if story_ledger else []
     profile = wp.get("domain_profile", {})
     blueprint = getattr(ws, "world_blueprint", None) or wp.get("world_blueprint") or {}
@@ -462,6 +464,7 @@ def render_corpus(wp, ws, target_tokens, tracer, corpus, done_weeks, save_cb, lo
 
     def _render_week(s):                                  # ★一周的全部渲染 = 一个并行单元
         date = _date_of(s, step_days=step_days)
+        review_context = canonical_context(ws, s)
         facts = _session_facts(ws, s)
         event_decls = {e.get("id"): e for e in blueprint.get("event_types", [])}
         labeled_events = [
@@ -551,7 +554,9 @@ def render_corpus(wp, ws, target_tokens, tracer, corpus, done_weeks, save_cb, lo
                          "corpus.user", s=week_label(s), time_unit=time_unit, date=date,
                          facts=json.dumps(gf, ensure_ascii=False),
                          events=json.dumps(group_events, ensure_ascii=False),
-                         story_context=story_context, hint=hint)}],
+                         story_context=story_context, hint=hint)
+                         + (("\n【生成与审阅共享的截至时点事实；不得把未知业务状态写成已发生】\n"
+                             + json.dumps(review_context, ensure_ascii=False)) if quality_enabled else "")}],
                     temperature=0.6 if _att == 0 else 0.2, max_tokens=8192)
                 cand, leak_notes = [], []
                 for d in _dicts(out.get("docs") if isinstance(out, dict) else []):
@@ -571,7 +576,12 @@ def render_corpus(wp, ws, target_tokens, tracer, corpus, done_weeks, save_cb, lo
                 miss_val, miss_stop, miss_event = _discriminate(contents)
                 missing = miss_val + miss_stop + miss_event
                 unsupported = []
-                if not missing and story_ledger:
+                quality_review = None
+                if not missing and quality_enabled:
+                    quality_review = review_documents(tracer, ws, s, cand, context=review_context)
+                    if quality_review["status"] != "passed":
+                        unsupported = [json.dumps(item, ensure_ascii=False) for item in quality_review["issues"]]
+                elif not missing and story_ledger:
                     unsupported = review_narrative_supportedness(
                         tracer,
                         canon={"session": s, "facts": gf, "domain_events": group_events,
@@ -610,12 +620,14 @@ def render_corpus(wp, ws, target_tokens, tracer, corpus, done_weeks, save_cb, lo
                 fallback_count.append(len(left))          # ★机械验收落点(语义改为"弃段计数"):汇总进末尾日志
                 ents = sorted({m.split("的「")[0] for m in left})
                 log(f"  ⚠fail-loud弃段[{time_unit}{week_label(s)}]:{len(left)} 个 atom 多轮重渲后盲读者仍不可还原,弃段不入库({ents})")
-                if story_ledger and group_events:
+                if quality_enabled or (story_ledger and group_events):
                     raise RuntimeError(
                         f"game narrative 渲染失败:{time_unit}{week_label(s)} 仍有 {len(left)} 个未通过项")
                 return []
             if story_ledger:
                 _attach_story_provenance(grp_docs, group_events, story_scenes)
+            if quality_enabled:
+                attach_receipts(grp_docs, quality_review, s)
             return grp_docs
 
         filler_failures: list[str] = []
@@ -713,33 +725,46 @@ PHRASE_SYS = render("phrase.system")
 
 
 def phrase_questions(orders, wp, tracer, log=print) -> list[dict]:
+    from pipeline.question_contract import attach_question_contract, validate_question
+
     def _ph(o):                                           # 每条订单独立 → 并发出题
+        o = attach_question_contract(o, wp)
         line = line_for(o.get("line", ""))                # 出题意图/须隐藏 = 各产线自己的 intent()
         if line is None:                                  # 兜底(订单都来自已建线,理论不触发)
             return {**o, "question": "", "_phrase_fallback": False}
         intent, hide = line.intent(o)
+        fallback_issues = validate_question(intent, o["question_contract"])
+        if fallback_issues:
+            return {**o, "question": "", "_phrase_fallback": False,
+                    "question_validation": {"status": "rejected", "issues": fallback_issues}}
         # ★确定性出题 bypass(L9 闭选项 MC):选项串必须逐字保真、LLM 润色会打乱选项/丢 gold → 破坏纯代码 EM。
         #   直接用 intent 原文作题面(它已是完整可答的 MC 题,含 held-out x* + 全部选项)。
-        if getattr(line, "deterministic_phrasing", False):
-            return {**o, "question": intent, "_phrase_fallback": False}
+        if o["question_contract"]["render_policy"] == "canonical_template":
+            return {**o, "question": intent, "_phrase_fallback": False,
+                    "question_validation": {"status": "passed", "mode": "canonical_template",
+                        "source": "deterministic_template", "llm_calls": 0,
+                        "issues": [], "rewrite_issues": []}}
         out = tracer.chat_json("phrase",
             [{"role": "system", "content": PHRASE_SYS},
              {"role": "user", "content": render("phrase.user", intent=intent, hide=hide)}],
             temperature=0.5, max_tokens=2048)
         q = out.get("question", "") if isinstance(out, dict) else ""
         q = q if isinstance(q, str) else ""
-        fell_back = not q.strip()
+        issues = validate_question(q, o["question_contract"])
+        fell_back = bool(issues)
         if fell_back:
             # intent 是产线代码生成、已被良定义闸验证过的完整可答题面；润色模型只负责
             # 表达，不拥有订单生杀权。协议失败时直接保留真源，不丢掉已验证的供给。
             q = intent
-        # ★主语保真兜底(Q49 悬空代词根治):phrase 偶尔把主语专名改成"他/该案"丢了指代。实体名核(前4字)
-        #   若整个没在题面出现 → 退回 intent 原文(它必含实体名、是完整可答问题)。比"禁代词"软规则多一道硬保证。
-        ent = (o.get("entity") or "").strip()
-        if q and ent and ent[:4] not in q:
-            q = intent
-            fell_back = True
-        return {**o, "question": q, "_phrase_fallback": fell_back}
+        # Validate the fallback through the same contract as model output.
+        final_issues = validate_question(q, o["question_contract"])
+        if final_issues:
+            q = ""
+        return {**o, "question": q, "_phrase_fallback": fell_back,
+                "question_validation": {"status": "rejected" if final_issues else "passed",
+                    "mode": "template_fallback" if fell_back else o["question_contract"]["render_policy"],
+                    "source": "contract_validator", "llm_calls": 1,
+                    "issues": final_issues, "rewrite_issues": issues}}
     raw = config.pmap(_ph, orders, workers=8)
     fallback_count = sum(bool(q.pop("_phrase_fallback", False)) for q in raw)
     qs = [q for q in raw if q.get("question", "").strip()]    # 丢并发下偶发的空题面
