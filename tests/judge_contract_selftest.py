@@ -24,6 +24,7 @@ with patch.dict(sys.modules, {"config": config}):
 from eval import qa_cache
 from eval.question_filter import filter_questions
 from eval.grading import JUDGE_VERSION, is_scored
+from eval.provenance import make_evaluation_context, record_provenance
 
 
 def question(**changes):
@@ -243,10 +244,12 @@ class JudgeContractTest(unittest.TestCase):
         system = Mock()
         system.retrieve.return_value = "context"
         system.get_diagnostics.return_value = {}
+        evaluation_context = make_evaluation_context([(0, "2026-01-01", "context")], "")
+        cache_context = {"evaluation_context": evaluation_context}
         with tempfile.TemporaryDirectory() as td, patch.object(qa_cache, "CACHE_DIR", Path(td)), \
              patch.object(runner, "unified_answer", return_value="负责者名字的另一种说法") as solve:
             config.chat_json.side_effect = TimeoutError("offline timeout")
-            first = runner.run_system("A", [q], system, verbose=False, bench_id="b", cache_context={"corpus_hash": "one"})
+            first = runner.run_system("A", [q], system, verbose=False, bench_id="b", cache_context=cache_context)
             self.assertEqual(first[0]["judgement"]["verdict"], "error")
             self.assertEqual(runner.aggregate(first)["overall"]["n"], 0)
             disc = runner.discrimination_summary({"A": {"records": first, "agg": runner.aggregate(first)}}, ["A"])
@@ -254,19 +257,20 @@ class JudgeContractTest(unittest.TestCase):
             self.assertIsNone(disc["overall"]["A"])
             self.assertIsNone(disc["headroom"])
             peer = row(q, judge.judge_record(q, "孔雪"))
-            kept, report = filter_questions([q], {"A": first, "B": [peer]})
+            peer["evaluation_provenance"] = record_provenance(q, evaluation_context)
+            kept, report = filter_questions([q], {"A": first, "B": [peer]}, expected_context=evaluation_context)
             self.assertEqual(kept, [q])
             self.assertEqual(report["items"][0]["disposition"], "kept_incomplete")
             config.chat_json.side_effect = None
             config.chat_json.return_value = {"correct": False, "reason": "答案不同"}
-            second = runner.run_system("A", [q], system, verbose=False, bench_id="b", cache_context={"corpus_hash": "one"})
+            second = runner.run_system("A", [q], system, verbose=False, bench_id="b", cache_context=cache_context)
             self.assertIs(second[0]["correct"], False)
             self.assertTrue(second[0]["_prediction_resumed"])
             self.assertEqual(solve.call_count, 1)
             self.assertEqual(runner.aggregate(second)["overall"]["n"], 1)
-            _, report = filter_questions([q], {"A": second, "B": [peer]})
+            _, report = filter_questions([q], {"A": second, "B": [peer]}, expected_context=evaluation_context)
             self.assertEqual(report["items"][0]["disposition"], "kept_not_all_correct")
-            third = runner.run_system("A", [q], system, verbose=False, bench_id="b", cache_context={"corpus_hash": "one"})
+            third = runner.run_system("A", [q], system, verbose=False, bench_id="b", cache_context=cache_context)
             self.assertTrue(third[0]["_resumed"])
             runner.run_system("A", [q], system, verbose=False, bench_id="b", cache_context={"corpus_hash": "changed"})
             self.assertEqual(solve.call_count, 2)

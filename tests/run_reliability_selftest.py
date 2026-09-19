@@ -279,7 +279,8 @@ with tempfile.TemporaryDirectory() as td:
                    config_meta={"target_tokens": 10, "render_only": ["old-entity"]})
     game_run.write(factory.ART["whitepaper"], {"domain_profile": {}})
     game_run.write(factory.ART["world"], WorldState(n_sessions=1, narrative={"version": 1}).to_dict())
-    game_final = {"corpus": {"sessions": [{"session_id": 0, "date": "full", "docs": []}]},
+    game_final = {"corpus": {"sessions": [{"session_id": 0,
+                                         "date": WorldState(n_sessions=1).date_of_session(0), "docs": []}]},
                   "done_weeks": [0]}
     game_run.write(factory.ART["corpus"], game_final)
 

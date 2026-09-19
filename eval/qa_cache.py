@@ -5,11 +5,14 @@ import json
 import threading
 from pathlib import Path
 from eval.grading import JUDGE_VERSION, is_scored
+from eval.provenance import public_question, reference_hash, reference_payload
 
 ROOT = Path(__file__).resolve().parent.parent
 CACHE_DIR = ROOT / "output" / "eval" / "_qa_cache"
 _lk = threading.Lock()
-CACHE_VERSION = 2
+CACHE_VERSION = 3
+_GRADING_KEYS = {"grading", "judge_model", "judge_prompt", "judge_prompt_hash", "judge_version",
+                 "judge_config", "rubric", "reference", "reference_hash"}
 
 
 def digest(value) -> str:
@@ -17,13 +20,29 @@ def digest(value) -> str:
 
 
 def bench_id(questions: list, context: dict | None = None) -> str:
-    """All question fields plus solver model/corpus/protocol identify a run."""
-    return digest({"schema": CACHE_VERSION, "questions": questions, "context": context})[:24]
+    """Prediction namespace, stable across reference and judge-only revisions."""
+    return digest({"schema": CACHE_VERSION, "questions": [public_question(q) for q in questions],
+                   "context": _solver_context(context)})[:24]
 
 
-def qhash(question_or_item, context: dict | None = None, *, grading: bool = True) -> str:
-    return digest({"schema": CACHE_VERSION, "question": question_or_item, "context": context,
-                   "judge_version": JUDGE_VERSION if grading else None})
+def _solver_context(context):
+    # New callers provide {solver, grading, evaluation_context}. Preserve legacy
+    # solver fields while excluding only explicitly judge-owned configuration.
+    return {k: v for k, v in (context or {}).items() if k not in _GRADING_KEYS}
+
+
+def qhash(question_or_item, context: dict | None = None, *, grading: bool = True,
+          prediction: str | None = None) -> str:
+    payload = {"schema": CACHE_VERSION, "question": public_question(question_or_item),
+               "solver_context": _solver_context(context)}
+    if grading:
+        payload.update(reference=reference_payload(question_or_item) if isinstance(question_or_item, dict) else None,
+                       source_qid=question_or_item.get("qid") if isinstance(question_or_item, dict) else None,
+                       reference_provided=any(k in question_or_item for k in ("reference_proposal", "gold", "gt"))
+                           if isinstance(question_or_item, dict) else False,
+                       judge_version=JUDGE_VERSION, prediction=prediction,
+                       grading_context={k: v for k, v in (context or {}).items() if k in _GRADING_KEYS})
+    return digest(payload)
 
 
 def _path(bid: str, system: str, *, predictions: bool = False) -> Path:
@@ -34,7 +53,8 @@ def _path(bid: str, system: str, *, predictions: bool = False) -> Path:
 
 def _valid_prediction(rec):
     pred = rec.get("pred")
-    return (not rec.get("error") and isinstance(pred, str) and bool(pred.strip())
+    return (not rec.get("error") and rec.get("execution_status", "ok") in ("ok", "success")
+            and isinstance(pred, str) and bool(pred.strip())
             and not (pred.lstrip().startswith("[") and "ERROR" in pred))
 
 
@@ -46,7 +66,9 @@ def _load(bid, system, predictions=False):
             try:
                 rec = json.loads(line)
                 if (rec.get("_cache_version") == CACHE_VERSION and rec.get("_qh")
-                        and _valid_prediction(rec) and (predictions or is_scored(rec))):
+                        and _valid_prediction(rec) and rec.get("_answer_hash") == digest(rec["pred"])
+                        and (predictions or (is_scored(rec)
+                             and rec.get("_reference_hash") == reference_hash(rec)))):
                     records[rec["_qh"]] = rec
             except (ValueError, TypeError, AttributeError):
                 continue
@@ -65,8 +87,10 @@ def _append(bid, system, rec, predictions=False):
     if not _valid_prediction(rec) or (not predictions and not is_scored(rec)):
         return
     if predictions:
-        rec = {key: rec[key] for key in ("_qh", "pred", "bridge_extracted") if key in rec}
-    row = {**rec, "_cache_version": CACHE_VERSION}
+        rec = {key: rec[key] for key in ("_qh", "pred", "bridge_extracted", "retrieved_context_hash") if key in rec}
+    row = {**rec, "_cache_version": CACHE_VERSION, "_answer_hash": digest(rec["pred"])}
+    if not predictions:
+        row["_reference_hash"] = reference_hash(rec)
     try:
         with _lk:
             CACHE_DIR.mkdir(parents=True, exist_ok=True)

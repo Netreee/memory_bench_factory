@@ -13,6 +13,7 @@ closed_loop);此处只放:场景输入 + stage 薄包装 + STAGES 注册 + CLI�
   ./venv/bin/python -m pipeline.factory --list-runs
 """
 from __future__ import annotations
+from copy import deepcopy
 from pathlib import Path
 import argparse, hashlib, json, sys, time
 
@@ -152,11 +153,11 @@ ART = {"input": "00_input.json", "whitepaper": "01_whitepaper.json", "world": "0
        "orders": "03_orders.json", "questions": "04_questions.json", "corpus": "05_corpus.json",
        "grounding": "06_grounded_questions.json", "quality": "07_release.json"}
 CORPUS_CKPT = "05_corpus.ckpt.json"
-CORPUS_RENDER_CONTRACT_VERSION = 4
+CORPUS_RENDER_CONTRACT_VERSION = 12
 
 # ★作答协议(B类①修复):benchmark 出厂【显式声明】None 的两类语义 + 期望作答,治"None 未定义→理性系统被误判"。
 #   契约层一处声明(非逐题补丁),所有 None 题共享;eval 侧据此把 gold 哨兵映射到人类作答。
-ANSWER_PROTOCOL = {
+LEGACY_ANSWER_PROTOCOL = {
     "version": 5,
     "rules": [
         "普通问题:答该项在【题面所指时点】的具体值。",
@@ -182,6 +183,31 @@ ANSWER_PROTOCOL = {
     "gold_sentinel_map": {"INSUFFICIENT": "无此项/查无此记录", "forgotten=true": "已停止统计/不再跟踪",
                           "out_of_scope": "信息不足/不在记录范围内"},
 }
+
+from copy import deepcopy
+from eval.answer_task_review import POLICY_VERSION
+
+ANSWER_PROTOCOL = deepcopy(LEGACY_ANSWER_PROTOCOL)
+ANSWER_PROTOCOL.update(version=7, scoring_policy=POLICY_VERSION,
+                       scoring_scope="task_with_supporting_reasons",
+                       additional_facts="record_unrelated_separately")
+ANSWER_PROTOCOL["rules"][-1] = (
+    "评分遵循下方公开政策：题目要求的主要任务及回答直接支撑它的关键理由均在范围内；"
+    "允许自然简略和有效的不同证据路径，确实无关的附言另记。")
+ANSWER_PROTOCOL["rules"].insert(2,
+    "【周期编号】资料的 session/周期编号从0开始：编号0是第1期，编号1是第2期，以此类推。"
+    "题面中的第N周/期使用从1开始的自然序号；日期仍按资料的实际日期理解。")
+ANSWER_PROTOCOL["rules"].insert(3,
+    "【历史时点的记录状态】题面所问时点在资料覆盖的周期内时，采用截至该时点最后一条有效记录的值；"
+    "当期没有新的有效状态记录，沿用此前最近有效值。明确停止统计、撤销或替代记录须据其含义处理。"
+    "这不表示现实中所有事件均会被记录，也不允许向资料范围外的未来外推。")
+
+
+def _answer_protocol(wp):
+    policy = (wp.get("quality_contract") or {}).get("scoring_policy")
+    if policy not in (None, POLICY_VERSION):
+        raise ValueError("Unknown whitepaper scoring policy")
+    return ANSWER_PROTOCOL if policy else LEGACY_ANSWER_PROTOCOL
 
 
 def stage_input(run: Run):
@@ -237,7 +263,17 @@ def stage_whitepaper(run: Run):
         run.write("01_seed_audit.json", wp["seed_audit"])
     if run.scenario == "game":
         _pin_game_primary(wp)
-    wp["quality_contract"] = {"version": 1, "corpus_review": True,
+    elif pack is not None:
+        # Freeze the execution strategy with the original whitepaper. Existing
+        # saved papers retain their own strategy and review bindings.
+        wp["world_generation"] = {"strategy": "agentic", "version": 1}
+    wp["quality_contract"] = {"version": 4, "corpus_review": True,
+                              "world_semantic_review": True,
+                              "public_disclosure": True,
+                              "process_proposals": False,  # Opt in while capability quality is being calibrated.
+                              "scoring_policy": POLICY_VERSION,
+                              "public_semantic_review": True,
+                              "isolated_reference_audit": True,
                               "release_requires": "question_corpus_and_world_contracts"}
     run.write(ART["whitepaper"], wp)
     run.set_algo(active_lines=[l.get("line") for l in wp.get("active_lines", [])],
@@ -253,29 +289,271 @@ def stage_world(run: Run):
     if (run.scenario != "game" and run.manifest["config"].get("augment")
             and run.has(ART["world"])):                         # ★增量(§10.1):旧世界上 augment 新实体
         existing = WorldState.from_dict(run.read(ART["world"]))
-    ws = build_world(wp, run.tracer, run.log, existing=existing,
-                     narrative=(run.scenario == "game"))
+    from pipeline import world_semantics, disclosure
+    review_enabled = world_semantics.enabled(wp, run.manifest.get("config", {}))
+    disclosure_enabled = disclosure.enabled(wp)
+    if ((wp.get("seed_contract") or {}).get("schema_version") == 2
+            and not (review_enabled and disclosure_enabled)):
+        raise WorldBlueprintError("Seed v2 requires the original world review and public disclosure context")
+    if disclosure_enabled and not review_enabled:
+        raise WorldBlueprintError("公开信息安排必须经过原世界业务审阅")
+    draft = {}
+    options = {"draft_out": draft} if review_enabled else {}
+    agent_options = {}
+    if (wp.get("world_generation") or {}).get("strategy") == "agentic":
+        import hashlib
+        identity = json.dumps({"whitepaper": wp,
+            "existing": existing.to_dict() if existing is not None else None},
+            ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        checkpoint_id = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:20]
+        agent_options["checkpoint_path"] = run.dir / f"02_world_agent_{checkpoint_id}.json"
+        options.update(agent_options)
+    try:
+        ws = build_world(wp, run.tracer, run.log, existing=existing,
+                         narrative=(run.scenario == "game"), **options)
+    finally:
+        if draft:
+            run.write("02_world_draft.json", draft)
     _prepare_lines(wp, ws, run.log)
     seed_audit = validate_seed_world(wp, ws)
+    review = None
+    if review_enabled:
+        task_input = run.read(ART["input"])
+        run.write("02_world_draft.json", draft)
+        attempts = []
+        disclosure_attempts = []
+        for attempt in range(2):
+            unit_plan = [{"unit_id": unit["unit_id"], "intent": unit["intent"],
+                          "entities": [item["name"] for item in unit["raw"]["entities"]],
+                          "events": [item["id"] for item in unit["raw"]["events"]]}
+                         for unit in (draft.get("agent") or {}).get("units", [])]
+            author_context = (draft.get("repair_log") if attempt else None)
+            if unit_plan:
+                author_context = {"business_work_plan": unit_plan,
+                                  "repair_responses": author_context,
+                                  "scope": "Fallible author intent; verify actual world facts independently"}
+            if disclosure_enabled:
+                disclosure_feedback = attempts[-1] if attempts else None
+                if unit_plan and disclosure_feedback is None:
+                    disclosure_feedback = {"business_work_plan": unit_plan,
+                        "scope": "Author grouping for navigation; acquisition times still need independent authoring"}
+                plan_report = disclosure.author_plan(
+                    wp, ws, run.tracer, task_input=task_input,
+                    feedback=disclosure_feedback)
+                disclosure_attempts.append(plan_report)
+                run.write("02_disclosure_plan_attempts.json", {"attempts": disclosure_attempts})
+                if plan_report.get("status") != "ready" or disclosure.validate_plan(ws):
+                    run.write("02_world_candidate.json", ws.to_dict())
+                    raise WorldBlueprintError("公开信息安排未形成有效候选；见 02_disclosure_plan_attempts.json")
+            run.write("02_world_candidate.json", ws.to_dict())
+            review = world_semantics.review_world(
+                wp, ws, run.tracer, task_input=task_input,
+                previous=attempts[-1] if attempts else None,
+                author_responses=author_context)
+            attempts.append(review)
+            run.write("02_world_review_attempts.json", {"attempts": attempts})
+            if review.get("status") == "passed" and not world_semantics.validate_review(
+                    review, wp, ws, task_input=task_input):
+                break
+            targets = review.get("repair_targets") or {}
+            truth_repair = bool(targets.get("intrinsic") or targets.get("structure"))
+            disclosure_repair = disclosure_enabled and targets.get("disclosure") is True
+            if (attempt or review.get("status") not in ("failed", "unresolved")
+                    or not (truth_repair or disclosure_repair)):
+                raise WorldBlueprintError("世界业务审阅尚未通过；见 02_world_review_attempts.json，候选未发布")
+            if not truth_repair:
+                run.log("  ↻ 公开信息安排需要返修；保留世界真值，返回原作者重拟安排并复核")
+                continue
+            run.log("  ↻ 世界业务审阅发现待核问题，返回原作者进行一次有限返修")
+            repaired_draft = {}
+            # One call per selected intrinsic author, plus the original bounded
+            # structure/validation retries. Keep a finite ceiling for large worlds.
+            repair_call_limit = min(12, max(4, len(targets.get("intrinsic", []))
+                                             + (3 if targets.get("structure") else 2)))
+            try:
+                ws = build_world(wp, run.tracer, run.log, existing=existing,
+                    narrative=(run.scenario == "game"), draft_out=repaired_draft,
+                    repair_input={"draft": draft, "feedback": review,
+                                  "targets": {k: targets[k] for k in ("intrinsic", "structure") if k in targets},
+                                  "max_calls": repair_call_limit}, **agent_options)
+            finally:
+                if repaired_draft:
+                    run.write("02_world_repair_draft.json", repaired_draft)
+            draft = repaired_draft
+            run.write("02_world_draft.json", draft)
+            _prepare_lines(wp, ws, run.log)
+            seed_audit = validate_seed_world(wp, ws)
+    bundle = {ART["world"]: ws.to_dict()}
     if wp.get("seed_contract"):
-        run.write("02_seed_audit.json", seed_audit)
-    run.write(ART["world"], ws.to_dict())
-    # world 已更换，任何旧渲染中断点都不再与当前 canon 对应。
-    (run.dir / CORPUS_CKPT).unlink(missing_ok=True)
-    run.set_algo(entities=len(ws.entities), sessions=ws.n_sessions)
+        bundle["02_seed_audit.json"] = seed_audit
+    metadata = {"entities": len(ws.entities), "sessions": ws.n_sessions}
+    if disclosure_enabled:
+        metadata["public_disclosure"] = {
+            "records": len(ws.disclosure.get("records", [])),
+            "undisclosed_references": len(ws.disclosure.get("undisclosed", [])),
+            "author_attempts": len(disclosure_attempts),
+            "scope": "LLM-reviewed publication schedule; not a question difficulty claim"}
+    if review is not None:
+        bundle[world_semantics.REVIEW_ARTIFACT] = review
+        metadata["world_semantic_review"] = {"status": review["status"], "attempts": len(attempts)}
+    _publish_world_bundle(run, bundle, metadata)
+
+
+def _publish_world_bundle(run: Run, bundle: dict, metadata: dict):
+    """Restore the previously published world/opinion if the commit is interrupted.
+
+    The stage lock serializes writers. Readers still verify content bindings,
+    so a crash between individual atomic writes cannot certify a mixed bundle.
+    """
+    names = list(bundle) + [CORPUS_CKPT]
+    previous = {name: (run.dir / name).read_bytes() if (run.dir / name).exists() else None
+                for name in names}
+    prior_algo = deepcopy(run.manifest.get("algo", {}))
+    try:
+        for name, value in bundle.items():
+            run.write(name, value)
+        run.set_algo(**metadata)
+        (run.dir / CORPUS_CKPT).unlink(missing_ok=True)
+    except BaseException:
+        for name, content in previous.items():
+            path = run.dir / name
+            if content is None:
+                path.unlink(missing_ok=True)
+            else:
+                restore = path.with_name("." + path.name + ".world-restore")
+                try:
+                    restore.write_bytes(content)
+                    restore.replace(path)
+                finally:
+                    restore.unlink(missing_ok=True)
+        run.manifest["algo"] = prior_algo
+        if hasattr(run, "_save_manifest"):
+            run._save_manifest()
+        raise
+
+
+def _require_current_world_review(run: Run, wp: dict, ws=None):
+    """Resume guards replay the saved opinion; they never start a model call."""
+    from pipeline import world_semantics, disclosure
+    if not world_semantics.enabled(wp, run.manifest.get("config", {})):
+        if disclosure.enabled(wp):
+            raise WorldBlueprintError("公开信息安排要求原世界业务审阅，不能在续跑时关闭")
+        return
+    if not run.has(world_semantics.REVIEW_ARTIFACT) or not run.has(ART["input"]):
+        raise WorldBlueprintError("缺少当前世界的业务审阅；请先运行原 world 阶段")
+    ws = ws if ws is not None else WorldState.from_dict(run.read(ART["world"]))
+    review = run.read(world_semantics.REVIEW_ARTIFACT)
+    errors = world_semantics.validate_review(review, wp, ws, task_input=run.read(ART["input"]))
+    if review.get("status") != "passed" or errors:
+        raise WorldBlueprintError("世界业务审阅缺失、未通过或已过期；请先运行原 world 阶段")
+
+
+def _world_is_current(run: Run) -> bool:
+    try:
+        _require_current_world_review(run, run.read(ART["whitepaper"]))
+        return True
+    except (ValueError, OSError, TypeError, KeyError):
+        return False
+
+
+def _require_current_corpus_review(run: Run, wp: dict, corpus_obj=None):
+    """Recheck saved corpus receipts before downstream work, without model calls."""
+    if not (wp.get("quality_contract") or {}).get("corpus_review"):
+        return
+    from pipeline.corpus_contract import validate_corpus
+    ws = WorldState.from_dict(run.read(ART["world"]))
+    corpus_obj = corpus_obj if corpus_obj is not None else run.read(ART["corpus"])
+    report = validate_corpus(ws, corpus_obj)
+    if report.get("status") != "passed" or report.get("issues"):
+        codes = list(dict.fromkeys(issue.get("code", "unknown") for issue in report.get("issues", [])))
+        raise ValueError(f"正文审阅缺失、未通过或已过期:{codes}；请先运行原 corpus 阶段")
+
+
+def _corpus_is_current(run: Run) -> bool:
+    try:
+        _require_current_corpus_review(run, run.read(ART["whitepaper"]))
+        return True
+    except (ValueError, OSError, TypeError, KeyError, AttributeError):
+        return False
+
+
+def _require_current_question_wording(run: Run, wp: dict, questions=None):
+    """Replay original wording receipts before downstream work; never call a model."""
+    if not (wp.get("quality_contract") or {}).get("scoring_policy"):
+        return
+    from pipeline.question_wording import validate_wording
+    questions = questions if questions is not None else run.read(ART["questions"])
+    if not isinstance(questions, list) or any(not isinstance(q, dict) for q in questions):
+        raise ValueError("题面产物格式无效；请先运行原 questions 阶段")
+    invalid = []
+    for index, question in enumerate(questions):
+        errors = validate_wording(question)
+        if errors:
+            invalid.append({"qid": question.get("qid", index),
+                            "codes": [error.get("code", "unknown") for error in errors]})
+    if invalid:
+        raise ValueError(f"题面审阅缺失、未通过或已过期:{invalid}；请先运行原 questions 阶段")
+
+
+def _questions_is_current(run: Run) -> bool:
+    try:
+        _require_current_question_wording(run, run.read(ART["whitepaper"]))
+        return True
+    except (ValueError, OSError, TypeError, KeyError, AttributeError):
+        return False
 
 
 def stage_orders(run: Run):
     wp = run.read(ART["whitepaper"]); ws = WorldState.from_dict(run.read(ART["world"]))
     validate_seed_identity(run, wp)
     validate_seed_world(wp, ws)
+    _require_current_world_review(run, wp, ws)
     cfg = run.manifest["config"]
     quotas = cfg.get("quotas")
     # Closed-loop floors own their supply plan; ordinary runs use a total budget.
     # Historical runs without this config retain their explicit legacy behavior.
     budget = cfg.get("question_budget") if quotas is None else None
     supply = {}
-    orders = run_lines(wp, ws, run.log, quotas=quotas, question_budget=budget, stats=supply)
+    process_enabled = (cfg.get("process_proposals") is True
+                       or (wp.get("quality_contract") or {}).get("process_proposals") is True)
+    # Allocate in the original registry before a bounded proposal. The preview
+    # is deterministic and read-only; it does not regenerate world or questions.
+    orders = run_lines(wp, ws, (lambda *args: None) if process_enabled else run.log,
+                       quotas=quotas, question_budget=budget, stats=supply)
+    if process_enabled:
+        import config
+        from pipeline.lines import line_for
+        from pipeline.process_proposals import propose_process_orders
+        from eval.answer_task_review import POLICY_VERSION
+        quality = wp.get("quality_contract") or {}
+        active = any(getattr(line_for(item.get("line")), "id", None) == "L3_process"
+                     for item in wp.get("active_lines", []))
+        target = 0
+        if active and budget is not None:
+            target = next((row["allocated"] for row in supply.get("lines", [])
+                           if row["line"] == "L3_process"), 0)
+        elif active:
+            target = int((quotas or {}).get("L3_process",
+                         wp.get("capability_targets", {}).get("total_q", 40)))
+        if active and target > 0 and ws.events:
+            if not (quality.get("scoring_policy") == POLICY_VERSION
+                    and quality.get("public_semantic_review") is True
+                    and quality.get("isolated_reference_audit") is True):
+                raise ValueError("Process proposals require original public semantic review and task-support scoring")
+            proposal = {}
+            try:
+                proposal = propose_process_orders(wp, ws, target=target,
+                    chat_json=run.tracer.chat_json, model=config.MODEL)
+            finally:
+                if proposal:
+                    run.write("03_process_proposals.json", proposal)
+            if proposal.get("status") != "completed":
+                raise RuntimeError("Original process proposal execution failed; see 03_process_proposals.json")
+            orders = run_lines(wp, ws, run.log, quotas=quotas,
+                question_budget=budget, stats=supply, process_proposals=proposal)
+        else:
+            # Ordinary lines keep exactly their original selection behavior.
+            run.log(f"  Process proposal not requested: active={active}, target={target}, typed_events={len(ws.events)}")
     from pipeline.question_contract import attach_question_contract, bind_question_world
     orders = [attach_question_contract(bind_question_world(order, ws), wp)
               for order in orders]
@@ -297,7 +575,14 @@ def stage_well_posed(run: Run):
         wp = run.read(ART["whitepaper"])
         validate_seed_identity(run, wp)
         validate_seed_world(wp, ws)
+        _require_current_world_review(run, wp, ws)
     kept, report = run_well_posed(orders, ws)
+    process_count = sum(order.get("capability") == "L3_process_trace" for order in kept)
+    if process_count:
+        report["process_reference_scope"] = {
+            "n": process_count, "checked": "frozen_world_witness_identity",
+            "natural_reference": "awaiting_public_semantic_review"}
+        run.log(f"  业务过程题 {process_count} 道：此处仅核验冻结世界引用；自然答案与关键理由仍待公开材料审阅")
     run.write(ART["orders"], kept)                          # 过闸 orders 覆写(下游 stage_questions 只对良定义题出题)
     run.write("03_well_posed_report.json", report)
     o = report["overall"]
@@ -309,13 +594,20 @@ def stage_well_posed(run: Run):
 def stage_questions(run: Run):
     orders = run.read(ART["orders"]); wp = run.read(ART["whitepaper"])
     pack = validate_seed_identity(run, wp)
+    _require_current_world_review(run, wp)
     # The compiled question contract and the solver's published instructions
     # move together, including when regenerating questions in an older run.
     about = run.read("00_about.json")
-    if about.get("answer_protocol") != ANSWER_PROTOCOL:
-        about["answer_protocol"] = ANSWER_PROTOCOL
+    protocol = _answer_protocol(wp)
+    if about.get("answer_protocol") != protocol:
+        about["answer_protocol"] = protocol
         run.write("00_about.json", about)
-    qs = phrase_questions(orders, wp, run.tracer, run.log)
+    audit = {}
+    try:
+        qs = phrase_questions(orders, wp, run.tracer, run.log, audit=audit)
+    finally:
+        if audit:
+            run.write("04_wording_report.json", audit)
     if pack is not None:
         provenance = run.read(ART["input"])["seed"]
         qs = [{**q, "seed": provenance} for q in qs]
@@ -345,12 +637,13 @@ def _corpus_checkpoint_identity(wp: dict, world: dict, target: int,
 
 def stage_corpus(run: Run):
     wp = run.read(ART["whitepaper"]); world = run.read(ART["world"])
-    # Resuming an old world still uses the current corpus contract. This copy
-    # does not silently rewrite the frozen whitepaper or the world.
-    wp = {**wp, "quality_contract": {"version": 1, "corpus_review": True}}
     ws = WorldState.from_dict(world)
     validate_seed_identity(run, wp)
     validate_seed_world(wp, ws)
+    _require_current_world_review(run, wp, ws)
+    # Resuming an old world still uses the current corpus contract. This copy
+    # does not silently rewrite the frozen whitepaper or the world.
+    wp = {**wp, "quality_contract": {**wp.get("quality_contract", {}), "corpus_review": True}}
     if run.scenario == "game" and not ws.narrative:
         raise WorldBlueprintError(
             "game corpus 缺少合法 Story Ledger；请先强制重跑 world，禁止退化为普通语料渲染")
@@ -443,26 +736,55 @@ def stage_corpus(run: Run):
 
 
 def stage_grounding(run: Run):
-    """★命门3 接地闸(§G):orders(gold)↔ corpus(语料)两支【汇合】,逐题验 gold 是否在证据文档
-    【逐字 + 就近归属】可验,不接地即弃。纯代码、零 LLM。出厂题库 = 06_grounded_questions;
-    存活率写进 manifest.algo.grounding,弃因逐条另存 06_grounding_report.json。"""
+    """Merge original questions and corpus under the whitepaper's review contract.
+
+    New runs use public LLM review; lexical matches remain diagnostics. Legacy
+    runs retain their declared grounding path. Keep all review outcomes in the
+    report. Parsed per-candidate format failures remain pending; publish only
+    the completely certified subset after the shared delivery validation.
+    """
     from pipeline.grounding import run_grounding
+    wp = {}
     if run.has(ART["whitepaper"]):
         wp = run.read(ART["whitepaper"])
         validate_seed_identity(run, wp)
+        _require_current_world_review(run, wp)
         if wp.get("seed_contract"):
             validate_seed_world(wp, WorldState.from_dict(run.read(ART["world"])))
     elif run.manifest.get("config", {}).get("seed_pack_digest"):
         raise SeedPackError("种子运行缺少白皮书，不能发布题库")
     questions = run.read(ART["questions"])
+    _require_current_question_wording(run, wp, questions)
     corpus_obj = run.read(ART["corpus"])
-    kept, report = run_grounding(questions, corpus_obj)
+    _require_current_corpus_review(run, wp, corpus_obj)
+    from pipeline.grounding_review import enabled, review_grounding, REVIEW_ARTIFACT
+    if enabled(wp):
+        import config
+        from eval.provenance import public_protocol
+        cfg = run.manifest.get("config", {})
+        kept, report, semantic = review_grounding(
+            questions, corpus_obj, public_protocol(run.read("00_about.json")),
+            chat_json=run.tracer.chat_json, model=config.REVIEWER_MODEL,
+            max_calls=cfg.get("semantic_max_calls"),
+            isolated_reference=(wp.get("quality_contract") or {}).get("isolated_reference_audit", False),
+            max_tokens=cfg.get("semantic_max_tokens", 4096),
+            max_input_chars=cfg.get("semantic_max_input_chars", 200000))
+        run.write(REVIEW_ARTIFACT, semantic)
+        run.write("06_grounding_report.json", report)
+        if not report["delivery_safe"]:
+            raise RuntimeError("Public review execution is not delivery-safe; see 06_semantic_review.json")
+    else:
+        kept, report = run_grounding(questions, corpus_obj)
     run.write(ART["grounding"], kept)
     run.write("06_grounding_report.json", report)
     o = report["overall"]
     algo_update = {"grounding": {"overall": o, "by_line": report["by_line"],
                                   "by_capability": report["by_capability"],
-                                  "n_dropped": report["n_dropped"]}}
+                                  "n_dropped": report["n_dropped"],
+                                  "n_pending": report.get("n_pending", 0),
+                                  **({"execution_complete": report["execution_complete"],
+                                      "delivery_safe": report["delivery_safe"]}
+                                     if "delivery_safe" in report else {})}}
     # grounding 是产物汇合点，必须据当前 06 重算闭环账本。否则一次早期失败后
     # 从中游恢复，即使最终题量已达标，manifest 仍会永久携带陈旧 UNMET。
     target = (run.manifest.get("algo") or {}).get("targetspec") or {}
@@ -481,7 +803,7 @@ def stage_grounding(run: Run):
             "met_status": "MET" if met else "UNMET_GROUNDING",
         })
     run.set_algo(**algo_update)
-    run.log(f"  ★接地闸:{o['grounded']}/{o['n']} 接地({(o['survival'] or 0):.0%}),弃 {report['n_dropped']} "
+    run.log(f"  ★接地闸:{o['grounded']}/{o['n']} 接地({(o['survival'] or 0):.0%}),弃 {report['n_dropped']}，待审 {report.get('n_pending', 0)} "
             f"→ 出厂题库 {ART['grounding']}")
 
 
@@ -489,6 +811,9 @@ def stage_grounding(run: Run):
 def stage_quality(run: Run):
     """Release is separate from generation completion and mechanical grounding."""
     from pipeline.quality import evaluate_release, ReleaseError
+    if (run.read(ART["whitepaper"]).get("seed_contract") or {}).get("schema_version") == 2:
+        from pipeline.seed_lineage import ARTIFACT as lineage_artifact, seed_lineage_report
+        run.write(lineage_artifact, seed_lineage_report(run.dir))
     report = evaluate_release(run.dir)
     run.write(ART["quality"], report)
     run.set_algo(quality={"version": report["version"], "status": report["status"],
@@ -508,11 +833,11 @@ def _quality_is_current(run: Run) -> bool:
 STAGES = [
     Stage("input",      [],                       stage_input,      ART["input"]),
     Stage("whitepaper", ["input"],                stage_whitepaper, ART["whitepaper"]),
-    Stage("world",      ["whitepaper"],           stage_world,      ART["world"]),
+    Stage("world",      ["whitepaper"],           stage_world,      ART["world"], is_current=_world_is_current),
     Stage("orders",     ["whitepaper", "world"],  stage_orders,     ART["orders"]),
     Stage("well_posed", ["orders", "world"],      stage_well_posed, "03_well_posed_report.json"),  # ★边A闸:出题前剔 ill-posed(覆写 03_orders)
-    Stage("questions",  ["orders"],               stage_questions,  ART["questions"]),
-    Stage("corpus",     ["whitepaper", "world"],  stage_corpus,     ART["corpus"]),
+    Stage("questions",  ["orders", "well_posed"], stage_questions,  ART["questions"], is_current=_questions_is_current),
+    Stage("corpus",     ["whitepaper", "world"],  stage_corpus,     ART["corpus"], is_current=_corpus_is_current),
     Stage("grounding",  ["questions", "corpus"],  stage_grounding,  ART["grounding"]),  # ★命门3:gold↔语料 汇合校验
     Stage("quality", ["world", "questions", "corpus", "grounding"], stage_quality, ART["quality"],
           is_current=_quality_is_current),
@@ -535,7 +860,11 @@ def _print_runs():
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--scenario", default=None)
+    ap.add_argument("--process-questions", action="store_true", default=None,
+                    help="Enable original L3 business-process proposals for a frozen older run")
     ap.add_argument("--seed-pack", help="策展种子 JSON；增强 input→whitepaper，后续阶段保持同一合同")
+    ap.add_argument("--world-semantic-review", action="store_true", default=None,
+                    help="为旧白皮书显式启用原 world 阶段的业务语义审阅；新白皮书自动启用")
     ap.add_argument("--target-mtokens", type=float, default=None, help="目标 token(M);新 run 缺省 1.0,续 run 沿用")
     ap.add_argument("--question-budget", type=int, default=None,
                     help="普通流程总订单上限；新 run 缺省 30，续 run 沿用；不承诺最终存活题数")
@@ -554,6 +883,8 @@ def main():
     ap.add_argument("--haystack-ratio", type=float, default=4.0, help="针:草比(v0 仅留痕,精配是 v2)")
     ap.add_argument("--time-span-weeks", type=int, default=None, help="时间跨度周数(None=反推/默认)")
     ap.add_argument("--max-rounds", type=int, default=2, help="②实测纠偏环最多整轮重渲次数(bounded)")
+    ap.add_argument("--total-only", action="store_true", help="总题量为硬下限；白皮书逐线权重用于生产配额，显式 --per-line 仍为硬下限")
+    ap.add_argument("--max-world-entities", type=int, default=80, help="闭环每个独立世界的实体上限(8–80)，种子结构最低要求仍须满足")
     a = ap.parse_args()
 
     if a.list_runs:
@@ -562,6 +893,10 @@ def main():
         ap.error("--question-budget 必须为正整数")
     if a.question_budget is not None and a.min_questions is not None:
         ap.error("--question-budget 与闭环 --min-questions 不能同时指定")
+    if a.total_only and a.min_questions is None:
+        ap.error("--total-only requires --min-questions")
+    if not 8 <= a.max_world_entities <= 80 or a.max_rounds < 1 or (a.min_questions is not None and a.min_questions < 1):
+        ap.error("Invalid quantity/world limits")
 
     if a.seed_pack and a.scenario:
         ap.error("--seed-pack 已定义场景，不能同时指定 --scenario")
@@ -584,7 +919,17 @@ def main():
         run_id, scenario = new_run_id(requested_scenario), requested_scenario
 
     cfg = {"from": a.from_stage, "to": a.to_stage, "only": a.only}
+    if a.world_semantic_review:
+        cfg["world_semantic_review"] = True
     manifest_path = RUNS_DIR / run_id / "manifest.json"
+    if a.process_questions:
+        previous = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else {}
+        if (previous.get("stages", {}).get("orders", {}).get("done")
+                and previous.get("config", {}).get("process_proposals") is not True
+                and not (a.force and (a.only == "orders" or (a.only is None and
+                    a.from_stage in (None, "input", "whitepaper", "world", "orders"))))):
+            ap.error("Enabling process questions requires regenerating original orders and downstream stages")
+        cfg["process_proposals"] = True
     if a.question_budget is not None:
         previous = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else {}
         if (previous.get("stages", {}).get("orders", {}).get("done")
@@ -620,7 +965,8 @@ def main():
             if v.strip().isdigit():
                 plm[k.strip()] = int(v)
         spec = TargetSpec(min_questions=a.min_questions, per_line_min=plm,
-                          haystack_ratio=a.haystack_ratio, time_span_weeks=a.time_span_weeks)
+                          haystack_ratio=a.haystack_ratio, time_span_weeks=a.time_span_weeks,
+                          total_only=a.total_only, max_world_entities=a.max_world_entities)
         _, status = build_to_target(run, spec, max_rounds=a.max_rounds)
         run.log(f"=== DONE {run_id}:闭环 {status} / {run.tracer.n} 次 LLM / {round((time.time() - t0) / 60, 1)} min / 留痕 {run.dir} ===")
         return

@@ -1,16 +1,16 @@
 """
 pipeline.closed_loop —— §S 闭环旋钮 driver(从 run_factory_v2 拆出,行为不变)。
 反推世界规模/配额 → ①供给环 → 渲 → 接地 → ②实测纠偏。4 个纯决策函数 + build_to_target 循环控制。
-★build_to_target 内部【惰性 import】factory 的 stage(断开 factory↔closed_loop 导入环);函数体逐字未改。
+★build_to_target 内部【惰性 import】factory 的 stage(断开 factory↔closed_loop 导入环)。
 """
 from __future__ import annotations
-import dataclasses, math
+import dataclasses, math, time
 from copy import deepcopy
 from pipeline.world_state import WorldState
 from pipeline.world_blueprint import (WorldBlueprintError, event_role_requirements,
                                       relation_capacity, relation_owner_side)
 from pipeline.lines import line_for
-from pipeline.run import Run, _finalize_run, _run_stage, _update_run_metadata
+from pipeline.run import Run, _finalize_run, _run_stage, _run_stage_locked, _update_run_metadata
 from pipeline.targetspec import TargetSpec, invert_rate, WorldParams, DEFAULT_SLACK
 
 
@@ -370,6 +370,48 @@ def _resolve_per_line_contract(active: list[str], requested: dict) -> dict:
     return resolved
 
 
+def _run_world_attempt(run: Run, wp: dict, stage_world, artifacts: dict, corpus_checkpoint: str):
+    """Keep the published contract/world/opinion together through stage marking.
+
+    The original stage may commit successfully before its final manifest mark
+    fails. Hold the ordinary Run lock across that window and roll back only the
+    published bundle and algorithm metadata; attempted drafts, opinions and
+    provider traces remain available for audit.
+    """
+    from pipeline.world_semantics import REVIEW_ARTIFACT
+    with run.stage_write_lock("world"):
+        run._reload_manifest_for_stage()
+        names = (artifacts["whitepaper"], artifacts["world"], REVIEW_ARTIFACT,
+                 "02_seed_audit.json", corpus_checkpoint)
+        previous = {name: (run.dir / name).read_bytes() if (run.dir / name).is_file() else None
+                    for name in names}
+        prior_algo = deepcopy(run.manifest.get("algo", {}))
+        started = time.time()
+        try:
+            run.write(artifacts["whitepaper"], wp)
+            _run_stage_locked(run, "world", stage_world, artifacts["world"])
+        except BaseException as exc:
+            for name, content in previous.items():
+                path = run.dir / name
+                if content is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    restore = path.with_name("." + path.name + ".closed-loop-restore")
+                    try:
+                        restore.write_bytes(content)
+                        restore.replace(path)
+                    finally:
+                        restore.unlink(missing_ok=True)
+            run.manifest["algo"] = prior_algo
+            # mark() may have changed the in-memory or on-disk stage to done
+            # before raising. Retain this attempt's failure, not old success.
+            state = run.manifest.setdefault("stages", {}).setdefault("world", {})
+            for key in ("ts", "finished_ts"):
+                state.pop(key, None)
+            run.fail_stage("world", exc, time.time() - started)
+            raise
+
+
 def build_to_target(run: Run, spec: TargetSpec, max_rounds: int = 2, order_subrounds: int = 2):
     """§S 闭环旋钮 v0。前置:input + whitepaper 已由 drive 跑完(本函数从 01_whitepaper.json 起,自管 world→grounding)。
     ★只管【循环控制】:反推规模/配额 → patch 白皮书+config → 直调【现有 stage 函数】(经 _run_stage)→ 读回产物判 floor。
@@ -385,14 +427,16 @@ def build_to_target(run: Run, spec: TargetSpec, max_rounds: int = 2, order_subro
                    if line_for(l.get("line", "")) and float(l.get("weight") or 0) > 0]
     active = list(dict.fromkeys(l["line"] for l in canon_lines))                  # 已建且去重的激活线
     explicit_per_line = bool(spec.per_line_min)
-    if not explicit_per_line:                                                     # 没显式给 → 白皮书 weight 派生(weight 终于被读)
+    if not explicit_per_line and not spec.total_only:                              # 默认保留逐线硬下限；total_only 只强制总量和显式下限
         spec.per_line_min = spec.derive_per_line_min(canon_lines)
     spec.per_line_min = _resolve_per_line_contract(active, spec.per_line_min)
     s = sum(spec.per_line_min.values())                                           # ★总下限盈余无处落 → 按比例摊进各线 floor
-    if 0 < s < spec.min_questions:                                                #   (使「逐线 floor 全达 ⟹ 总数达标」,消掉"总数单独差"的歧义态)
+    if 0 < s < spec.min_questions and not spec.total_only:                         #   (使「逐线 floor 全达 ⟹ 总数达标」,消掉"总数单独差"的歧义态)
         scale = spec.min_questions / s
         spec.per_line_min = {k: math.ceil(v * scale) for k, v in spec.per_line_min.items()}
-    params = invert_rate(spec)
+    production_spec = (dataclasses.replace(spec, per_line_min=spec.derive_per_line_min(canon_lines))
+                       if spec.total_only else spec)
+    params = invert_rate(production_spec)
     profile = wp.get("domain_profile", {})
     run.log(f"╔═ 闭环旋钮 build_to_target:min_q={spec.min_questions} per_line_min={spec.per_line_min}")
     run.log(f"║  invert_rate(保守先验,slack={DEFAULT_SLACK}) → n_ent={params.n_entities} n_sess={params.n_sessions} "
@@ -406,12 +450,11 @@ def build_to_target(run: Run, spec: TargetSpec, max_rounds: int = 2, order_subro
     prev_events: set = set()
     narrative_mode = run.scenario == "game"
     for rnd in range(1, max_rounds + 1):
-        # 01 是当前已发布世界的有效合同。候选扩容只能与新的 02 一起提交；否则
-        # world 在失败/中断前被写回 01，会留下“旧世界 + 新合同”的撕裂 Run。
-        published_wp = run.read(ART["whitepaper"])
         run.log(f"╠═ 第 {rnd}/{max_rounds} 轮 ══════════════════════════════")
         _scale_world_contract(wp, params.n_entities, params.n_sessions,
                               narrative=narrative_mode)                           # patch 规模旋钮；显式蓝图同步更新 primary/time
+        if sum(int(t.get("count", 0)) for t in (wp.get("world_blueprint") or {}).get("entity_types", [])) > spec.max_world_entities:
+            raise WorldBlueprintError("Seed entity minima exceed this run's max_world_entities")
         event_role_moves = _ensure_event_role_capacity(wp)
         if event_role_moves:
             run.log(f"║  事件角色互异容量：总实体不变，类型重分配 {event_role_moves}")
@@ -429,26 +472,21 @@ def build_to_target(run: Run, spec: TargetSpec, max_rounds: int = 2, order_subro
         # ── ① 订单供给环:直调 stage_world + stage_orders(便宜,绝不渲);供不上 → 长世界重跑 ──
         feasible: set = set()
         for sub in range(1, order_subrounds + 1):
-            try:
-                run.write(ART["whitepaper"], wp)
-                _run_stage(run, "world", stage_world, ART["world"])
-            except BaseException:
-                # KeyboardInterrupt 也必须回滚；02 在 stage_world 成功末尾才原子发布，
-                # 因而恢复此前 01 就重新得到一对一致的已发布产物。
-                run.write(ART["whitepaper"], published_wp)
-                raise
-            published_wp = deepcopy(wp)
+            _run_world_attempt(run, wp, stage_world, ART, CORPUS_CKPT)
             _run_stage(run, "orders", stage_orders, ART["orders"])
             _run_stage(run, "well_posed", stage_well_posed, "03_well_posed_report.json")  # ★边A闸:赤字按【良定义后】供给算
             ws = WorldState.from_dict(run.read(ART["world"]))
             feasible = {ln.id for a in active if (ln := line_for(a)) and ln.feasible(ws, profile)[0]}
             produced = _orders_by_line(run.read(ART["orders"]))   # 此时 03_orders 已是过闸(良定义)子集
             deficit = _order_deficit(produced, spec.per_line_min, feasible)
+            if spec.total_only and sum(produced.values()) < spec.min_questions:
+                deficit["total"] = spec.min_questions - sum(produced.values())
             run.log(f"║  ①供给子轮{sub}:实产 {produced} / 硬下限 {spec.per_line_min} "
                     f"(软配额 {params.target_orders}) → 硬赤字 {deficit or '无'}")
             if not deficit or sub == order_subrounds:
                 break
             params = _grow_for_supply(params, deficit, grow_sessions=(rnd == 1)) # 第2轮+只长实体，不破坏旧语料时间轴
+            params = dataclasses.replace(params, n_entities=min(params.n_entities, spec.max_world_entities))
             _scale_world_contract(wp, params.n_entities, params.n_sessions,
                                   narrative=narrative_mode)
             event_role_moves = _ensure_event_role_capacity(wp)
@@ -462,10 +500,13 @@ def build_to_target(run: Run, spec: TargetSpec, max_rounds: int = 2, order_subro
         # 订单数是问题数和接地题数的严格上界。供给子轮耗尽后仍缺硬下限时，
         # questions/corpus 不可能补回，必须在最贵的渲染前失败。
         order_shortfall = _order_shortfall(produced, spec.per_line_min)
+        if spec.total_only and sum(produced.values()) < spec.min_questions:
+            order_shortfall["total"] = spec.min_questions - sum(produced.values())
         if order_shortfall:
             _update_run_metadata(run, algo={
                 "targetspec": {"min_questions": spec.min_questions,
                                "per_line_min": spec.per_line_min,
+                               "total_only": spec.total_only, "max_world_entities": spec.max_world_entities,
                                "haystack_ratio": spec.haystack_ratio},
                 "orders_by_line": produced,
                 "met_status": f"UNMET_ORDER_SUPPLY: {order_shortfall}",
@@ -508,6 +549,8 @@ def build_to_target(run: Run, spec: TargetSpec, max_rounds: int = 2, order_subro
         # ── ② floor 校验(读回 stage 产物判定;driver 只做循环决策)──
         report = run.read("06_grounding_report.json")
         met, per_line_final, growable, permanent = _floor_status(report["by_line"], report["overall"], spec, feasible)
+        if spec.total_only:
+            per_line_final.update({lid: row.get("grounded", 0) for lid, row in report["by_line"].items()})
         last = {"kept": run.read(ART["grounding"]), "report": report, "growable": growable, "permanent": permanent}
         o = report["overall"]
         run.log(f"║  ②接地后:总 {o['grounded']}/{spec.min_questions}  逐线 {per_line_final}")
@@ -515,6 +558,7 @@ def build_to_target(run: Run, spec: TargetSpec, max_rounds: int = 2, order_subro
         _update_run_metadata(run, algo={
             "targetspec": {"min_questions": spec.min_questions,
                            "per_line_min": spec.per_line_min,
+                           "total_only": spec.total_only, "max_world_entities": spec.max_world_entities,
                            "haystack_ratio": spec.haystack_ratio},
             "per_line_final": per_line_final,
             "met_status": "MET" if met else f"round{rnd}_unmet",
@@ -522,12 +566,36 @@ def build_to_target(run: Run, spec: TargetSpec, max_rounds: int = 2, order_subro
         if met:
             run.log(f"╚═ ✓ 旋钮达标(MET):总 {o['grounded']}≥{spec.min_questions},各线 floor 均满足。")
             break
+        # An unresolved or rejected semantic candidate is not evidence that
+        # the world needs more entities. Keep this bounded review's complete
+        # artifacts; changing its world would not repair its reviewed meaning.
+        if ((wp.get("quality_contract") or {}).get("public_semantic_review") is True
+                and (report.get("n_pending", 0) > 0 or report.get("n_dropped", 0) > 0)):
+            _update_run_metadata(run, algo={
+                "met_status": "UNMET_QUALITY_REVIEW",
+                "quality_review_shortfall": {
+                    "round": rnd,
+                    "n_pending": report.get("n_pending", 0),
+                    "n_rejected": report.get("n_dropped", 0),
+                    "pending_qids": [item["qid"] for item in report.get("pending", [])],
+                    "rejected_qids": [item["qid"] for item in report.get("drops", [])],
+                    "grounding_report": "06_grounding_report.json",
+                    "semantic_review": "06_semantic_review.json",
+                    "decision_basis": "recorded_review_status_not_entity_shortage",
+                },
+            })
+            _update_run_metadata(
+                run, config_remove=("augment", "render_only", "render_only_pairs"))
+            run.set_status("failed")
+            run.log("╚═ ✗ 题量未达标，已有候选审阅未决或被拒绝；保留完整意见与题目，"
+                    "不据此自动扩大世界。状态 UNMET_QUALITY_REVIEW。")
+            raise WorldBlueprintError("闭环题量未满足:UNMET_QUALITY_REVIEW；见 06 审阅产物")
         if permanent:                                                            # floor 落在【不可行线】→ 永远达不到,长世界也救不了,别空转
             run.log(f"╚═ ⚠ floor 落在不可行线{permanent}(基质供不出)→ 无解,停止空转并判失败。")
             break
         if rnd < max_rounds:                                                     # ② 用实测 survival 放大(只增不减)
             measured = {lid: v["survival"] for lid, v in report["by_line"].items() if v.get("survival") is not None}
-            params = invert_rate(spec, survival=measured, slack=DEFAULT_SLACK * 1.3)
+            params = invert_rate(production_spec, survival=measured, slack=DEFAULT_SLACK * 1.3)
             params = dataclasses.replace(params, n_entities=max(params.n_entities, len(ws.entities)),
                                          n_sessions=ws.n_sessions)               # ★augment 只长实体不长周(周变了旧 docs 就失效,失去增量意义)
             run.log(f"║  ②实测 survival={measured} → 重算 target_orders={params.target_orders} "

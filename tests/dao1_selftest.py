@@ -9,9 +9,12 @@
 """
 from __future__ import annotations
 import sys
+import json
 from copy import deepcopy
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from corpus_fixture_helpers import fixed_document_reviews
 from pipeline.world_state import WorldState, Timeline, Op, SET, UPDATE, EXPIRE, _date_of, validate
 from pipeline.world_gen import _affix_units, imprint_structure
 from pipeline.render import (_attach_story_provenance, _canonical_fact_refs,
@@ -34,6 +37,24 @@ def _fake_filler(messages):
     want = int(match.group(1)) if match else 0
     return [{"type": "旁支日志", "content": f"外围无关归档记录 {index}"}
             for index in range(want)]
+
+
+def _fake_public_stage_call(tag, messages):
+    """Fixture transport support only; this does not test model judgment."""
+    user = messages[-1]["content"]
+    if tag == "render.signal" and "【冻结的公共阶段定义】" in user:
+        definitions = json.loads(user.split("【冻结的公共阶段定义】", 1)[1].splitlines()[0])
+        date = user.split("【文档日期】", 1)[1].splitlines()[0]
+        return {"docs": [{"content": f"{date}，{rule['entity_noun']}的{rule['field']}阶段顺序为"
+                          + "、".join(rule["ordered_stages"]) + "。实际记录可跳级，不可倒退。"}
+                         for rule in definitions]}
+    if tag == "corpus.review":
+        data = json.loads(user)
+        return {"document_reviews": fixed_document_reviews(data["documents"]), "verdict": "pass", "unsupported_claims": [], "coverage": [
+            {"requirement_id": item["requirement_id"], "status": "supported", "reason": "固定离线桩：规则正文可读",
+             "evidence": [{"doc_index": index, "quote": data["documents"][index]["content"]}]}
+            for index, item in enumerate(data["requirements"])]}
+    return None
 
 
 ck("盲读答案的成对引号不改变精确值", _strict_eq("『已拾取』", "已拾取")
@@ -69,6 +90,9 @@ class _ScriptedTracer:
         self.text_prompts.append(messages)
         return "外围无关归档记录。"
     def chat_json(self, tag, messages, **kw):
+        public_stage_response = _fake_public_stage_call(tag, messages)
+        if public_stage_response is not None:
+            return public_stage_response
         if tag == "narrative.review":
             return {"unsupported_claims": []}
         if tag == "render.discriminate":
@@ -90,20 +114,20 @@ def _mini_ws():
     return WorldState({"鼎晟案": {"累计计费工时": _tl((0, "86小时"))}}, n_sessions=1)
 
 
-def _run_render(tracer, style_spec=None):
+def _run_render(tracer, style_spec=None, target=0):
     ws = _mini_ws()
     corpus = {"sessions": []}
     wp = {"domain_profile": {"doc_genres": ["纪要"], "stopped_phrase": "停止计费"}}
     if style_spec is not None:
         wp["style_spec"] = style_spec
     render_corpus(wp,
-                  ws, 0, tracer, corpus, set(), save_cb=lambda: None, log=lambda *a: None)
+                  ws, target, tracer, corpus, set(), save_cb=lambda: None, log=lambda *a: None)
     return corpus["sessions"][0]["docs"] if corpus["sessions"] else []
 
 # ①:doc 含字段名「累计计费工时」(含禁词「累计」)+ 事实就近 → 必须【一次过】,不被禁词杀
 good_doc = {"title": "周度纪要", "type": "纪要", "content": "鼎晟案本期累计计费工时为86小时,推进正常。"}
 t1 = _ScriptedTracer([{"docs": [good_doc]}])
-docs1 = _run_render(t1)
+docs1 = _run_render(t1, target=1)
 ck("①豁免:字段名含禁词的合格 doc 一次过(不再静默杀)", len(t1.calls) == 1 and any("86小时" in d["content"] for d in docs1))
 ck("①无兜底备忘混入", not any(d.get("is_fallback") for d in docs1))
 ck("filler 提示词不向模型暴露冻结实体专名",
@@ -219,6 +243,9 @@ class _StoryTracer:
         return "边境商队在本期登记了一批与主线无关的普通货物。"
 
     def chat_json(self, tag, messages, **kw):
+        public_stage_response = _fake_public_stage_call(tag, messages)
+        if public_stage_response is not None:
+            return public_stage_response
         user = messages[-1]["content"]
         if tag == "narrative.review":
             self.review_calls.append(user)
@@ -308,13 +335,15 @@ class _PartialFillerTracer(_StoryTracer):
 
 partial_filler_corpus = {"sessions": []}
 partial_filler_done = set()
-render_corpus({"domain_profile": {"doc_genres": ["剧情日志"]}}, story_ws, 0,
-              _PartialFillerTracer(), partial_filler_corpus, partial_filler_done,
+partial_filler_tracer = _PartialFillerTracer()
+render_corpus({"domain_profile": {"doc_genres": ["剧情日志"]}}, story_ws, 1,
+              partial_filler_tracer, partial_filler_corpus, partial_filler_done,
               save_cb=lambda: None, log=lambda *a: None)
 partial_fillers = [doc for session in partial_filler_corpus["sessions"]
                    for doc in session["docs"] if doc.get("is_filler") is True]
 ck("②c 单篇 filler 失败显式跳过，不杀死已满足规模与事件合同的 corpus",
-   partial_filler_done == {0, 1} and len(partial_fillers) == 15)
+   partial_filler_done == {0, 1} and partial_filler_tracer.filler_calls == 2
+   and len(partial_fillers) == 1)
 
 try:
     render_corpus({"domain_profile": {"doc_genres": ["剧情日志"]}}, story_ws, 1000,
@@ -674,9 +703,11 @@ ck("⑫c phraser 空正文→保留完整 intent，不侵蚀订单 floor",
    len(ph_empty) == 1 and "周涛" in ph_empty[0]["question"])
 # ⑫d v5 保留属性归属约束，并明示主答案与附带事实的评分边界。
 from pipeline.factory import ANSWER_PROTOCOL as _AP
-ck("⑫d 协议 v5 + 属性归属和评分范围声明", _AP["version"] == 5 and _AP.get("attribute_ownership_no_fold") is True
+ck("⑫d 协议 v7 + 属性归属和公开A评分范围声明", _AP["version"] == 7 and _AP.get("attribute_ownership_no_fold") is True
    and any("不得经关系链折算" in r for r in _AP["rules"])
-   and _AP.get("scoring_scope") == "primary_answer" and _AP.get("additional_facts") == "not_assessed")
+   and _AP.get("scoring_scope") == "task_with_supporting_reasons"
+   and _AP.get("scoring_policy") == "task-with-supporting-reasons/v1"
+   and _AP.get("additional_facts") == "record_unrelated_separately")
 
 # ════════ ⑦ L4 _choice_field 叠词去重 ════════
 # typed world 冻结后仍需允许 L5 派生“只增证据”侧信道；不得改 canonical 轨迹。

@@ -103,6 +103,9 @@ class FixtureTracer:
 
     def chat_json(self, name, messages, **kwargs):
         self.calls.append((name, deepcopy(messages)))
+        if name == "world.joint_plan":
+            return {"plan": "Keep existing identities and stable sector; revise the report and then review it.",
+                    "limitations": "Offline fixture; no semantic acceptance claimed."}
         if name == "world.batch":
             # world.batch is serial per type in this two-entity fixture.
             index = sum(call[0] == name for call in self.calls) - 1
@@ -241,7 +244,7 @@ class SeedWorldTests(unittest.TestCase):
         self.assertIn("relation_bindings", prompt)
         self.assertIn("shared_roles", prompt)
 
-    def test_entity_prompts_have_short_context_not_structure_instructions(self):
+    def test_entity_prompts_share_plan_but_keep_intrinsic_only_ownership(self):
         wp, _, table = fixture(shared_roles=True, relation_bindings=True)
         tracer = FixtureTracer(table)
         build_world(wp, tracer, log=lambda *args: None)
@@ -252,9 +255,8 @@ class SeedWorldTests(unittest.TestCase):
             self.assertIn("Track revision and review", text)
             self.assertIn("Revision causes review.", text)
             self.assertIn("本阶段只生成当前类型的内在字段", text)
-            self.assertNotIn("caused_by", text)
-            self.assertNotIn("\"causal_rules\"", text)
-            self.assertNotIn("relation_bindings", text)
+            self.assertIn("共同作者上下文", text)
+            self.assertIn(wp["seed_contract"]["task"]["instructions"], text)
             self.assertNotIn("tests/seed_world_selftest.py", text)
             self.assertNotIn("默认非单调", text)
         # The report entity schema advertises capital, not the event-owned

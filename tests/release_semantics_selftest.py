@@ -12,7 +12,9 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from pipeline.corpus_contract import review_documents, attach_receipts
+from pipeline.corpus_contract import review_documents, attach_receipts, fidelity_requirements
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from corpus_fixture_helpers import fixed_positive_review
 from pipeline.question_contract import attach_question_contract, bind_question_world
 from pipeline.quality import evaluate_release
 from pipeline.world_state import WorldState, Timeline, Op, SET, UPDATE
@@ -20,7 +22,7 @@ from pipeline.world_state import WorldState, Timeline, Op, SET, UPDATE
 
 class StubReviewer:
     def chat_json(self, *args, **kwargs):
-        return {"verdict": "pass", "unsupported_claims": []}
+        return fixed_positive_review(args[1])
 
 
 def release_fixture(directory, wp, ws, order, values, *, bind=True):
@@ -30,7 +32,7 @@ def release_fixture(directory, wp, ws, order, values, *, bind=True):
     for session, value in enumerate(values):
         docs = [{"doc_id": f"doc{session}", "is_filler": False,
                  "content": f"测试报告的{order['field']}为{value}。"}]
-        review = review_documents(StubReviewer(), ws, session, docs)
+        review = review_documents(StubReviewer(), ws, session, docs, requirements=fidelity_requirements(ws, session))
         attach_receipts(docs, review, session)
         sessions.append({"session_id": session, "docs": docs})
     final = {**q, "candidate_evidence_doc_ids": [f"doc{s}" for s in order["evidence_sessions"]],

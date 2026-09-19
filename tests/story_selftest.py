@@ -311,8 +311,8 @@ sample_defects = [
 ck("游戏叙事只放行两类题型整形缺陷",
    [item["type"] for item in _blocking_world_defects(sample_defects, True)] ==
    ["monotonic_violation", "out_of_range", "illegal_transition"])
-ck("非叙事世界保持旧门禁",
-   _blocking_world_defects(sample_defects, False) == sample_defects)
+ck("非叙事世界也不为端点极值强改真值，声明约束仍阻塞",
+   _blocking_world_defects(sample_defects, False) == sample_defects[1:])
 
 
 class _BuildTracer:

@@ -4,11 +4,11 @@ pipeline.lines.L8_transition —— L8 状态机转移产线(单能力线:L8_nex
 世界基质 = 白皮书 domain_profile.state_machines 声明的【单向状态序】字段
 (如 工单状态:新建→处理中→已解决→关闭;案件状态:立案→…→结案）。世界已强制该字段沿声明序
 单调推进(world_state.validate 的 illegal_transition 闸:倒流/出界算缺陷、定向重修）。
-  点菜 = 每个状态机字段 × 每个【当前非终态】实体 → 一道"下一合法阶段"题;
+  点菜 = 每个状态机字段 × 每个【当前非终态】实体 → 一道"阶段序紧邻后继"题;
   gt   = 声明序里【当前态的后继】(代码从 states 索引算,过校验闸）;
-  出题 = 不给当前态名、不列完整状态表 → 逼系统【先回忆 X 当前阶段 + 从语料归纳生命周期顺序】再推进一步;
-  能力 = 结构化"流程推进"记忆。平铺检索答不了(它只会取当前值、不懂"下一步"是什么）——状态机原生考点,
-         且【只在世界蓝图自然声明了状态序的类型上激活】；不按场景名硬编码开关。
+  出题 = 不给当前态名、不在题面列完整状态表 → 结合实体记录与公开流程说明查找紧邻后继;
+  能力 = 当前状态记忆 + 公开阶段规则应用，不宣称仅由稀疏轨迹归纳完整流程。
+         实际记录允许跳级；阶段序的紧邻后继不等于预测下一次实际更新。
 
 v1 只做【下一合法状态】(值答案,套现有判分,零协议改动）;
 【非法转移声明】(判定答案"成立/不成立",牵动答案协议 + judge)留 v1.5。
@@ -40,10 +40,35 @@ def _current_state(ws: WorldState, ent: str, field: str):
     return tl.latest_valid() if tl else None
 
 
+def _has_typed_rules(ws) -> bool:
+    blueprint = getattr(ws, "world_blueprint", None) or {}
+    return bool(blueprint.get("entity_types") and not blueprint.get("legacy_adapter"))
+
+
+def _entity_state_machines(ws, entity: str, profile=None) -> dict:
+    """Typed rules keep their owner; only legacy worlds use the flat mirror."""
+    if not _has_typed_rules(ws):
+        return _state_machines(profile or {})
+    entity_type = (getattr(ws, "entity_types", None) or {}).get(entity)
+    declarations = [item for item in ws.world_blueprint["entity_types"]
+                    if item.get("id") == entity_type]
+    if len(declarations) != 1:
+        return {}
+    return _state_machines({"state_machines": [
+        {"field": field.get("name"), "states": field.get("states")}
+        for field in declarations[0].get("fields", []) if field.get("kind") == "status"]})
+
+
+def _order_states(ws, order):
+    if _has_typed_rules(ws):
+        return _entity_state_machines(ws, order.get("entity", "")).get(order.get("field"), [])
+    return [str(value) for value in (order.get("aux") or {}).get("states", [])]
+
+
 class TransitionLine(ProductionLine):
     id = "L8_transition"
     title = "状态机转移"
-    memory = "单向流程的下一合法阶段推断(记住当前态 + 归纳生命周期顺序 → 推进一步)"
+    memory = "当前状态记忆与公开阶段顺序应用(定位当前态，再找序列中紧邻的后一阶段)"
     gt_substrate = "白皮书 state_machines 声明序 + 实体当前态索引(代码算后继)"
     implemented = True
     requires: list[str] = ["state_machine_fields"]   # 需 ≥1 状态机字段且有【非终态】实体
@@ -56,25 +81,25 @@ class TransitionLine(ProductionLine):
     def feasible(self, ws, profile: dict) -> tuple[bool, str]:
         """有状态机字段、且至少一个实体当前处于【非终态】(有唯一后继)→ 可激活。
         这条 feasible 正是【世界结构分叉】的开关：无状态序声明就直接 False，不为出题补造状态机。"""
-        sm = _state_machines(profile)
-        if not sm:
-            return (False, "白皮书未声明 state_machines(无单向流程字段)→ 本线不激活")
-        for f, sts in sm.items():
-            last, allset = _norm(sts[-1]), {_norm(x) for x in sts}
-            for ent, flds in ws.entities.items():
+        has_rules = False
+        for ent, flds in ws.entities.items():
+            for f, sts in _entity_state_machines(ws, ent, profile).items():
+                has_rules = True
+                last, allset = _norm(sts[-1]), {_norm(x) for x in sts}
                 if f in flds:
                     cur = _current_state(ws, ent, f)
                     if cur and _norm(cur) in allset and _norm(cur) != last:
                         return (True, f"状态机「{f}」有非终态实体「{ent}」(当前={cur})可问下一阶段")
+        if not has_rules:
+            return (False, "白皮书未声明适用于实体的阶段顺序→ 本线不激活")
         return (False, "有状态机字段,但无【当前处于非终态】的实体(都已到终态/出界)")
 
     def enumerate(self, ws, target: int = 200, wp=None) -> list[dict]:
         profile = (wp or {}).get("domain_profile", {}) if isinstance(wp, dict) else {}
-        sm = _state_machines(profile)
         out: list[dict] = []
-        for f, sts in sm.items():
-            idx_of = {_norm(s): i for i, s in enumerate(sts)}
-            for ent, flds in ws.entities.items():
+        for ent, flds in ws.entities.items():
+            for f, sts in _entity_state_machines(ws, ent, profile).items():
+                idx_of = {_norm(s): i for i, s in enumerate(sts)}
                 if f not in flds:
                     continue
                 cur = _current_state(ws, ent, f)
@@ -97,11 +122,10 @@ class TransitionLine(ProductionLine):
 
     def gt(self, ws, o: dict):
         """护城河:从声明序 + 实体【当前态】重算后继(不信 aux.gt,真从世界取当前态再索引)。"""
-        aux = o.get("aux") or {}
-        sts = [str(x) for x in (aux.get("states") or [])]
+        sts = _order_states(ws, o)
         cur = _current_state(ws, o.get("entity", ""), o.get("field", ""))
         if not sts or not cur:
-            return o.get("gt")
+            return None if _has_typed_rules(ws) else o.get("gt")
         idx_of = {_norm(s): i for i, s in enumerate(sts)}
         i = idx_of.get(_norm(cur))
         if i is None or i >= len(sts) - 1:
@@ -114,7 +138,9 @@ class TransitionLine(ProductionLine):
         I3 gold==声明序后继 / I4 护城河 gt() 重算==烘焙。"""
         aux = order.get("aux") or {}
         ent, fld = order.get("entity", ""), order.get("field", "")
-        sts = [str(x) for x in (aux.get("states") or [])]
+        sts = _order_states(ws, order)
+        if _has_typed_rules(ws) and list(aux.get("states") or []) != sts:
+            return ("drop", "订单阶段顺序与该实体类型的冻结定义不一致")
         # I0 声明合法
         if len(sts) < 2 or len({_norm(x) for x in sts}) != len(sts):
             return ("drop", f"状态机声明非法(<2 态或 _norm 重复):{sts}")
@@ -150,8 +176,9 @@ class TransitionLine(ProductionLine):
 
     def intent(self, o: dict) -> tuple[str, list]:
         ent, fld, gold = o.get("entity", ""), o.get("field", ""), o.get("gt", "")
-        s = (f"据记录,【{ent}】的「{fld}」一直按一条固定的【单向流程】推进(只能往后走、不能倒退)。"
-             f"问:按这条流程,{ent} 当前所处的阶段【再往前推进一步】会进入哪个阶段?"
+        s = (f"根据记录确定【{ent}】的「{fld}」所处阶段，再对照公开的适用阶段顺序，"
+             f"在该顺序中紧邻这个阶段的后一阶段是什么？"
+             f"问的是阶段序中的相邻位置，不是预测下一次实际状态变更。"
              f"★只回一个阶段名;不要回当前阶段、也不要把整条流程列出来。")
         return s, [str(gold)]                              # 后继(答案)别泄漏进题面
 

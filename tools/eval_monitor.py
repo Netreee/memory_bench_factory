@@ -121,7 +121,8 @@ function render(d){
  h+=`<div class="card hdr"><span class="tag ${d.status}">${d.status}</span>`
    +`<span>model: <b>${esc(d.model||"?")}</b></span>`
    +`<span>协议: ${d.protocol?"是":"否"}</span>`
-   +`<span>可判分: ${d.n_judgeable||0}/${d.n_total||0}</span>`
+   +`<span>选取: ${d.n_selected??d.n_judgeable??0}/${d.n_total||0}</span>`
+   +`<span>输入预筛选: ${d.n_eligible??d.n_judgeable??0}</span>`
    +`<span>⏱ ${fmt(elapsed)}</span></div>`;
  if(d.eval_id)h+=`<div class="sub" style="color:#5dade2;margin-bottom:2px">${esc(d.eval_id)}</div>`;
  h+=`<div class="sub">${esc(d.bench||"")}</div>`;
@@ -149,7 +150,7 @@ function render(d){
   let liveAcc=sd.j_real>0?accH(sd.correct/sd.j_real):"—";
   let stat="";
   if(sd.status==="pending")stat='<span class="skip">pending</span>';
-  else if(sd.status==="done")stat=`✓ acc=${accH(sd.acc)} <span style="color:#666">${fmt(et)}</span>`;
+  else if(sd.status==="done")stat=`✓ acc=${accH(sd.acc)} 已计分 ${sd.scored??sd.j_real??0}/${sd.total||0} <span style="color:#666">${fmt(et)}</span>`;
   else if(sd.status==="judging")stat=`✅${sd.done} → jdg ${sd.judged}/${sd.total} ~${liveAcc} <span style="color:#666">${fmt(et)}</span>`;
   else stat=`ans ${sd.done}/${sd.total} <span style="color:#666">${fmt(et)}</span>`;
   if(sd.incomplete)stat+=` <span class="skip">待复判 ${sd.incomplete}</span>`;
@@ -178,13 +179,15 @@ function render(d){
  // discrimination
  if(d.disc){
   let ds=d.disc;
-  h+='<div class="card"><h3>区分度</h3>';
+  h+='<div class="card"><h3>跨系统分数比较</h3>';
   if(ds.status==="incomplete"){
    h+='<div>判分未完成；暂不判断排名、区分度或题库难度。</div></div>';
+  }else if(ds.status==="insufficient_systems"){
+   h+='<div>至少需要两个不同系统；本次不评估跨系统区分。</div></div>';
   }else{
   if(ds.ranking)h+=`<div>排名: ${ds.ranking.map(s=>s+"="+(ds.overall[s]*100).toFixed(0)+"%").join(" > ")}</div>`;
   h+=`<div>总分离差: ${(ds.ov_spread*100).toFixed(0)}% | 余量: ${(ds.headroom*100).toFixed(0)}%</div>`;
-  h+=`<div>${ds.discriminates?"✓ 有区分度":"⚠ 区分度弱"}</div></div>`;
+  h+=`<div>${ds.discriminates?"本批分数差达到描述性阈值":"本批分数差未达到描述性阈值"}；不单独证明题库难度。</div></div>`;
   }
  }
 

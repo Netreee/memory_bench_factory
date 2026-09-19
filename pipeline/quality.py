@@ -30,15 +30,37 @@ def file_hash(path: Path) -> str:
 def implementation_fingerprint() -> str:
     paths = [ROOT / "pipeline" / name for name in (
         "quality.py", "corpus_contract.py", "question_contract.py", "value_types.py",
-        "world_state.py", "well_posed.py", "grounding.py", "render.py", "seed_world.py")]
+        "world_state.py", "well_posed.py", "grounding.py", "grounding_review.py",
+        "semantic_review.py", "reference_audit.py", "reference_locations.py",
+        "question_wording.py", "render.py", "seed_world.py", "seed_pack.py", "seed_v2.py", "seed_run.py",
+        "world_semantics.py", "disclosure.py", "process_proposals.py")]
     paths += sorted((ROOT / "pipeline/lines").glob("*.py"))
-    paths += [ROOT / "eval" / name for name in ("judge.py", "grading.py")]
+    paths += [ROOT / "eval" / name for name in ("judge.py", "grading.py", "semantic_judge.py",
+                                               "answer_task_review.py", "provenance.py")]
     values = [(p.relative_to(ROOT).as_posix(), file_hash(p) if p.is_file() else "missing") for p in paths]
     return hashlib.sha256(json.dumps(values, separators=(",", ":")).encode()).hexdigest()
 
 
 def _read(directory, name):
     return json.loads((Path(directory) / name).read_text(encoding="utf-8"))
+
+
+def _release_inputs(directory):
+    from pipeline.grounding_review import enabled, REVIEW_ARTIFACT
+    from pipeline import world_semantics
+    wp_path = Path(directory) / "01_whitepaper.json"
+    names = list(INPUTS)
+    if wp_path.exists():
+        wp = _read(directory, "01_whitepaper.json")
+        manifest = _read(directory, "manifest.json") if (Path(directory) / "manifest.json").is_file() else {}
+        if enabled(wp):
+            names.append(REVIEW_ARTIFACT)
+        if world_semantics.enabled(wp, manifest.get("config", {})):
+            names += [world_semantics.REVIEW_ARTIFACT, "00_input.json"]
+        if (wp.get("seed_contract") or {}).get("schema_version") == 2:
+            from pipeline.seed_run import SEED_ARTIFACT, AUDIT_ARTIFACT, GENERATION_ARTIFACT
+            names += [SEED_ARTIFACT, AUDIT_ARTIFACT, GENERATION_ARTIFACT, "00_input.json"]
+    return tuple(dict.fromkeys(names))
 
 
 def _delivery_contract(directory) -> dict:
@@ -48,8 +70,14 @@ def _delivery_contract(directory) -> dict:
     result = {"min_questions": target.get("min_questions", 0),
               "per_line_min": target.get("per_line_min", {}),
               "inherited_research_only": (manifest.get("release_policy") or {}).get("inherited_research_only", False)}
+    result["world_semantic_review"] = manifest.get("config", {}).get("world_semantic_review", False)
+    wp_path = Path(directory) / "01_whitepaper.json"
+    if wp_path.is_file() and (_read(directory, "01_whitepaper.json").get("seed_contract") or {}).get("schema_version") == 2:
+        result["seed_input_identity"] = {key: manifest.get("config", {}).get(key)
+                                          for key in ("seed_id", "seed_pack_digest")}
     if (type(result["min_questions"]) is not int or result["min_questions"] < 0
             or type(result["inherited_research_only"]) is not bool
+            or type(result["world_semantic_review"]) is not bool
             or not isinstance(result["per_line_min"], dict)
             or any(not isinstance(k, str) or type(v) is not int or v < 0
                    for k, v in result["per_line_min"].items())):
@@ -75,6 +103,45 @@ def _manual_rejection(directory) -> bool:
         return True  # unreadable reviewer result cannot silently certify a release
 
 
+def _scoring_contract_supported(question, whitepaper, protocol):
+    """Admit an explicit scoring route, not a passed semantic judgement.
+
+    The normal contract/world checks and current isolated public review remain
+    mandatory later in evaluate_release. Legacy judgeability stays unchanged.
+    """
+    from eval.grading import requires_semantic_grading
+    from eval.judge import is_judgeable
+    if not requires_semantic_grading(question):
+        return is_judgeable(question)
+    from eval.answer_task_review import POLICY_VERSION
+    from eval.provenance import protocol_scoring_policy
+    from pipeline.reference_audit import validate_reference_proposal
+    qc = whitepaper.get("quality_contract") or {}
+    contract, aux = question.get("question_contract") or {}, question.get("aux") or {}
+    if not all(isinstance(value, dict) for value in (qc, contract, aux)):
+        return False
+    try:
+        validate_reference_proposal(question.get("reference_proposal"))
+        public_policy = protocol_scoring_policy(protocol)
+    except (ValueError, TypeError):
+        return False
+    return (qc.get("scoring_policy") == public_policy == POLICY_VERSION
+            and qc.get("public_semantic_review") is True
+            and qc.get("isolated_reference_audit") is True
+            and question.get("line") == "L3_process"
+            and aux.get("scorer") == "semantic"
+            and aux.get("gt_scope") == "canonical_witness_not_semantic_proof"
+            and contract.get("scoring_policy") == POLICY_VERSION
+            and contract.get("scoring_scope") == "task_with_supporting_reasons"
+            and contract.get("answer_kind") == "structured"
+            and contract.get("render_policy") == "semantic_review"
+            and contract.get("reference_authority") == "proposed_not_mechanically_proven"
+            and contract.get("gold") == question["reference_proposal"]["answer"]
+            and contract.get("reference_proposal") == question["reference_proposal"]
+            and contract.get("canonical_witness") == question.get("gt")
+            and (contract.get("parameters") or {}).get("process") == aux.get("process"))
+
+
 def evaluate_release(directory) -> dict:
     """Pure read-only evaluation. The factory writes the returned receipt."""
     from pipeline.corpus_contract import validate_corpus
@@ -89,7 +156,7 @@ def evaluate_release(directory) -> dict:
 
     directory = Path(directory)
     issues, warnings, hashes, checks = [], [], {}, {}
-    for name in INPUTS:
+    for name in _release_inputs(directory):
         path = directory / name
         if not path.is_file():
             issues.append({"code": "missing_release_input", "artifact": name})
@@ -102,6 +169,7 @@ def evaluate_release(directory) -> dict:
               "inputs": hashes, "implementation_fingerprint": implementation_fingerprint(),
               "checks": checks, "issues": issues, "warnings": warnings,
               "limitations": ["Model-assisted semantic review can still miss or misclassify claims.",
+                              "Process witness consistency is structural; its natural reference depends on the recorded public semantic review.",
                               "This gate does not certify business rules absent from the seed contract.",
                               "Candidate document count is not minimal necessary evidence or difficulty."]}
     if issues:
@@ -109,13 +177,43 @@ def evaluate_release(directory) -> dict:
     try:
         wp = _read(directory, "01_whitepaper.json")
         manifest = _read(directory, "manifest.json") if (directory / "manifest.json").is_file() else {}
+        if (wp.get("seed_contract") or {}).get("schema_version") == 2:
+            from types import SimpleNamespace
+            from pipeline.seed_run import validate_seed_identity
+            view = SimpleNamespace(manifest=manifest, has=lambda name: (directory / name).is_file(),
+                                   read=lambda name: _read(directory, name))
+            validate_seed_identity(view, wp)
+            checks["seed_input_identity"] = {"status": "passed", "schema_version": 2}
+            report["scope"].append("frozen_seed_extraction_and_generation_context")
+            from pipeline import world_semantics
+            if ((wp.get("quality_contract") or {}).get("public_disclosure") is not True
+                    or not world_semantics.enabled(wp, manifest.get("config", {}))):
+                issues.append({"code": "seed_v2_requires_world_review_and_disclosure"})
         if (manifest.get("release_policy") or {}).get("inherited_research_only"):
             issues.append({"code": "unverified_source_derivation"})
         report["delivery_contract"] = _delivery_contract(directory)
         ws = WorldState.from_dict(_read(directory, "02_world.json"))
+        from pipeline import world_semantics
+        if world_semantics.enabled(wp, manifest.get("config", {})):
+            world_review = _read(directory, world_semantics.REVIEW_ARTIFACT)
+            world_errors = world_semantics.validate_review(world_review, wp, ws,
+                task_input=_read(directory, "00_input.json"))
+            checks["world_semantics"] = {"status": world_review.get("status"), "issues": world_errors}
+            report["scope"].append("world_business_semantics")
+            if world_review.get("status") != "passed" or world_errors:
+                issues.append({"code": "world_semantic_review_not_current", "details": world_errors})
+        elif (wp.get("quality_contract") or {}).get("public_disclosure") is True:
+            issues.append({"code": "disclosure_requires_world_semantic_review"})
         source = _read(directory, "04_questions.json")
         questions = _read(directory, "06_grounded_questions.json")
         corpus = _read(directory, "05_corpus.json")
+        from pipeline.grounding_review import enabled, candidates_with_evidence, selection, validate_delivery, REVIEW_ARTIFACT
+        from eval.provenance import public_protocol, protocol_scoring_policy
+        semantic_enabled = enabled(wp)
+        protocol = public_protocol(_read(directory, "00_about.json"))
+        expected_policy = (wp.get("quality_contract") or {}).get("scoring_policy")
+        if protocol_scoring_policy(protocol) != expected_policy:
+            issues.append({"code": "public_scoring_policy_mismatch"})
         if not isinstance(questions, list) or not questions:
             raise ValueError("Final question set is empty or not a list")
         if not isinstance(source, list):
@@ -131,7 +229,7 @@ def evaluate_release(directory) -> dict:
         source_by_id = {q.get("qid"): q for q in source if isinstance(q, dict) and q.get("qid")}
         for index, q in enumerate(questions, 1):
             qid = q.get("qid")
-            if not is_judgeable(q):
+            if not _scoring_contract_supported(q, wp, protocol):
                 issues.append({"code": "unsupported_scoring_contract", "index": index, "qid": qid})
             if not qid or qid in seen_qids:
                 issues.append({"code": "missing_or_duplicate_qid", "index": index, "qid": qid})
@@ -140,6 +238,9 @@ def evaluate_release(directory) -> dict:
                 contracts.append({"code": "missing_question_contract", "index": index})
             else:
                 contracts.extend({"index": index, "qid": qid, **item} for item in validate_question(q))
+                if q["question_contract"].get("render_policy") == "semantic_review":
+                    from pipeline.question_wording import validate_wording
+                    contracts.extend({"index": index, "qid": qid, **item} for item in validate_wording(q))
                 trusted_order = bind_question_world(q, ws)
                 trusted_wp = {**wp, "world_blueprint": ws.world_blueprint or wp.get("world_blueprint", {})}
                 if (any(q.get(key) != trusted_order.get(key) for key in
@@ -157,7 +258,7 @@ def evaluate_release(directory) -> dict:
                         issues.append({"code": "typed_gold_mismatch", "qid": qid})
             original = source_by_id.get(qid)
             if not original or any(original.get(key) != q.get(key) for key in (
-                    "question", "gt", "aux", "question_contract", "capability", "entity", "field")):
+                    "question", "gt", "aux", "question_contract", "question_validation", "capability", "entity", "field")):
                 issues.append({"code": "question_source_mismatch", "index": index, "qid": qid})
             # Independent date oracle: do not reuse the production gt_mr implementation.
             if q.get("capability") == "MR":
@@ -184,7 +285,43 @@ def evaluate_release(directory) -> dict:
         corpus_check = validate_corpus(ws, corpus)
         checks["corpus"] = corpus_check
         issues.extend(corpus_check["issues"])
-        regrounded, grounding_check = run_grounding(questions, corpus)
+        if semantic_enabled:
+            review = _read(directory, REVIEW_ARTIFACT)
+            isolated = (wp.get("quality_contract") or {}).get("isolated_reference_audit", False)
+            if isolated != bool((review.get("binding") or {}).get("reference_auditor_model")):
+                issues.append({"code": "semantic_review_method_mismatch"})
+            candidates = candidates_with_evidence(source, corpus, isolated_reference=isolated)
+            delivery = validate_delivery(candidates, corpus, protocol, review)
+            checks["semantic_review_delivery"] = delivery
+            if not delivery["delivery_safe"]:
+                issues.extend(delivery["issues"])
+            elif not delivery["execution_complete"]:
+                warnings.append({"code": "parsed_format_failures_isolated_as_pending",
+                                 "items": delivery["parsed_format_failures"]})
+            expected_final, semantic_check = selection(candidates, review)
+            derivation = manifest.get("derived_from") or {}
+            if derivation.get("operation") == "filter_all_selected_systems_correct":
+                inherited = derivation.get("semantic_review") or {}
+                positions = {q.get("qid"): (i, q) for i, q in enumerate(expected_final)}
+                indices = [positions.get(q.get("qid"), (-1, None))[0] for q in questions]
+                if (inherited.get("artifact") != REVIEW_ARTIFACT
+                        or inherited.get("sha256") != file_hash(directory / REVIEW_ARTIFACT)
+                        or inherited.get("scope") != "unchanged_complete_source_review"
+                        or inherited.get("source_final_count") != len(expected_final)
+                        or inherited.get("selected_qids") != [q.get("qid") for q in questions]
+                        or len(positions) != len(expected_final)
+                        or any(i < 0 for i in indices) or indices != sorted(set(indices))
+                        or any(positions.get(q.get("qid"), (-1, None))[1] != q for q in questions)):
+                    issues.append({"code": "semantic_filter_derivation_mismatch"})
+            elif expected_final != questions:
+                issues.append({"code": "semantic_selection_mismatch"})
+            checks["public_semantics"] = semantic_check
+            if semantic_check["n_pending"]:
+                warnings.append({"code": "unresolved_candidates_not_released", "n": semantic_check["n_pending"]})
+            regrounded = candidates_with_evidence(questions, corpus)
+            grounding_check = {"n_dropped": 0, "decision_basis": "public_semantic_review"}
+        else:
+            regrounded, grounding_check = run_grounding(questions, corpus)
         checks["grounding"] = grounding_check
         if grounding_check["n_dropped"]:
             issues.append({"code": "current_corpus_grounding_failed", "drops": grounding_check["drops"]})
@@ -194,8 +331,10 @@ def evaluate_release(directory) -> dict:
                 for s in sessions for d in s.get("docs", [])}
         for index, q in enumerate(questions, 1):
             ids = q.get("candidate_evidence_doc_ids", q.get("evidence_doc_ids", []))
-            if not ids or any(did not in docs or docs[did][0] not in q.get("evidence_sessions", [])
-                              or docs[did][1].get("is_filler") for did in ids):
+            if (not ids and not semantic_enabled) or any(
+                    did not in docs
+                    or (not semantic_enabled and docs[did][0] not in q.get("evidence_sessions", []))
+                    or docs[did][1].get("is_filler") for did in ids):
                 issues.append({"code": "invalid_evidence_reference", "index": index})
             if q.get("qid") in actual_evidence and ids != actual_evidence[q.get("qid")]:
                 issues.append({"code": "stale_candidate_evidence_pool", "index": index})
@@ -240,14 +379,19 @@ def quality_snapshot(run_dir) -> dict:
                 or type(receipt.get("eligible")) is not bool
                 or receipt.get("status") not in ("passed", "failed")):
             raise ValueError("invalid release receipt schema")
-        if receipt["status"] == "passed" and (not receipt["scope"] or not {
-                "seed_structure", "question_contracts", "world_answers", "corpus", "grounding", "coverage"
-                }.issubset(receipt["checks"])):
+        required_checks = {"seed_structure", "question_contracts", "world_answers", "corpus", "grounding", "coverage"}
+        from pipeline.world_semantics import REVIEW_ARTIFACT as WORLD_REVIEW_ARTIFACT
+        if WORLD_REVIEW_ARTIFACT in _release_inputs(directory):
+            required_checks.add("world_semantics")
+        from pipeline.seed_run import GENERATION_ARTIFACT
+        if GENERATION_ARTIFACT in _release_inputs(directory):
+            required_checks.add("seed_input_identity")
+        if receipt["status"] == "passed" and (not receipt["scope"] or not required_checks.issubset(receipt["checks"])):
             raise ValueError("passed receipt lacks required checks")
         base.update({key: receipt.get(key, base[key]) for key in ("scope", "checks", "issues")})
         if (receipt.get("version") != VERSION or receipt.get("implementation_fingerprint") != implementation_fingerprint()
                 or receipt.get("delivery_contract") != _delivery_contract(directory)
-                or set(receipt.get("inputs", {})) != set(INPUTS)
+                or set(receipt.get("inputs", {})) != set(_release_inputs(directory))
                 or any(not (directory / name).is_file() or file_hash(directory / name) != expected
                        for name, expected in receipt.get("inputs", {}).items())):
             return {**base, "status": "stale", "eligible": False}

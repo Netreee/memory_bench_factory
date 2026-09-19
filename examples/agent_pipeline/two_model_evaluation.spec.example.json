@@ -1,0 +1,68 @@
+{
+  "version": "agent-evaluation-spec/v2",
+  "source_case": "../../output/agent_generation",
+  "calibration": {
+    "results": "../../output/agent_calibration/execution/results.json",
+    "plan": "../../output/agent_calibration/plan.json",
+    "semantic_audit": "../../output/agent_calibration/run_independent_audit.json"
+  },
+  "evaluation_plan": {
+    "systems": [
+      {
+        "name": "fullcontext_gpt",
+        "model": "gpt-6-astra",
+        "max_tokens": 16384
+      },
+      {
+        "name": "fullcontext_glm",
+        "model": "glm-4.7-nothinking",
+        "max_tokens": 16384
+      }
+    ],
+    "judge": {
+      "model": "gpt-6-astra",
+      "max_tokens": 16384
+    },
+    "transport": {
+      "version": "chat-completions-transport/v1",
+      "profiles": {
+        "high_json": {
+          "token_limit_parameter": "max_completion_tokens",
+          "reasoning_effort": "high",
+          "omit_parameters": [
+            "logprobs",
+            "temperature",
+            "top_logprobs",
+            "top_p"
+          ],
+          "response_format": {
+            "type": "json_object"
+          },
+          "http_timeout_seconds": 300,
+          "deadline_seconds": 300
+        },
+        "plain_json": {
+          "token_limit_parameter": "max_tokens",
+          "response_format": {
+            "type": "json_object"
+          },
+          "http_timeout_seconds": 300,
+          "deadline_seconds": 300
+        }
+      },
+      "model_profiles": {
+        "gpt-6-astra": "high_json",
+        "glm-4.7-nothinking": "plain_json"
+      },
+      "default_profile": "legacy"
+    },
+    "max_provider_attempts": 24,
+    "keep_easy_ratio": 0.0,
+    "filter_seed": 20260917,
+    "full_context_char_budget": 120000,
+    "max_input_chars": 200000,
+    "grading_response_layout": "grading-reassessment-layout/v1",
+    "scoring_policy": "task-with-supporting-reasons/v1",
+    "grading_method": "independent-answer-task-review/v1"
+  }
+}

@@ -1,0 +1,828 @@
+{
+  "schema_version": 2,
+  "seed_id": "sports_attachment_review_v2",
+  "family": "sports_attachment_review",
+  "title": "体育行业研判：财年口径、主体层级与预期更新",
+  "description": "从企业年报、行业调研和政策目标提炼不同主体、期间及观察类型的对应关系，维护合成体育行业研究简报。",
+  "sources": [
+    {
+      "id": "sports_01",
+      "path": "data/real_seed/yanpan_2026-09-19/extracted/体育行业分析/《滔搏国际202425年度报告》.pdf",
+      "sha256": "eab0ee6147d44ee66199e61217d07e7242cf702fa64081c247f7e346ff6be355",
+      "role": "corpus",
+      "source_kind": "factual_record",
+      "title": "Topsports International Annual Report 2024/25",
+      "allowed_use": [
+        "ontology",
+        "mechanism",
+        "exemplar_style"
+      ],
+      "sensitivity": "public_reference",
+      "date_scope": {
+        "reporting_period_end": "2025-02-28"
+      }
+    },
+    {
+      "id": "sports_02",
+      "path": "data/real_seed/yanpan_2026-09-19/extracted/体育行业分析/《安踏体育用品有限公司2025年度报告》.pdf",
+      "sha256": "d58bbfd5f2528a47c96efb98fb6a87294875a42aab9abf5463bbc440e12edd7c",
+      "role": "corpus",
+      "source_kind": "factual_record",
+      "title": "安踏体育二零二五年年度业绩公告及年报",
+      "allowed_use": [
+        "ontology",
+        "mechanism",
+        "exemplar_style"
+      ],
+      "sensitivity": "public_reference",
+      "date_scope": {
+        "reporting_period_end": "2025-12-31"
+      }
+    },
+    {
+      "id": "sports_03",
+      "path": "data/real_seed/yanpan_2026-09-19/extracted/体育行业分析/《普华永道全球体育行业调研第八期中国报告》.pdf",
+      "sha256": "43992a87c7313ba06225abb5da985f20770d221ffc6d84c20bc37e12965acf39",
+      "role": "corpus",
+      "source_kind": "analytical",
+      "title": "普华永道全球体育行业调研第八期中国报告",
+      "allowed_use": [
+        "ontology",
+        "mechanism",
+        "exemplar_style"
+      ],
+      "sensitivity": "public_reference",
+      "date_scope": {
+        "published_month": "2024-11",
+        "survey_period": "2024年1月至5月"
+      }
+    },
+    {
+      "id": "sports_04",
+      "path": "data/real_seed/yanpan_2026-09-19/extracted/体育行业分析/《促进户外运动设施建设与服务提升行动方案（2023—2025年）》.pdf",
+      "sha256": "3b4c71ab8856f7670d38f50d626dcbf32ecc25de10f9dab41a78e8c140ecd65d",
+      "role": "corpus",
+      "source_kind": "normative",
+      "title": "促进户外运动设施建设与服务提升行动方案2023至2025年",
+      "allowed_use": [
+        "ontology",
+        "mechanism",
+        "exemplar_style"
+      ],
+      "sensitivity": "public_reference",
+      "date_scope": {
+        "policy_period": "2023至2025年"
+      }
+    }
+  ],
+  "task": {
+    "objective": "体育行业研判：财年口径、主体层级与预期更新",
+    "instructions": [
+      "合成连续工作档案，公开材料说明每条信息何时、经何种途径获知；计划、实际发生和事后回顾保持各自含义。",
+      "决定答案的业务条件、口径和关键理由必须出现在公开语料；审阅只依据受测者可见材料。",
+      "按批次分线题量规划足够的独立实体、时间跨度和事件；种子所列数量只设下限，并非每轮生产规模。",
+      "研究对象覆盖企业和行业样本；每条指标明确主体、期间、单位和观察性质。",
+      "比较不同财年、集团与分部时公开说明差异；以资料核对和简报更新推进工作。"
+    ],
+    "forbidden_inferences": []
+  },
+  "exemplars": [
+    {
+      "title": "财年核对",
+      "content": "海岚运动的财年截至二月底，青禾体育的财年截至十二月底。第二期核对单分别保留两条期间，简报标记为期间不同。",
+      "doc_type": "业务复核记录",
+      "date": "2027-01-22",
+      "origin": "synthetic",
+      "source_refs": [],
+      "mechanism_refs": [
+        "fiscal_scope"
+      ]
+    },
+    {
+      "title": "预期更新",
+      "content": "第三期调研摘要将未来三年的行业增长预期调整为温和增长。研究简报更新了预期段落，上一财年的已报告收入保持原记录。",
+      "doc_type": "业务复核记录",
+      "date": "2027-01-22",
+      "origin": "synthetic",
+      "source_refs": [],
+      "mechanism_refs": [
+        "expectation_status"
+      ]
+    }
+  ],
+  "mechanisms": [
+    {
+      "id": "fiscal_scope",
+      "description": "同一简报引用的观察保留企业集团、品牌分部或行业样本范围，以及各自财年截止日。",
+      "source_refs": [
+        {
+          "source_id": "sports_01",
+          "locator": "page:4,56"
+        },
+        {
+          "source_id": "sports_02",
+          "locator": "page:1,10;visual"
+        },
+        {
+          "source_id": "sports_03",
+          "locator": "page:3,7-9"
+        }
+      ],
+      "required_entity_types": [
+        "subject",
+        "observation",
+        "brief"
+      ],
+      "required_relation_types": [
+        "observation_for_subject",
+        "brief_uses_observation"
+      ],
+      "required_event_types": [
+        "observation_registered",
+        "scope_checked",
+        "brief_updated"
+      ],
+      "required_causal_rules": [
+        "register_to_scope",
+        "scope_to_brief"
+      ],
+      "failure_modes": [
+        "混用二月底财年与十二月底财年",
+        "把集团数值套给品牌分部"
+      ],
+      "capability_hooks": [
+        "L1_timeline",
+        "L2_relational",
+        "L3_process"
+      ]
+    },
+    {
+      "id": "expectation_status",
+      "description": "将已报告业绩、受访者未来预期、政策目标分别表述，后续更新保留原判断的时间和依据。",
+      "source_refs": [
+        {
+          "source_id": "sports_01",
+          "locator": "page:4,56"
+        },
+        {
+          "source_id": "sports_03",
+          "locator": "page:3,7-9"
+        },
+        {
+          "source_id": "sports_04",
+          "locator": "page:2-3"
+        }
+      ],
+      "required_entity_types": [
+        "observation",
+        "brief"
+      ],
+      "required_relation_types": [
+        "brief_uses_observation"
+      ],
+      "required_event_types": [
+        "brief_updated"
+      ],
+      "required_causal_rules": [],
+      "failure_modes": [
+        "把预期增长当成实际增长",
+        "把政策目标写成已完成"
+      ],
+      "capability_hooks": [
+        "L5_conflict",
+        "L6_refusal"
+      ]
+    }
+  ],
+  "blueprint_requirements": {
+    "entity_types": [
+      {
+        "id": "subject",
+        "noun": "体育研究对象",
+        "count": 3,
+        "fields": [
+          {
+            "name": "对象层级",
+            "kind": "category",
+            "source_refs": [
+              {
+                "source_id": "sports_01",
+                "locator": "page:4,56"
+              },
+              {
+                "source_id": "sports_02",
+                "locator": "page:1,10;visual"
+              },
+              {
+                "source_id": "sports_03",
+                "locator": "page:3,7-9"
+              }
+            ]
+          },
+          {
+            "name": "业务范围",
+            "kind": "category",
+            "source_refs": [
+              {
+                "source_id": "sports_01",
+                "locator": "page:4,56"
+              },
+              {
+                "source_id": "sports_03",
+                "locator": "page:3,7-9"
+              }
+            ]
+          }
+        ],
+        "source_refs": [
+          {
+            "source_id": "sports_01",
+            "locator": "page:4,56"
+          },
+          {
+            "source_id": "sports_02",
+            "locator": "page:1,10;visual"
+          },
+          {
+            "source_id": "sports_03",
+            "locator": "page:3,7-9"
+          }
+        ],
+        "primary": true
+      },
+      {
+        "id": "observation",
+        "noun": "体育指标观察",
+        "count": 3,
+        "fields": [
+          {
+            "name": "关联对象",
+            "kind": "reference",
+            "source_refs": [
+              {
+                "source_id": "sports_01",
+                "locator": "page:4,56"
+              },
+              {
+                "source_id": "sports_02",
+                "locator": "page:1,10;visual"
+              },
+              {
+                "source_id": "sports_03",
+                "locator": "page:3,7-9"
+              }
+            ]
+          },
+          {
+            "name": "指标与单位",
+            "kind": "text",
+            "source_refs": [
+              {
+                "source_id": "sports_01",
+                "locator": "page:4,56"
+              },
+              {
+                "source_id": "sports_02",
+                "locator": "page:1,10;visual"
+              }
+            ]
+          },
+          {
+            "name": "期间口径",
+            "kind": "text",
+            "source_refs": [
+              {
+                "source_id": "sports_01",
+                "locator": "page:4,56"
+              },
+              {
+                "source_id": "sports_02",
+                "locator": "page:1,10;visual"
+              },
+              {
+                "source_id": "sports_03",
+                "locator": "page:3,7-9"
+              }
+            ]
+          },
+          {
+            "name": "观察性质",
+            "kind": "category",
+            "source_refs": [
+              {
+                "source_id": "sports_01",
+                "locator": "page:4,56"
+              },
+              {
+                "source_id": "sports_03",
+                "locator": "page:3,7-9"
+              },
+              {
+                "source_id": "sports_04",
+                "locator": "page:2-3"
+              }
+            ]
+          },
+          {
+            "name": "核对状态",
+            "kind": "status",
+            "source_refs": [
+              {
+                "source_id": "sports_01",
+                "locator": "page:4,56"
+              },
+              {
+                "source_id": "sports_02",
+                "locator": "page:1,10;visual"
+              },
+              {
+                "source_id": "sports_03",
+                "locator": "page:3,7-9"
+              }
+            ]
+          }
+        ],
+        "source_refs": [
+          {
+            "source_id": "sports_01",
+            "locator": "page:4,56"
+          },
+          {
+            "source_id": "sports_02",
+            "locator": "page:1,10;visual"
+          },
+          {
+            "source_id": "sports_03",
+            "locator": "page:3,7-9"
+          }
+        ]
+      },
+      {
+        "id": "brief",
+        "noun": "体育研究简报条目",
+        "count": 2,
+        "fields": [
+          {
+            "name": "关键观察",
+            "kind": "reference",
+            "source_refs": [
+              {
+                "source_id": "sports_03",
+                "locator": "page:3,7-9"
+              }
+            ]
+          },
+          {
+            "name": "结论阶段",
+            "kind": "status",
+            "source_refs": [
+              {
+                "source_id": "sports_03",
+                "locator": "page:3,7-9"
+              }
+            ]
+          },
+          {
+            "name": "结论范围",
+            "kind": "category",
+            "source_refs": [
+              {
+                "source_id": "sports_03",
+                "locator": "page:3,7-9"
+              }
+            ]
+          }
+        ],
+        "source_refs": [
+          {
+            "source_id": "sports_03",
+            "locator": "page:3,7-9"
+          }
+        ]
+      }
+    ],
+    "relation_types": [
+      {
+        "id": "observation_for_subject",
+        "from_type": "observation",
+        "to_type": "subject",
+        "field": "关联对象",
+        "temporal": false,
+        "min_count": 1,
+        "source_refs": [
+          {
+            "source_id": "sports_01",
+            "locator": "page:4,56"
+          },
+          {
+            "source_id": "sports_02",
+            "locator": "page:1,10;visual"
+          },
+          {
+            "source_id": "sports_03",
+            "locator": "page:3,7-9"
+          }
+        ]
+      },
+      {
+        "id": "brief_uses_observation",
+        "from_type": "brief",
+        "to_type": "observation",
+        "field": "关键观察",
+        "temporal": true,
+        "min_count": 1,
+        "source_refs": [
+          {
+            "source_id": "sports_03",
+            "locator": "page:3,7-9"
+          }
+        ]
+      }
+    ],
+    "event_types": [
+      {
+        "id": "observation_registered",
+        "label": "登记报告或调研观察",
+        "roles": {
+          "observation": "observation"
+        },
+        "effect_fields": [
+          {
+            "role": "observation",
+            "field": "核对状态"
+          }
+        ],
+        "min_count": 1,
+        "source_refs": [
+          {
+            "source_id": "sports_01",
+            "locator": "page:4,56"
+          },
+          {
+            "source_id": "sports_03",
+            "locator": "page:3,7-9"
+          }
+        ],
+        "status": "synthetic_design",
+        "basis": "依据所引资料的工作关系安排合成事件；次数和具体间隔由本种子设计。"
+      },
+      {
+        "id": "scope_checked",
+        "label": "核对期间与主体口径",
+        "roles": {
+          "observation": "observation",
+          "brief": "brief"
+        },
+        "effect_fields": [
+          {
+            "role": "observation",
+            "field": "核对状态"
+          }
+        ],
+        "min_count": 1,
+        "source_refs": [
+          {
+            "source_id": "sports_01",
+            "locator": "page:4,56"
+          },
+          {
+            "source_id": "sports_02",
+            "locator": "page:1,10;visual"
+          },
+          {
+            "source_id": "sports_03",
+            "locator": "page:3,7-9"
+          }
+        ],
+        "status": "synthetic_design",
+        "basis": "依据所引资料的工作关系安排合成事件；次数和具体间隔由本种子设计。",
+        "relation_bindings": [
+          {
+            "relation": "brief_uses_observation",
+            "from_role": "brief",
+            "to_role": "observation"
+          }
+        ]
+      },
+      {
+        "id": "brief_updated",
+        "label": "更新体育研究简报",
+        "roles": {
+          "observation": "observation",
+          "brief": "brief"
+        },
+        "effect_fields": [
+          {
+            "role": "brief",
+            "field": "结论阶段"
+          }
+        ],
+        "min_count": 1,
+        "source_refs": [
+          {
+            "source_id": "sports_03",
+            "locator": "page:3,7-9"
+          }
+        ],
+        "status": "synthetic_design",
+        "basis": "依据所引资料的工作关系安排合成事件；次数和具体间隔由本种子设计。",
+        "relation_bindings": [
+          {
+            "relation": "brief_uses_observation",
+            "from_role": "brief",
+            "to_role": "observation"
+          }
+        ]
+      }
+    ],
+    "causal_rules": [
+      {
+        "id": "register_to_scope",
+        "trigger_event": "observation_registered",
+        "effect_event": "scope_checked",
+        "delay_sessions": 1,
+        "shared_roles": [
+          "observation"
+        ],
+        "source_refs": [
+          {
+            "source_id": "sports_01",
+            "locator": "page:4,56"
+          },
+          {
+            "source_id": "sports_02",
+            "locator": "page:1,10;visual"
+          },
+          {
+            "source_id": "sports_03",
+            "locator": "page:3,7-9"
+          }
+        ],
+        "status": "synthetic_design",
+        "basis": "原资料支持材料与后续工作之间的依赖；一期间隔为合成调度选择。"
+      },
+      {
+        "id": "scope_to_brief",
+        "trigger_event": "scope_checked",
+        "effect_event": "brief_updated",
+        "delay_sessions": 1,
+        "shared_roles": [
+          "observation",
+          "brief"
+        ],
+        "source_refs": [
+          {
+            "source_id": "sports_01",
+            "locator": "page:4,56"
+          },
+          {
+            "source_id": "sports_03",
+            "locator": "page:3,7-9"
+          }
+        ],
+        "status": "synthetic_design",
+        "basis": "原资料支持材料与后续工作之间的依赖；一期间隔为合成调度选择。"
+      }
+    ],
+    "evidence_channels": [
+      "合成年报摘要",
+      "分部指标表",
+      "行业调研摘要",
+      "政策目标摘记",
+      "口径核对单",
+      "研究简报"
+    ],
+    "temporal_model": {
+      "min_sessions": 4,
+      "time_granularity": "期",
+      "allow_retrospective": true,
+      "description": "最少四期为合成设计；获取时间、发生时间、报告期间分别交代。"
+    }
+  },
+  "document_map": [
+    {
+      "source_id": "sports_01",
+      "segments": [
+        {
+          "locator": "page:4,56,62",
+          "topic": "财年截止日、集团财务指标和主体定义",
+          "reading_method": "text"
+        }
+      ]
+    },
+    {
+      "source_id": "sports_02",
+      "segments": [
+        {
+          "locator": "page:1,10",
+          "topic": "年度截止日、集团与分部收入及利润口径",
+          "reading_method": "visual"
+        }
+      ]
+    },
+    {
+      "source_id": "sports_03",
+      "segments": [
+        {
+          "locator": "page:3,7-9",
+          "topic": "样本调研时间、未来增长预期与市场范围",
+          "reading_method": "text"
+        }
+      ]
+    },
+    {
+      "source_id": "sports_04",
+      "segments": [
+        {
+          "locator": "page:1-3",
+          "topic": "政策覆盖期间和行动目标",
+          "reading_method": "text"
+        }
+      ]
+    }
+  ],
+  "generation_contract": {
+    "syntheticization": {
+      "names": "generate_fictional",
+      "case_numbers": "generate_fictional",
+      "numeric_values": "generate_with_explicit_units",
+      "dates": "generate_with_explicit_period_and_disclosure"
+    },
+    "must_include": [],
+    "must_distinguish": [
+      {
+        "text": "财年截止日、材料发布日期、调研期和预测期分别保留。",
+        "status": "accepted",
+        "source_refs": [
+          {
+            "source_id": "sports_01",
+            "locator": "page:4,56"
+          },
+          {
+            "source_id": "sports_02",
+            "locator": "page:1,10;visual"
+          },
+          {
+            "source_id": "sports_03",
+            "locator": "page:3,7-9"
+          }
+        ]
+      },
+      {
+        "text": "已报告业绩、行业调研预期和政策目标分别记载。",
+        "status": "accepted",
+        "source_refs": [
+          {
+            "source_id": "sports_01",
+            "locator": "page:4,56"
+          },
+          {
+            "source_id": "sports_03",
+            "locator": "page:3,7-9"
+          },
+          {
+            "source_id": "sports_04",
+            "locator": "page:2-3"
+          }
+        ]
+      }
+    ],
+    "must_not_infer": [
+      {
+        "text": "不得由行业平均或受访者预期推出某一家公司的已实现利润；未确认单位时保留待核状态。",
+        "status": "accepted",
+        "source_refs": [
+          {
+            "source_id": "sports_01",
+            "locator": "page:4,56"
+          },
+          {
+            "source_id": "sports_03",
+            "locator": "page:3,7-9"
+          }
+        ]
+      },
+      {
+        "text": "不得生成投资推荐、确定股价走势或未在公开语料说明的计算公式。",
+        "status": "accepted",
+        "source_refs": [
+          {
+            "source_id": "sports_01",
+            "locator": "page:4,56"
+          },
+          {
+            "source_id": "sports_03",
+            "locator": "page:3,7-9"
+          }
+        ]
+      }
+    ],
+    "sensitive_fields": [],
+    "active_lines": [],
+    "traps": [],
+    "unresolved": [],
+    "synthetic_designs": [
+      {
+        "text": "实体数量、至少四期和每种事件至少一次为本次合成世界的覆盖选择；原资料未规定这些数目。",
+        "status": "synthetic_design",
+        "source_refs": []
+      },
+      {
+        "text": "事件之间的一期间隔只安排合成节奏，实际因果成立条件由作者和审阅者结合材料判断。",
+        "status": "synthetic_design",
+        "source_refs": []
+      },
+      {
+        "text": "附件未给出统一的原任务提示词；本种子的持续维护任务由编制者依据材料结构设计。",
+        "status": "synthetic_design",
+        "source_refs": []
+      },
+      {
+        "text": "示例文书日期2027-01-22为合成日期，示例中的期数用于表达先后；实际世界另行规划日期与对应关系。",
+        "status": "synthetic_design",
+        "source_refs": []
+      }
+    ]
+  },
+  "review": {
+    "quality_status": "curated_for_original_pipeline_trial",
+    "blocking_issues": [],
+    "reviewer": "Codex source reading and seed curation",
+    "independent_review_performed": false,
+    "coverage": {
+      "sources_inventoried": 4,
+      "source_records": [
+        {
+          "source_id": "sports_01",
+          "file_pages": 117,
+          "file_rows": null,
+          "file_columns": null,
+          "reviewed_segments": [
+            [
+              "page:4,56,62",
+              "财年截止日、集团财务指标和主体定义",
+              "text"
+            ]
+          ],
+          "limitations": []
+        },
+        {
+          "source_id": "sports_02",
+          "file_pages": 227,
+          "file_rows": null,
+          "file_columns": null,
+          "reviewed_segments": [
+            [
+              "page:1,10",
+              "年度截止日、集团与分部收入及利润口径",
+              "visual"
+            ]
+          ],
+          "limitations": [
+            "PDF 字体映射导致文本提取乱码；仅引用已逐页视觉核对的第1、10页，未宣称完整年报核读。"
+          ]
+        },
+        {
+          "source_id": "sports_03",
+          "file_pages": 59,
+          "file_rows": null,
+          "file_columns": null,
+          "reviewed_segments": [
+            [
+              "page:3,7-9",
+              "样本调研时间、未来增长预期与市场范围",
+              "text"
+            ]
+          ],
+          "limitations": []
+        },
+        {
+          "source_id": "sports_04",
+          "file_pages": 10,
+          "file_rows": null,
+          "file_columns": null,
+          "reviewed_segments": [
+            [
+              "page:1-3",
+              "政策覆盖期间和行动目标",
+              "text"
+            ]
+          ],
+          "limitations": []
+        }
+      ],
+      "full_document_semantic_reading_claimed": false
+    },
+    "scope": "所引关键段落和表格支持合成领域设计；未进行现行法规核验、真实案件判定或投资分析。",
+    "source_findings": [
+      "sports_02 文本提取乱码，改为关键页视觉阅读；未据乱码推断数值或字段。",
+      "两份公司材料的报告期间不同，调研预期与政策目标各有独立适用期间。"
+    ],
+    "synthetic_designs": [
+      "实体数量、至少四期和每种事件至少一次为本次合成世界的覆盖选择；原资料未规定这些数目。",
+      "事件之间的一期间隔只安排合成节奏，实际因果成立条件由作者和审阅者结合材料判断。",
+      "附件未给出统一的原任务提示词；本种子的持续维护任务由编制者依据材料结构设计。",
+      "示例文书日期2027-01-22为合成日期，示例中的期数用于表达先后；实际世界另行规划日期与对应关系。"
+    ]
+  }
+}

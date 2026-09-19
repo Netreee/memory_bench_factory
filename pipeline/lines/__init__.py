@@ -94,7 +94,7 @@ def feasible_lines(ws, profile: dict) -> list[tuple[str, bool, str]]:
 # ── 注册表级产线编排(stage_world / stage_orders / 闭环 driver 共用;原 run_factory_v2 搬入)─────
 # ★派发:run_lines 遍历白皮书激活线 → line.enumerate 点菜(配额驱动 + feasible 门控)。
 #   叠基质:prepare_lines 各线把所需基质叠进共享世界(命门1)。两者都只依赖本表的 line_for。
-def _budgeted_lines(wp, ws, budget: int, log, stats: dict | None) -> list[dict]:
+def _budgeted_lines(wp, ws, budget: int, log, stats: dict | None, *, process_orders=None) -> list[dict]:
     """Allocate a total budget before selection; never refill a short line with L6.
 
     Candidate enumeration is bounded and its limit is reported. A pool at the
@@ -140,12 +140,15 @@ def _budgeted_lines(wp, ws, budget: int, log, stats: dict | None) -> list[dict]:
     selected = []
     for (line, weight, auto), allocated in zip(planned, allocations):
         feasible, reason = line.feasible(ws, profile)
+        extra = process_orders if line.id == "L3_process" and process_orders is not None else []
+        if extra and not feasible:
+            feasible, reason = True, "Bounded typed process proposals are structurally available; semantics await review"
         row = {"line": line.id, "weight": weight, "auto_activated": auto, "allocated": allocated,
                "feasible": feasible, "feasibility_reason": reason, "candidates": 0, "eligible": 0,
                "selected": 0, "duplicate_candidates": 0, "rejected": {}, "pool_at_limit": False}
         eligible, identities, rejected = [], set(), Counter()
         if feasible and allocated > 0:
-            candidates = line.enumerate(ws, limit, wp)
+            candidates = line.enumerate(ws, limit, wp) + list(extra)
             row["candidates"] = len(candidates)
             row["pool_at_limit"] = len(candidates) >= limit
             for order in candidates:
@@ -175,6 +178,10 @@ def _budgeted_lines(wp, ws, budget: int, log, stats: dict | None) -> list[dict]:
                 offset += 1
             selected.extend(picked)
             row["selected"] = len(picked)
+        if process_orders is not None and line.id == "L3_process":
+            row["process_proposals"] = {"structurally_bound": len(extra),
+                "selected": sum(o.get("capability") == "L3_process_trace" for o in selected),
+                "semantic_status": "not_reviewed"}
         row["eligible"] = len(eligible)
         row["rejected"] = dict(rejected)
         row["shortfall"] = allocated - row["selected"]
@@ -194,14 +201,18 @@ def _budgeted_lines(wp, ws, budget: int, log, stats: dict | None) -> list[dict]:
     return selected
 
 
-def run_lines(wp, ws, log=print, quotas=None, *, question_budget=None, stats=None) -> list[dict]:
+def run_lines(wp, ws, log=print, quotas=None, *, question_budget=None, stats=None, process_proposals=None) -> list[dict]:
     """按白皮书激活的产线,line_for 鲁棒匹配 → 调 line.enumerate 点菜。
     ★配额驱动(closed_loop_targetspec §7):`quotas={line_id: 配额}`(由 invert_rate 反推),缺省回退 total_q。
     ★feasible 接线(盲审 B6:零件原本没装上):基质喂不饱的线跳过 + 日志,不无效产 0 单、不死循环。"""
+    process_orders = None
+    if process_proposals is not None:
+        from pipeline.process_proposals import validate_process_report
+        process_orders = validate_process_report(process_proposals, wp, ws)
     if question_budget is not None:
         if quotas is not None:
             raise ValueError("question_budget and per-line quotas are mutually exclusive")
-        return _budgeted_lines(wp, ws, question_budget, log, stats)
+        return _budgeted_lines(wp, ws, question_budget, log, stats, process_orders=process_orders)
     active = [l.get("line") for l in wp.get("active_lines", [])]
     profile = wp.get("domain_profile", {})
     default_target = int(wp.get("capability_targets", {}).get("total_q", 40))
@@ -215,10 +226,27 @@ def run_lines(wp, ws, log=print, quotas=None, *, question_budget=None, stats=Non
             continue
         seen.add(line.id)
         ok, why = line.feasible(ws, profile)       # ★基质可行性:不满足 → 跳过(避免无效产 0 单 / 死循环)
+        extra = process_orders if line.id == "L3_process" and process_orders is not None else []
+        if extra and not ok:
+            ok, why = True, "Bounded typed process proposals available"
         if not ok:
             skipped.append(f"{line.id}(基质不足:{why})"); continue
         q = int(quotas.get(line.id, default_target))   # ★该线配额(over-provision 已由 invert_rate 算好)
         got = line.enumerate(ws, q, wp)            # 各产线自带代码 gt(护城河);wp 供 L2 等取关系
+        if extra:
+            # Only the explicit proposal path mixes capabilities. Keep the
+            # original line quota; sufficient old sorting supply must not hide
+            # every newly authored process candidate.
+            pools, picked, offset = {}, [], 0
+            for order in got + list(extra):
+                pools.setdefault(order.get("capability", ""), []).append(order)
+            while len(picked) < max(q, 0):
+                round_items = [pool[offset] for pool in pools.values() if len(pool) > offset]
+                if not round_items:
+                    break
+                picked.extend(round_items[:q - len(picked)])
+                offset += 1
+            got = picked
         orders_out.extend(got)
         fired.append(f"{line.id}:{len(got)}单/配额{q}")
     # ★结构原型自动激活:auto_activate 线(如 L8 状态机)只要世界里有其基质(feasible)就触发,
@@ -240,6 +268,10 @@ def run_lines(wp, ws, log=print, quotas=None, *, question_budget=None, stats=Non
         stats.update({"mode": "explicit_quotas" if quotas else "legacy_per_line",
                       "legacy_total_q": default_target, "selected": len(orders_out),
                       "fired": fired, "skipped": skipped})
+        if process_orders is not None:
+            stats["process_proposals"] = {"structurally_bound": len(process_orders),
+                "selected": sum(o.get("capability") == "L3_process_trace" for o in orders_out),
+                "semantic_status": "not_reviewed"}
     return orders_out
 
 

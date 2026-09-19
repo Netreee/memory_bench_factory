@@ -9,7 +9,7 @@ from decimal import Decimal
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import config
-from eval.grading import JUDGE_VERSION, is_scored
+from eval.grading import JUDGE_VERSION, is_scored, requires_semantic_grading
 from pipeline.value_types import ValueComparisonError, parse_date, parse_number
 
 
@@ -88,7 +88,8 @@ def llm_judge(question: str, gold_set: list, pred: str) -> bool:
 
 
 def _strict_llm(messages: list) -> dict:
-    data = config.chat_json(messages, temperature=0.0, max_tokens=1024)
+    data = config.chat_json(messages, temperature=0.0, max_tokens=1024,
+                            model=getattr(config, "JUDGE_MODEL", getattr(config, "MODEL", None)))
     if not isinstance(data, dict) or type(data.get("correct")) is not bool:
         raise ValueError("judge schema: correct must be a JSON boolean")
     if not isinstance(data.get("reason"), str) or not data["reason"].strip():
@@ -449,7 +450,7 @@ def _judge_all_required_atoms(required: list[str], pred: str) -> bool:
 
 def judgement(verdict: str, path: str, reason: str, **extra) -> dict:
     """Versioned score envelope; null never participates in capability accuracy."""
-    if verdict not in {"correct", "incorrect", "error", "unjudgeable"}:
+    if verdict not in {"correct", "incorrect", "error", "unjudgeable", "uncertain"}:
         raise ValueError("unknown verdict")
     return {"verdict": verdict, "correct": {"correct": True, "incorrect": False}.get(verdict),
             "path": path, "reason": reason, "version": JUDGE_VERSION, **extra}
@@ -500,6 +501,10 @@ def judge_record(q: dict, pred: str, use_llm: bool = True) -> dict:
     def result(ok, path, reason):
         return judgement("correct" if ok else "incorrect", path, reason, **metadata)
 
+    if requires_semantic_grading(q):
+        return judgement("unjudgeable", "semantic_mode_required",
+                         "Process references require the public A policy and its bound semantic review; canonical witnesses are not legacy answer gold",
+                         **metadata)
     if not is_judgeable(q):
         return judgement("unjudgeable", "contract", "missing or unsupported grading contract/gold", **metadata)
     if not isinstance(pred, str):
@@ -600,7 +605,7 @@ def judge_record(q: dict, pred: str, use_llm: bool = True) -> dict:
              "question_contract": contract, "primary_answer": primary}, ensure_ascii=False)},
         ])
         record = result(data["correct"], "llm_primary", data["reason"])
-        record["judge_model"] = getattr(config, "MODEL", None)
+        record["judge_model"] = getattr(config, "JUDGE_MODEL", getattr(config, "MODEL", None))
         return record
     except Exception as exc:
         return judgement("error", "llm_failure", f"{type(exc).__name__}: {str(exc)[:160]}", **metadata)

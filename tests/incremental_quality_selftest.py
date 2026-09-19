@@ -21,14 +21,16 @@ os.environ["MODEL"] = "offline-model"
 
 from pipeline import factory
 from pipeline import run as run_module
-from pipeline.corpus_contract import attach_receipts, review_documents, validate_corpus
+from pipeline.corpus_contract import attach_receipts, review_documents, validate_corpus, fidelity_requirements
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from corpus_fixture_helpers import fixed_positive_review
 from pipeline.world_state import Op, SET, Timeline, WorldState, _date_of
 
 
 class PassReviewer:
     def chat_json(self, step, *args, **kwargs):
         assert step == "corpus.review"
-        return {"verdict": "pass", "unsupported_claims": []}
+        return fixed_positive_review(args[0])
 
 
 def world(expanded=False):
@@ -41,7 +43,7 @@ def world(expanded=False):
 def reviewed_session(ws, sid, *, doc_id=None):
     docs = [{"doc_id": doc_id or f"signal-{sid}", "title": "当期登记",
              "content": "旧部门状态为已开业。"}]
-    report = review_documents(PassReviewer(), ws, sid, docs)
+    report = review_documents(PassReviewer(), ws, sid, docs, requirements=fidelity_requirements(ws, sid))
     attach_receipts(docs, report, sid)
     return {"session_id": sid, "date": _date_of(sid), "docs": docs}
 

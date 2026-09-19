@@ -258,6 +258,9 @@ def validate_seed_pack(pack: dict) -> dict:
     exact sanitized snapshot, including its original identity. Neither hash is
     a signature or a claim of independent verification of source contents.
     """
+    if isinstance(pack, dict) and type(pack.get("schema_version")) is int and pack["schema_version"] == 2:
+        from pipeline.seed_v2 import validate
+        return validate(pack)
     _object(pack, _TOP | {"digest", "contract_digest"}, _TOP, "seed_pack")
     _canonical(pack)
     if type(pack["schema_version"]) is not int or pack["schema_version"] != 1:
@@ -359,6 +362,9 @@ def seed_digest(pack: dict) -> str:
 def seed_contract(pack: dict) -> dict:
     """Build the exact sanitized snapshot for provenance/resume comparisons."""
     pack = validate_seed_pack(pack)
+    if pack["schema_version"] == 2:
+        from pipeline.seed_v2 import sanitize_contract
+        return sanitize_contract(pack)
     if "contract_digest" in pack:
         return pack
     identity = _digest(pack)
@@ -371,14 +377,32 @@ def seed_contract(pack: dict) -> dict:
 
 def seed_context(pack: dict) -> str:
     """Allowlisted generation context; source files are never read or included."""
-    return json.dumps(seed_contract(pack), ensure_ascii=False, indent=2, allow_nan=False)
+    return json.dumps(generation_context(pack), ensure_ascii=False, indent=2, allow_nan=False)
+
+
+def generation_context(pack: dict) -> dict:
+    """Validated generator projection; excludes v2 audit and evaluator inputs."""
+    from pipeline.seed_v2 import generation_context as project
+    return project(pack)
+
+
+def core_requirements(pack: dict) -> dict:
+    """Explicit executable requirements, excluding semantic-only v2 metadata."""
+    from pipeline.seed_v2 import core_requirements as project
+    return project(validate_seed_pack(pack))
 
 
 def seed_input(pack: dict) -> tuple[str, list[dict]]:
     """Return a CLI-ready scene description and existing-format few-shot docs."""
     pack = validate_seed_pack(pack)
+    if pack["schema_version"] == 2:
+        from pipeline.seed_v2 import require_generation_ready
+        require_generation_ready(pack)
     task = pack["task"]
-    description = f"{pack['description']}\n\n任务目标：{task['objective']}\n任务说明：{task['instructions']}"
+    instructions = task["instructions"]
+    if pack["schema_version"] == 2:
+        instructions = "\n".join(instructions)
+    description = f"{pack['description']}\n\n任务目标：{task['objective']}\n任务说明：{instructions}"
     examples = [{"title": item["title"], "content": item["content"],
                  "doc_type": item["doc_type"], "date": item["date"],
                  "seed_origin": item["origin"], "source_refs": deepcopy(item["source_refs"]),
@@ -445,7 +469,7 @@ def validate_seed_blueprint(wp_or_bp: dict, pack: dict) -> dict:
                             for group in _GROUPS})
     except SeedPackError as error:
         issues.append(f"Invalid business-object bindings: {error}")
-    requirements = pack["blueprint_requirements"]
+    requirements = core_requirements(pack)
     coverage = {}
     for group in _GROUPS:
         values = blueprint.get(group)

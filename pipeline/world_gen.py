@@ -3,9 +3,12 @@ pipeline.world_gen —— §5 共享世界生成(从 run_factory_v2 拆出,行�
 build_world:并发批次让 LLM 填世界表 → assemble_world 成状态机 → W.3 CRITIC 修复轮(validate 缺陷定向重生成)。
 """
 from __future__ import annotations
+from copy import deepcopy
+import hashlib
 import json
 import random
 import re
+import threading
 import config
 from pipeline.world_state import (assemble_world, validate, WorldState, _strip_disambig, name_collisions,
                                    Op, SET, UPDATE, EXPIRE, DELETE, INSUFFICIENT, INVALID,
@@ -20,6 +23,246 @@ from pipeline.seed_world import (causal_roles_match, seed_entity_prompt, seed_pr
 # 两类世界调用需要生成较长的严格 JSON。真实失败样本表明 8192 token 会被
 # deep reasoning 全部耗尽而正文为空；16384 的同 prompt 对照返回完整 JSON。
 WORLD_JSON_MAX_TOKENS = 16_384
+WORLD_DRAFT_VERSION = "original-world-draft/v2"
+
+
+def _world_digest(value):
+    return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True,
+                                    separators=(",", ":"), allow_nan=False).encode("utf-8")).hexdigest()
+
+
+class _RepairTracer:
+    """One shared attempt budget for the original authors, including repairs."""
+    def __init__(self, tracer, state, max_calls):
+        self.tracer, self.state, self.max_calls = tracer, state, max_calls
+        self.lock = threading.Lock()
+        self.fatal = None
+        self.entries_by_output_id = {}
+
+    def chat_json(self, step, messages, **kwargs):
+        from pipeline.world_blueprint import WorldBlueprintError
+        with self.lock:
+            if self.fatal:
+                raise WorldBlueprintError("world repair stopped after author execution failure")
+            calls = self.state["repair_log"]
+            if len(calls) >= self.max_calls:
+                raise WorldBlueprintError("world repair author call budget exhausted")
+            entry = {"step": step, "status": "running", "raw_output": None,
+                     "issue_responses": [], "actual_changes": []}
+            calls.append(entry)
+        try:
+            # The optional outer repair budget counts actual author attempts;
+            # legacy author defaults must not hide extra transport/JSON retries.
+            kwargs = {**kwargs, "retries": 1, "strict_json": True}
+            output = self.tracer.chat_json(step, messages, **kwargs)
+            entry["raw_output"] = deepcopy(output)
+            if not isinstance(output, dict) or "__error__" in output:
+                raise WorldBlueprintError(f"{step} author execution failed: {output}")
+            entry["issue_responses"] = deepcopy(output.get("issue_responses", []))
+            entry["status"] = "returned"
+            with self.lock:
+                self.entries_by_output_id[id(output)] = entry
+            return output
+        except Exception as error:
+            with self.lock:
+                entry["status"] = "error"
+                entry["error"] = f"{type(error).__name__}: {error}"
+                self.fatal = entry["error"]
+            raise
+
+    def record_changes(self, output, before, after, **metadata):
+        with self.lock:
+            entry = self.entries_by_output_id[id(output)]
+            entry.update(metadata)
+            entry["actual_changes"] = _repair_changes(before, after)
+
+
+def _repair_changes(before, after):
+    """Record actual author changes without interpreting their business meaning."""
+    changes = []
+    old_entities = {e["name"]: e.get("fields", {}) for e in before.get("entities", [])}
+    for entity in after.get("entities", []):
+        old = old_entities.get(entity["name"], {})
+        for field in sorted(set(old) | set(entity.get("fields", {}))):
+            if old.get(field) != entity.get("fields", {}).get(field):
+                changes.append({"entity": entity["name"], "field": field,
+                                "before": deepcopy(old.get(field)),
+                                "after": deepcopy(entity.get("fields", {}).get(field))})
+    for key in ("relations", "events"):
+        if before.get(key) != after.get(key):
+            changes.append({"structure": key, "before": deepcopy(before.get(key)),
+                            "after": deepcopy(after.get(key))})
+    return changes
+
+
+def build_world(wp, tracer, log=print, existing=None, narrative: bool = False, *,
+                draft_out: dict | None = None, repair_input: dict | None = None,
+                checkpoint_path=None) -> WorldState:
+    """Original builder, optionally retaining a bound draft or repairing it once.
+
+    Repair input: {draft, feedback, targets: {intrinsic: [{entity, fields}],
+    structure: bool}, max_calls: 4}. Feedback remains fallible author input.
+    ``draft_out`` is updated even on failure; the return type stays WorldState.
+    """
+    from pipeline.world_blueprint import WorldBlueprintError
+    if draft_out is not None and not isinstance(draft_out, dict):
+        raise TypeError("draft_out must be a dictionary")
+    if (wp.get("world_generation") or {}).get("strategy") == "agentic":
+        if narrative:
+            raise WorldBlueprintError("Agentic business world generation does not support game Story Ledger")
+        return _build_agentic_world(wp, tracer, log, existing, draft_out, repair_input, checkpoint_path)
+    state = None
+    if draft_out is not None or repair_input is not None:
+        state = {"version": WORLD_DRAFT_VERSION, "wp_hash": _world_digest(wp),
+                 "existing_base": deepcopy(existing.to_dict()) if existing is not None else None,
+                 "narrative": narrative, "merged": None, "raw_merged": None,
+                 "joint_plan": None, "initial_states": [],
+                 "repair_log": [], "status": "building"}
+    try:
+        if repair_input is not None:
+            if not isinstance(repair_input, dict):
+                raise WorldBlueprintError("repair_input must be an object")
+            draft = deepcopy(repair_input.get("draft"))
+            if not isinstance(draft, dict) or draft.get("version") != WORLD_DRAFT_VERSION:
+                raise WorldBlueprintError("unsupported world draft")
+            if draft.get("draft_hash") != _world_digest({k: v for k, v in draft.items() if k != "draft_hash"}):
+                raise WorldBlueprintError("world draft binding mismatch")
+            if draft.get("wp_hash") != _world_digest(wp) or draft.get("narrative") != narrative:
+                raise WorldBlueprintError("world draft whitepaper/mode mismatch")
+            if draft.get("status") != "completed" or not isinstance(draft.get("merged"), dict):
+                raise WorldBlueprintError("world draft has no completed candidate")
+            if draft.get("candidate_world_hash") != _world_digest(draft.get("candidate_world")):
+                raise WorldBlueprintError("world draft candidate binding mismatch")
+            if existing is not None and existing.to_dict() != draft.get("existing_base"):
+                raise WorldBlueprintError("world repair existing baseline mismatch")
+            if draft.get("mode") == "existing_noop":
+                raise WorldBlueprintError("world repair cannot alter a published existing-only baseline")
+            targets = repair_input.get("targets")
+            if (not isinstance(targets, dict) or set(targets) != {"intrinsic", "structure"}
+                    or not isinstance(targets["intrinsic"], list) or type(targets["structure"]) is not bool):
+                raise WorldBlueprintError("world repair targets must identify intrinsic fields and structure")
+            if not targets["intrinsic"] and not targets["structure"]:
+                raise WorldBlueprintError("world repair has no author targets")
+            max_calls = repair_input.get("max_calls", 4)
+            if type(max_calls) is not int or max_calls < 0:
+                raise WorldBlueprintError("world repair max_calls must be a nonnegative integer")
+            if not isinstance(repair_input.get("feedback"), (dict, list, str)) or not repair_input["feedback"]:
+                raise WorldBlueprintError("world repair requires the original review feedback")
+            state.update({"existing_base": deepcopy(draft["existing_base"]),
+                          "merged": deepcopy(draft["merged"]),
+                          "raw_merged": deepcopy(draft.get("raw_merged")),
+                          "joint_plan": deepcopy(draft.get("joint_plan")),
+                          "initial_states": deepcopy(draft.get("initial_states", [])),
+                          "parent_draft_hash": draft["draft_hash"],
+                          "repair_targets": deepcopy(targets),
+                          "feedback": deepcopy(repair_input["feedback"]),
+                          "max_calls": max_calls, "source_draft": draft})
+            existing = WorldState.from_dict(deepcopy(draft["existing_base"])) if draft["existing_base"] is not None else None
+            tracer = _RepairTracer(tracer, state, max_calls)
+        world = _build_world(wp, tracer, log, existing, narrative, _draft_state=state)
+        if state is not None:
+            state.update({"status": "completed", "candidate_world": deepcopy(world.to_dict()),
+                          "candidate_world_hash": _world_digest(world.to_dict())})
+        return world
+    except Exception as error:
+        if state is not None:
+            state.update({"status": "error", "error": f"{type(error).__name__}: {error}"})
+        raise
+    finally:
+        if state is not None and draft_out is not None:
+            state.pop("source_draft", None)
+            saved = deepcopy(state)
+            saved["draft_hash"] = _world_digest(saved)
+            draft_out.clear()
+            draft_out.update(saved)
+
+
+def _build_agentic_world(wp, tracer, log, existing, draft_out, repair_input, checkpoint_path):
+    """Use the original compiler, finalization and factory gates after agent authoring."""
+    from pipeline.world_agent import generate_world
+    from pipeline.world_blueprint import normalize_world_blueprint, WorldBlueprintError
+    from pipeline.seed_pack import validate_seed_blueprint
+    blueprint = normalize_world_blueprint(wp)
+    if wp.get("seed_contract") is not None:
+        audit = validate_seed_blueprint(wp, wp["seed_contract"])
+        if not audit["passed"]:
+            raise WorldBlueprintError("Seed blueprint is invalid: " + "; ".join(audit["issues"]))
+    baseline = deepcopy(existing.to_dict()) if existing is not None else None
+    state = {"version": WORLD_DRAFT_VERSION, "generation_strategy": "agentic",
+             "wp_hash": _world_digest(wp), "existing_base": baseline, "narrative": False,
+             "merged": None, "raw_merged": None, "joint_plan": None, "initial_states": [],
+             "repair_log": [], "status": "building"}
+    feedback, resume = None, None
+    try:
+        if repair_input is not None:
+            if not isinstance(repair_input, dict):
+                raise WorldBlueprintError("Agent repair input must be an object")
+            draft = repair_input.get("draft")
+            if (not isinstance(draft, dict) or draft.get("generation_strategy") != "agentic"
+                    or draft.get("version") != WORLD_DRAFT_VERSION or draft.get("status") != "completed"
+                    or draft.get("draft_hash") != _world_digest({k: v for k, v in draft.items() if k != "draft_hash"})
+                    or draft.get("wp_hash") != _world_digest(wp) or draft.get("existing_base") != baseline
+                    or draft.get("candidate_world_hash") != _world_digest(draft.get("candidate_world"))):
+                raise WorldBlueprintError("Agent repair draft is stale or changed")
+            feedback = repair_input.get("feedback")
+            if not isinstance(feedback, dict) or not feedback:
+                raise WorldBlueprintError("Agent repair requires the original review feedback")
+            # Saved opinions remain intact in the factory artifact. Repeated full
+            # world/prompt envelopes do not belong in the planner's next context.
+            feedback = {k: deepcopy(v) for k, v in feedback.items()
+                        if k not in {"messages", "input_snapshot", "binding", "previous"}}
+            resume = deepcopy(draft.get("agent"))
+            state["parent_draft_hash"] = draft["draft_hash"]
+        table, agent = generate_world(wp, tracer, existing=existing,
+            checkpoint_path=checkpoint_path, feedback=feedback, resume_state=resume, log=log)
+        state.update(merged=deepcopy(table), raw_merged=deepcopy(table), agent=deepcopy(agent),
+                     initial_states=deepcopy(agent.get("initial_states", [])))
+        if feedback is not None:
+            state["repair_log"] = [{"issue_responses": deepcopy(agent.get("issue_responses", [])),
+                "accepted_units": [{"unit_id": row["unit_id"], "intent": row["intent"]}
+                                   for row in agent.get("units", [])],
+                "retired_units": [row["unit_id"] for row in agent.get("retired_units", [])]}]
+        world, issues = assemble_world(table, blueprint=blueprint, existing=existing,
+                                      include_shape_diagnostics=False)
+        if issues:
+            raise WorldBlueprintError("Agent world has unresolved compiler errors: " + "; ".join(issues))
+        profile = deepcopy(wp.get("domain_profile") or {})
+        fields = {}
+        for item in blueprint["entity_types"]:
+            for field in item.get("fields", []):
+                fields.setdefault(field["name"], deepcopy(field))
+        profile["field_schema"] = list(fields.values())
+        profile["entity_noun"] = next(t["noun"] for t in blueprint["entity_types"] if t.get("primary"))
+        profile["state_machines"] = [{"field": f["name"], "states": f["states"]}
+                                     for f in fields.values() if f.get("states")]
+        protected = seed_protected_fields(wp)
+        profile["seed_protected_fields"] = sorted(protected)
+        blocking = []
+        for kind in blueprint["entity_types"]:
+            typed_world = deepcopy(world)
+            typed_world.entities = {name: rows for name, rows in world.entities.items()
+                                    if world.entity_types.get(name) == kind["id"]}
+            typed_profile = {"field_schema": kind["fields"], "state_machines": [
+                {"field": field["name"], "states": field["states"]}
+                for field in kind["fields"] if field.get("states")]}
+            blocking.extend(_blocking_world_defects(validate(typed_world, table, typed_profile), False,
+                             protected_fields=protected, entity_types=world.entity_types))
+        if blocking:
+            raise WorldBlueprintError("Agent world has unresolved truth defects: "
+                                      + json.dumps(blocking, ensure_ascii=False))
+        world = _finish_world(wp, world, table, profile, blueprint, False, protected, log)
+        state.update(status="completed", candidate_world=deepcopy(world.to_dict()),
+                     candidate_world_hash=_world_digest(world.to_dict()))
+        return world
+    except Exception as exc:
+        state.update(status="error", error=f"{type(exc).__name__}: {exc}")
+        raise
+    finally:
+        if draft_out is not None:
+            saved = deepcopy(state)
+            saved["draft_hash"] = _world_digest(saved)
+            draft_out.clear()
+            draft_out.update(saved)
 
 _BARE_NUM = re.compile(r"^-?\d+(?:\.\d+)?$")
 _FIELD_KIND_SUFFIX = re.compile(
@@ -33,11 +276,12 @@ _NARRATIVE_ADVISORY_DEFECTS = frozenset({"monotonic", "fake_evolving"})
 def _blocking_world_defects(defects: list[dict], narrative: bool, *,
                             protected_fields: set[tuple[str, str]] | None = None,
                             entity_types: dict[str, str] | None = None) -> list[dict]:
-    """返回必须阻塞世界冻结的缺陷；游戏剧情不为题型形状强扭自然轨迹。"""
+    """Separate declared truth constraints from optional task-shape diagnostics."""
     protected_fields = protected_fields or set()
     entity_types = entity_types or {}
     return [item for item in defects
-            if not (item.get("type") in _NARRATIVE_ADVISORY_DEFECTS and
+            if item.get("type") != "monotonic"
+            and not (item.get("type") in _NARRATIVE_ADVISORY_DEFECTS and
                     (narrative or (entity_types.get(item.get("entity")), item.get("field"))
                      in protected_fields))]
 
@@ -92,6 +336,19 @@ def _canonicalize_generated_field_names(fields: dict, allowed: set[str],
     return out
 
 
+def _intrinsic_proposal_issues(entity: dict, blueprint: dict) -> list[str]:
+    """Reuse the canonical compiler before counting a typed entity as generated.
+
+    Only this entity's field issues belong to its author. Missing other entity
+    counts, relations and events belong to later original stages and are ignored.
+    This does not decide business meaning or create any replacement value.
+    """
+    _, issues = assemble_world({"entities": [entity]}, blueprint=blueprint)
+    name = entity["name"]
+    prefixes = (f"entity {name}.", f"entity {name}(")
+    return [issue for issue in issues if issue.startswith(prefixes)]
+
+
 def _filter_incremental_structure(structure: dict, existing: WorldState,
                                   blueprint: dict) -> tuple[list[dict], list[dict]]:
     """过滤增量骨架中与旧世界重复或同期冲突的候选。
@@ -142,6 +399,34 @@ def _filter_incremental_structure(structure: dict, existing: WorldState,
         if not clashes:
             events.append(item)
     return relations, events
+
+
+def _check_repair_baseline(structure, existing, blueprint):
+    """Reject attempts to rewrite published operations before delta filtering."""
+    from pipeline.world_blueprint import WorldBlueprintError
+    for key in ("relations", "events"):
+        old = {item.get("id"): item for item in getattr(existing, key)}
+        for item in structure.get(key, []):
+            if not isinstance(item, dict):
+                raise WorldBlueprintError("world structure repair contains a non-object instance")
+            if item.get("id") in old and item != old[item["id"]]:
+                raise WorldBlueprintError("world structure repair changed a published instance")
+            if item.get("id") in old:
+                continue
+            slots = []
+            if key == "relations":
+                declaration = next((d for d in blueprint.get("relation_types", [])
+                                    if d["id"] == item.get("type")), None)
+                if declaration:
+                    owner = item.get("from") if relation_owner_side(blueprint, declaration) != "to" else item.get("to")
+                    slots.append((owner, declaration["field"]))
+            else:
+                slots.extend((e.get("entity"), e.get("field")) for e in item.get("effects", [])
+                             if isinstance(e, dict))
+            for entity, field in slots:
+                timeline = existing.timeline(entity, field)
+                if timeline and any(op.session == item.get("session") for op in timeline.ops):
+                    raise WorldBlueprintError("world structure repair rewrote a published operation slot")
 
 
 def _wire_declared_causality(structure: dict, blueprint: dict) -> int:
@@ -382,16 +667,39 @@ def _field_desc(f: dict) -> str:
     return f"{f.get('name')}({'·'.join(str(a) for a in ann)})"
 
 
+def _natural_identity_mode(wp: dict, blueprint: dict) -> bool:
+    """Existing typed/seed/quality modes allow distinct full object identities."""
+    quality = wp.get("quality_contract") or {}
+    return (not blueprint.get("legacy_adapter", False) or bool(wp.get("seed_contract"))
+            or any(quality.get(key) for key in ("scoring_policy", "world_semantic_review",
+                                                "corpus_review", "public_semantic_review")))
+
+
 def _world_system(profile: dict, type_id: str, time_unit: str, open_schema: bool = False,
-                  narrative: bool = False, typed: bool = False, seeded: bool = False) -> str:
+                  narrative: bool = False, typed: bool = False, seeded: bool = False,
+                  natural_identity: bool = False) -> str:
     noun = profile.get("entity_noun", "实体")
     fields = profile.get("field_schema", [])
     fdesc = "、".join(_field_desc(f) for f in fields) or ("若干随时间演化字段" if open_schema else "无内在字段")
     stopped = profile.get("stopped_phrase", "停止/失效")
+    natural_identity = natural_identity or typed or seeded
+    world_scope = f"只为蓝图实体类型【{type_id} / {noun}】设计一批随时间({time_unit})演化的真值表。"
+    identity_policy = ('★所有专名(实体名 + 人名类字段值)**表面互不近似**:禁止'
+                       '"张三/张三(数据)/张三_数据"这类共享主干的近重名'
+                       '(下游机械校验表面塌缩,近重名整条作废)。')
+    if natural_identity:
+        world_scope = (f"只为蓝图实体类型【{type_id} / {noun}】填写给定观察窗口({time_unit})内的事实。"
+                       "按对象与字段的业务含义判断稳定或变化；时间推进本身不要求改变取值。"
+                       "区分对象的固定内容、后续修订和业务状态，不把不同对象或版本混成一个对象的逐期变化。")
+        identity_policy = ("实体的完整名称必须唯一并能区分实际对象；合法共享主体、名称主干、年份或版本系列均允许。"
+                           "保留有业务意义的区分信息，不用不同名称伪造同一对象，也不为避免相似而虚构不同主体。"
+                           "使用完整名称和已声明关系表达身份；实际指代不清应说明，不能只因主干相同判错。")
     if narrative or seeded:
         numeric_policy = (
-            "- numeric 字段:按领域规律与事件节奏自然变化；不得为题型刻意制造峰谷。"
-            "若清单声明累计只增/只减/值域，必须遵守；数值写纯阿拉伯数字、不加千分位逗号，单位按字段清单。")
+            ("- numeric 字段:按领域规律与事件节奏自然变化或保持稳定；不得为题型刻意制造峰谷。"
+             if natural_identity else
+             "- numeric 字段:按领域规律与事件节奏自然变化；不得为题型刻意制造峰谷。")
+            + "若清单声明累计只增/只减/值域，必须遵守；数值写纯阿拉伯数字、不加千分位逗号，单位按字段清单。")
         coverage_policy = (
             "- 本阶段只填写清单中的内在字段，可以自然演化或保持稳定，不强制停用/null；"
             "关系和事件驱动字段留给后续阶段，本阶段不得填写；无内在字段时输出 fields={}。"
@@ -400,21 +708,52 @@ def _world_system(profile: dict, type_id: str, time_unit: str, open_schema: bool
             "domain event 驱动字段仍只给可选初态。")
     else:
         numeric_policy = (
-            "- numeric 字段:给 trajectory。默认非单调(峰/谷/反弹,最大或最小值落在非首非尾期,防 MR 退化);"
+            "- numeric 字段:按领域规律自然变化或保持稳定，不为题型刻意制造中间峰谷；"
             "若字段标了累计只增则逐期不减、标了只减则逐期不增、标了值域则全程不出界。"
             "所有数值写纯阿拉伯数字、不加千分位逗号，单位按字段清单。")
         coverage_policy = (
             "- 非结构驱动字段按领域自然生命周期演化或保持稳定，不为题型强制停用/null；"
             "若全部字段由 domain event 驱动，可直接输出空 fields。"
-            if typed else
+            if typed or natural_identity else
             f"- 若存在非结构驱动字段，至少 1 个字段末尾 null(={stopped})；"
             "若全部字段由 domain event 驱动，可直接输出空 fields。")
     return render("world.system", noun=noun, type_id=type_id, time_unit=time_unit,
                   fdesc=fdesc, stopped=stopped, numeric_policy=numeric_policy,
-                  coverage_policy=coverage_policy)
+                  coverage_policy=coverage_policy, world_scope=world_scope,
+                  identity_policy=identity_policy)
 
 
-def build_world(wp, tracer, log=print, existing=None, narrative: bool = False) -> WorldState:
+def _finish_world(wp, ws, merged, profile, blueprint, narrative, protected_fields, log):
+    """Original deterministic finalization, also used for zero-call draft replay."""
+    typed_contract = not blueprint.get("legacy_adapter", False)
+    if typed_contract:
+        active_l7 = any(str(item.get("line") or "").strip().lower().startswith("l7")
+                        and float(item.get("weight") or 0) > 0
+                        for item in wp.get("active_lines", []) if isinstance(item, dict))
+        planted = imprint_structure(ws, log, profile) if active_l7 else 0
+        log("  ✓ typed world 冻结:跳过 legacy 单位补写，关系/事件字段保持同一真源"
+            + (f"；L7 对 {planted} 个内在数值字段完成确定性基质整形" if active_l7 else ""))
+    else:
+        _affix_units(ws, profile, log)
+        imprint_structure(ws, log, profile)
+    validate_seed_world(wp, ws)
+    final_checks = validate(ws, merged, profile)
+    blocking = _blocking_world_defects(final_checks, narrative,
+                                      protected_fields=protected_fields, entity_types=ws.entity_types)
+    ws.generation_diagnostics = [{**item, "severity": "diagnostic",
+        "scope": "generation_advisory_not_world_error_or_measured_question_difficulty"}
+        for item in final_checks if item not in blocking]
+    if _natural_identity_mode(wp, blueprint):
+        ws.generation_diagnostics.extend({
+            "type": "similar_name_stem", "entities": names, "severity": "diagnostic",
+            "scope": "surface_similarity_not_identity_error_or_semantic_acceptance",
+            "detail": "完整名称不同但启发式主干相同；保留原身份，依据实际对象、关系与公开表达判断是否清楚。"
+        } for names in sorted(name_collisions(ws)))
+    return ws
+
+
+def _build_world(wp, tracer, log=print, existing=None, narrative: bool = False,
+                 *, _draft_state=None) -> WorldState:
     """按白皮书蓝图生成 typed world，并将关系/事件编译进既有 Timeline 地基。
 
     历史白皮书会先适配成单类型蓝图；显式蓝图不合法、类型数量不足或声明结构没有
@@ -425,6 +764,11 @@ def build_world(wp, tracer, log=print, existing=None, narrative: bool = False) -
     from pipeline.world_blueprint import normalize_world_blueprint, WorldBlueprintError
 
     blueprint = normalize_world_blueprint(wp)
+    repairing = _draft_state is not None and "source_draft" in _draft_state
+    if _draft_state is not None:
+        _draft_state["blueprint_hash"] = _world_digest(blueprint)
+        if repairing and _draft_state["source_draft"].get("blueprint_hash") != _world_digest(blueprint):
+            raise WorldBlueprintError("world draft blueprint binding mismatch")
     if wp.get("seed_contract") is not None:
         from pipeline.seed_pack import validate_seed_blueprint
         seed_blueprint_report = validate_seed_blueprint(wp, wp["seed_contract"])
@@ -469,17 +813,21 @@ def build_world(wp, tracer, log=print, existing=None, narrative: bool = False) -
     noun = primary["noun"]
     # ★W.3:让 build_world 真正消费白皮书的 change_density / traps(此前全程无视)
     cd = (spec.get("timeline", {}) or {}).get("change_density", "")
-    # 近重名陷阱已在源头【议会菜单 council.traps】删除(不靠代码子串猜,审计★1);
-    # 万一漏网,seen_base 在收集期按主干去重(出口拦截)= 真兜底,故此处不再用关键词黑名单过滤。
+    # Legacy keeps its surface-name heuristic. Modern authoring keeps distinct
+    # full identities and records stem similarity as a fallible diagnostic.
     traps = [t.get("trap") for t in (wp.get("traps") or []) if t.get("trap")][:3]
     base_extra = ""
     if not narrative:
         base_extra = (f"★变更密度:evolving 字段尽量按「{cd}」铺满全程。" if cd else "")
         base_extra += (f"★陷阱布局:本场景需自然埋入这些坑——{traps}(如可矛盾的多源字段、易混字段)。" if traps else "")
-    merged = {"entities": [], "relations": [], "events": [], "cascades": [], "absent_fields": []}
+    merged = (deepcopy(_draft_state["merged"]) if repairing else
+              {"entities": [], "relations": [], "events": [], "cascades": [], "absent_fields": []})
+    if _draft_state is not None:
+        _draft_state["merged"] = merged
     base_ents = existing.entities if existing is not None else {}    # ★增量:在既有世界上只长新实体
     seen = set(base_ents)                             # 新实体名避开既有
-    seen_base = {_strip_disambig(e) for e in base_ents}  # ★Fix3:也避开既有主干(不近重名)
+    seen_base = {_strip_disambig(e) for e in base_ents}
+    natural_identity = _natural_identity_mode(wp, blueprint)
     batch = 8
 
     existing_types = getattr(existing, "entity_types", {}) if existing is not None else {}
@@ -490,7 +838,7 @@ def build_world(wp, tracer, log=print, existing=None, narrative: bool = False) -
         existing_types = existing.entity_types
     missing_total = sum(max(0, t["count"] - sum(1 for x in existing_types.values() if x == t["id"]))
                         for t in type_specs)
-    if existing is not None and missing_total == 0:
+    if existing is not None and missing_total == 0 and not repairing:
         # 闭环已有实体数已达目标时保持真正 no-op：不调用 LLM、不重建旧 timeline，只补元数据。
         existing.n_sessions = max(existing.n_sessions or 0, n_sessions)
         existing.world_blueprint = blueprint
@@ -501,6 +849,9 @@ def build_world(wp, tracer, log=print, existing=None, narrative: bool = False) -
             _affix_units(existing, profile, log)
             imprint_structure(existing, log, profile)
         validate_seed_world(wp, existing)
+        if _draft_state is not None:
+            _draft_state["mode"] = "existing_noop"
+            _draft_state["raw_merged"] = deepcopy(merged)
         return existing
     relation_fields = {}
     for rel in blueprint.get("relation_types", []):
@@ -514,8 +865,117 @@ def build_world(wp, tracer, log=print, existing=None, narrative: bool = False) -
             tid = roles.get(effect.get("role"))
             event_fields.setdefault(tid, set()).add(effect.get("field"))
 
+    # A single shared author proposal precedes independent field decisions.
+    # It is retained in the original draft, never used as canonical evidence.
+    joint_plan = None
+    joint_text = ""
+    joint_enabled = bool(seed_hint) and not narrative
+    initial_states = deepcopy((_draft_state or {}).get("initial_states", []))
+    if joint_enabled:
+        from pipeline import world_joint_plan
+        plan_calendar = WorldState(n_sessions=n_sessions, world_blueprint=blueprint)
+        joint_context = world_joint_plan.make_context(
+            wp, blueprint, [{"session": s, "date": plan_calendar.date_of_session(s)}
+                            for s in range(n_sessions)], existing)
+        if repairing:
+            joint_plan = deepcopy(_draft_state["joint_plan"])
+        else:
+            joint_plan = world_joint_plan.author_plan(
+                wp, joint_context, tracer, model=config.STRUCTURE_MODEL,
+                max_tokens=WORLD_JSON_MAX_TOKENS)
+            if _draft_state is not None:
+                _draft_state["joint_plan"] = deepcopy(joint_plan)
+        errors = world_joint_plan.validate_plan(joint_plan, wp, joint_context)
+        if errors:
+            raise WorldBlueprintError("joint world author plan failed: " + "; ".join(errors)
+                                      + "; " + str((joint_plan or {}).get("error", "")))
+        joint_text = world_joint_plan.shared_prompt(joint_plan)
+
+    def check_joint_plan():
+        if joint_enabled:
+            errors = world_joint_plan.validate_plan(joint_plan, wp, joint_context)
+            if errors:
+                raise WorldBlueprintError("joint world author plan drift: " + "; ".join(errors))
+
+    # Entity authors need the shared types and actual earlier objects even when
+    # no seed/planning call is selected. This is read-only author context, not
+    # permission to write another type's fields or rename existing identities.
+    author_declarations = ({key: deepcopy(blueprint.get(key, []))
+                            for key in ("entity_types", "relation_types")}
+                           if natural_identity else None)
+    published_objects = []
+    if natural_identity and existing is not None:
+        published_objects = [{"name": name, "type": existing_types.get(name),
+                              "timelines": deepcopy(fields)}
+                             for name, fields in existing.to_dict()["entities"].items()]
+
+    repair_fields = {}
+    if repairing:
+        # Recompile the saved author proposal; never infer an editable proposal
+        # backwards from the final Timeline. Deterministic original finalizers
+        # must reproduce exactly the candidate that the caller reviewed.
+        prior = _draft_state["source_draft"]
+        check, issues = assemble_world(merged, blueprint=blueprint, existing=existing)
+        if any(issue.startswith(("entity ", "relation", "event", "causal rule")) for issue in issues):
+            raise WorldBlueprintError("world draft cannot recompile under its original blueprint")
+        check.n_sessions = max(check.n_sessions, n_sessions,
+                               existing.n_sessions if existing is not None else 0)
+        if narrative:
+            from pipeline.story import compile_story_ledger
+            check.narrative = compile_story_ledger(check, prior["candidate_world"].get("narrative"))
+        _finish_world(wp, check, merged, profile, blueprint, narrative, protected_fields, lambda *_: None)
+        if check.to_dict() != prior["candidate_world"]:
+            raise WorldBlueprintError("world draft does not reproduce the reviewed candidate")
+        entities_by_name = {e["name"]: e for e in merged["entities"]}
+        for target in _draft_state["repair_targets"]["intrinsic"]:
+            if (not isinstance(target, dict) or set(target) != {"entity", "fields"}
+                    or not isinstance(target["entity"], str) or not isinstance(target["fields"], list)
+                    or not target["fields"] or any(not isinstance(f, str) for f in target["fields"])
+                    or len(set(target["fields"])) != len(target["fields"])):
+                raise WorldBlueprintError("invalid intrinsic world repair target")
+            name = target["entity"]
+            if name in base_ents or name not in entities_by_name or name in repair_fields:
+                raise WorldBlueprintError("intrinsic repair cannot change existing/unknown/duplicate entities")
+            entity = entities_by_name[name]
+            owned = relation_fields.get(entity["type"], set()) | event_fields.get(entity["type"], set())
+            if set(target["fields"]) & owned or not set(target["fields"]).issubset(entity.get("fields", {})):
+                raise WorldBlueprintError("intrinsic repair may only target existing intrinsic proposal fields")
+            repair_fields[name] = set(target["fields"])
+        for name, fields in repair_fields.items():
+            entity = entities_by_name[name]
+            before = deepcopy(merged)
+            check_joint_plan()
+            output = tracer.chat_json("world.repair", [
+                {"role": "system", "content": (
+                    "你是原世界的内在字段作者，正在根据可质疑的业务审阅意见定向返修。"
+                    "原任务和冻结蓝图是依据，审阅意见不是新增规则。只可返回授权实体的授权字段；"
+                    "不改实体身份、其他字段、关系或事件，不降低种子要求，不为难度制造变化。"
+                    "可以基于原任务与既有事实反驳误审或保留未决；解释不是新增世界事实。"
+                    "未修改的字段可省略。严格JSON：{\"fields\":{},\"issue_responses\":"
+                    "[{\"issue_id\":\"原意见id\",\"disposition\":\"addressed|disputed|deferred\","
+                    "\"response\":\"基于原任务/事实的解释\"}]}")},
+                {"role": "user", "content": json.dumps({
+                    "entity": name, "allowed_fields": sorted(fields),
+                    "world_blueprint": blueprint, "original_proposal": merged,
+                    "reviewed_world": prior["candidate_world"],
+                    "fallible_review_feedback": _draft_state["feedback"]}, ensure_ascii=False)
+                 + seed_hint + joint_text}],
+                temperature=0.2, max_tokens=WORLD_JSON_MAX_TOKENS,
+                model=config.STRUCTURE_MODEL, retries=1, strict_json=True)
+            check_joint_plan()
+            new_fields = output.get("fields")
+            if not isinstance(new_fields, dict) or not set(new_fields).issubset(fields):
+                raise WorldBlueprintError("semantic intrinsic repair changed fields outside its targets")
+            if any(k in output for k in ("entities", "relations", "events", "world_blueprint", "seed_contract")):
+                raise WorldBlueprintError("semantic intrinsic repair attempted to change structure/identity")
+            entity["fields"].update(deepcopy(new_fields))
+            tracer.record_changes(output, before, merged, entity=name,
+                                  allowed_fields=sorted(fields))
+
     # 每个 entity type 独立生成，只给本类型字段；类型不是 prompt 装饰，而是字段白名单的索引。
     for t in type_specs:
+        if repairing:
+            continue  # The reviewed entities remain the candidate; no hidden regeneration.
         tid, type_noun = t["id"], t["noun"]
         base_count = (sum(1 for x in existing_types.values() if x == tid)
                       if existing_types else (len(base_ents) if blueprint.get("legacy_adapter") else 0))
@@ -543,18 +1003,53 @@ def build_world(wp, tracer, log=print, existing=None, narrative: bool = False) -
                                "不要为了满足末尾 null 要求擅自生成任何字段轨迹。")
         open_schema = bool(blueprint.get("legacy_adapter") and not intrinsic)
         sysp = _world_system(type_profile, tid, time_unit, open_schema=open_schema,
-                             narrative=narrative, typed=typed_contract, seeded=bool(seed_hint))
+                             narrative=narrative, typed=typed_contract, seeded=bool(seed_hint),
+                             natural_identity=natural_identity)
         trajectory_request = (
-            "非结构驱动字段只按剧情世界的自然节奏变化，不为题型造峰谷或强塞 null"
-            if narrative or seed_hint else "非结构驱动字段允许时做非单调演化并让至少一个字段 null 结尾")
+            "非结构驱动字段按对象与字段含义保持稳定或自然变化，不为题型造峰谷或强塞 null"
+            if natural_identity else
+            "非结构驱动字段只按领域的自然节奏变化，不为题型造峰谷或强塞 null"
+            if narrative or seed_hint or typed_contract else
+            "非结构驱动字段按领域自然演化；不为题型强制中间峰谷，停用按已声明约定处理")
 
+        rejected_intrinsic: list[dict] = []
         for rnd in range(4):
             need = want_total - base_count - len(produced)
             if need <= 0:
                 break
             wants = [min(batch, max(0, need - i * batch)) for i in range((need + batch - 1) // batch)]
+            actual_objects = [{key: deepcopy(e[key]) for key in ("name", "type", "fields", "purpose")
+                               if key in e} for e in merged["entities"] + produced]
+
+            author_context = ""
+            if natural_identity:
+                author_context = (
+                    "\n【冻结白皮书的类型与关系声明；仅供跨对象理解，不扩大本批字段权限】"
+                    + json.dumps(author_declarations, ensure_ascii=False)
+                    + "\n【已发布对象及 canonical 字段时间线；只读，不得修改】"
+                    + json.dumps(published_objects, ensure_ascii=False)
+                    + "\n【此前已生成的实际对象与内在事实；purpose 仅为作者用途说明】"
+                    + json.dumps(actual_objects, ensure_ascii=False)
+                    + "\n上述本轮对象仍是待编译候选，不是已审通过的事实；"
+                      "本轮尚无记录的字段与关系不能由名称或用途说明补成真值。"
+                      "可以在新对象的标题或描述中准确引用已有对象的完整名称，"
+                      "引用已有对象不等于新建同名实体。不要为躲避重名而另造被引用的人或对象。"
+                      "仍只返回本批类型与授权内在字段；不改已有对象，不代写结构作者负责的关系或事件。")
+                if joint_enabled:
+                    author_context += (
+                        "\n依据共同计划和已有实际对象分配本批用途，不引用尚不存在的计划别名。"
+                        "可在每个 entity 附 purpose 简述其用途；它不新增 canonical 事实。")
+
+            intrinsic_feedback = (
+                "\n【上轮本类型未接受的内在字段候选及原编译错误】\n"
+                + json.dumps(rejected_intrinsic, ensure_ascii=False)
+                + "\n这些对象尚未计入已生成数量。只在本批类型原字段权限内修正或重新提出，"
+                  "返回本轮所需数量；保留已接受对象，不补关系或事件，不改冻结声明。"
+                if rejected_intrinsic else "")
+            rejected_intrinsic = []
 
             def _world_batch(want):
+                check_joint_plan()
                 used_names = json.dumps(sorted(seen), ensure_ascii=False)
                 return tracer.chat_json("world.batch",
                     [{"role": "system", "content": sysp},
@@ -562,11 +1057,19 @@ def build_world(wp, tracer, log=print, existing=None, narrative: bool = False) -
                                                           type_id=tid, smax=n_sessions - 1,
                                                           trajectory_request=trajectory_request,
                                                           extra=type_extra)
-                      + f"\n【全世界已占用专名，禁止复用或换类型冒用】{used_names}"
-                        "\n必须返回足量、与本类型 noun 相称的新专名。"}],
-                    temperature=0.7, max_tokens=WORLD_JSON_MAX_TOKENS)
+                      + joint_text
+                      + author_context
+                      + intrinsic_feedback
+                      + ((f"\n【全世界已占用实体完整名称；不得再次新建同名实体或换类型冒用】{used_names}"
+                          "\n必须返回足量、与本类型 noun 相称且完整名称不同的新实体；"
+                          "标题或描述可按实际语义引用已有对象。") if natural_identity else
+                         (f"\n【全世界已占用专名，禁止复用或换类型冒用】{used_names}"
+                          "\n必须返回足量、与本类型 noun 相称的新专名。"))}],
+                    temperature=0.7, max_tokens=WORLD_JSON_MAX_TOKENS,
+                    strict_json=True, response_format={"type": "json_object"})
 
             for out in config.pmap(_world_batch, wants, workers=len(wants)):
+                check_joint_plan()
                 if not isinstance(out, dict) or "__error__" in out:
                     detail = (out.get("__error__", "非 JSON object")
                               if isinstance(out, dict) else "非 JSON object")
@@ -583,23 +1086,29 @@ def build_world(wp, tracer, log=print, existing=None, narrative: bool = False) -
                     if not nm or nm in seen or not isinstance(e.get("fields", {}), dict):
                         continue
                     base = _strip_disambig(nm)
-                    if base in seen_base:
+                    if not natural_identity and base in seen_base:
                         continue
                     allowed = {f.get("name") for f in intrinsic if f.get("name")}
-                    required = allowed - event_fields.get(tid, set())
                     fields = _canonicalize_generated_field_names(
                         dict(e.get("fields") or {}), allowed, intrinsic)
                     off_schema = [] if open_schema else [fn for fn in fields if fn not in allowed]
                     for fn in off_schema:
                         fields.pop(fn, None)
-                    if typed_contract and not required.issubset(fields):
-                        continue                     # 缺本类型内在字段的实体不计数，交给下一生成轮补齐
                     if typed_contract:
                         # 事件字段连初态也只由 structure 生成。保留 entity batch 的 session-0
                         # 基线会与 session-0 event 双写，形成两个真源。
                         for fname in event_fields.get(tid, set()) - relation_fields.get(tid, set()):
                             fields.pop(fname, None)
                     e["fields"] = fields
+                    if typed_contract:
+                        issues = _intrinsic_proposal_issues(e, blueprint)
+                        if issues:
+                            rejection = {"proposal": deepcopy(e), "issues": issues}
+                            rejected_intrinsic.append(rejection)
+                            if _draft_state is not None:
+                                _draft_state.setdefault("intrinsic_rejections", []).append(
+                                    {"type_id": tid, "round": rnd + 1, **deepcopy(rejection)})
+                            continue  # Retry this original type author within the same four rounds.
                     seen.add(nm); seen_base.add(base); produced.append(e)
                     if base_count + len(produced) >= want_total:
                         break
@@ -613,7 +1122,8 @@ def build_world(wp, tracer, log=print, existing=None, narrative: bool = False) -
     # 关系/事件在所有 typed entities 生成后统一实例化；此处只负责 canonical world。
     structural_markers = ("entity ", "relation", "event", "causal rule")
     structure: dict = {}
-    if typed_contract and (blueprint.get("relation_types") or blueprint.get("event_types")):
+    if (typed_contract and (blueprint.get("relation_types") or blueprint.get("event_types"))
+            and (not repairing or _draft_state["repair_targets"]["structure"])):
         def _initial_state(name, tid, raw_fields=None):
             out = {}
             if raw_fields is None and existing is not None:
@@ -635,37 +1145,113 @@ def build_world(wp, tracer, log=print, existing=None, narrative: bool = False) -
                         out[fname] = first.get("value")
             return out
 
+        # The structure author must see the already generated facts, not just
+        # occupied names. Keep raw intrinsic specifications and existing
+        # canonical operation histories distinct; neither is a new truth source.
+        existing_data = existing.to_dict() if existing is not None else {}
         catalog = [{"name": e, "type": existing_types.get(e),
-                    "initial_state": _initial_state(e, existing_types.get(e))} for e in base_ents]
+                    "initial_state": _initial_state(e, existing_types.get(e)),
+                    "canonical_fields": existing_data["entities"][e]} for e in base_ents]
         catalog += [{"name": e.get("name"), "type": e.get("type"),
-                     "initial_state": _initial_state(e.get("name"), e.get("type"), e.get("fields") or {})}
+                     "initial_state": _initial_state(e.get("name"), e.get("type"), e.get("fields") or {}),
+                     "intrinsic_fields": {f: deepcopy(value) for f, value in (e.get("fields") or {}).items()
+                                          if not joint_enabled or f not in event_fields.get(e.get("type"), set())},
+                     **({"purpose": deepcopy(e["purpose"])} if "purpose" in e else {})}
                     for e in merged["entities"]]
+        existing_canonical = {key: deepcopy(existing_data.get(key, []))
+                              for key in ("relations", "events", "cascades", "absent_fields")}
+        calendar = WorldState(n_sessions=n_sessions, world_blueprint=blueprint)
+        session_dates = [{"session": session, "date": calendar.date_of_session(session)}
+                         for session in range(n_sessions)]
+        review_hint = ("\n【本次定向返修：原候选与可质疑审阅意见】\n"
+                       + json.dumps({"original_proposal": merged,
+                                     "reviewed_world": _draft_state["source_draft"]["candidate_world"],
+                                     "fallible_review_feedback": _draft_state["feedback"]}, ensure_ascii=False)
+                       + ("\n只修改本次未发布候选的relations/events以及结构作者拥有的initial_states；"
+                          "初态仍仅限新实体的event-owned非relation字段，不改实体身份、其他内在字段、蓝图或种子。"
+                          if joint_enabled else
+                          "\n只修改本次候选的relations/events，不改实体、内在字段、蓝图或种子。")
+                       +
+                       "审阅意见不是新增业务规则；可依据原任务/已有事实反驳并保持原结构，或明确未决。"
+                       "不要为了题型或难度改造真值。返回完整候选结构，可附issue_responses列表，"
+                       "各项含issue_id、disposition(addressed|disputed|deferred)、response；解释不能补写世界事实。"
+                       if repairing else "")
         hint = ""
         for attempt in range(3):
+            before_structure = deepcopy(merged) if repairing else None
+            check_joint_plan()
             structure = tracer.chat_json("world.structure",
-                [{"role": "system", "content": render("world.structure", smax=n_sessions - 1)},
+                [{"role": "system", "content": render("world.structure", smax=n_sessions - 1)
+                  + (world_joint_plan.BASELINE_INSTRUCTION if joint_enabled else "")},
                  {"role": "user", "content": render(
                      "world.structure_user", time_unit=time_unit, cadence=temporal["cadence"],
                      smax=n_sessions - 1, blueprint=json.dumps(blueprint, ensure_ascii=False),
-                     entities=json.dumps(catalog, ensure_ascii=False))
+                     entities=json.dumps(catalog, ensure_ascii=False),
+                     session_dates=json.dumps(session_dates, ensure_ascii=False),
+                     existing_canonical=json.dumps(existing_canonical, ensure_ascii=False))
                  + (("\n【game 剧情节奏】事件至少铺到 3 个 session，任何一个 session 不得堆入过半事件；"
                      "按前置行动→结果组织，禁止把击败、完成、解锁等收束事件全塞进开场。"
                      "所有事件必须经共享参与者、显式关系或 caused_by 连到唯一主角。")
                     if narrative else "")
-                 + seed_hint + hint}],
+                 + seed_hint + joint_text + review_hint + hint}],
                 temperature=0.4 if attempt == 0 else 0.2,
                 max_tokens=WORLD_JSON_MAX_TOKENS,
                 model=config.STRUCTURE_MODEL, retries=1, strict_json=True)
+            check_joint_plan()
             if not isinstance(structure, dict) or "__error__" in structure:
                 detail = structure.get("__error__", "非 JSON object") if isinstance(structure, dict) else "非 JSON object"
                 raise WorldBlueprintError(f"world.structure 调用失败:{detail}")
+            attempt_record = {"attempt": attempt + 1, "raw_output": deepcopy(structure),
+                              "status": "returned"}
+            if _draft_state is not None:
+                _draft_state.setdefault("structure_attempts", []).append(attempt_record)
             if isinstance(structure, dict):
+                if repairing:
+                    if any(k in structure for k in ("entities", "world_blueprint", "seed_contract", "cascades", "absent_fields")):
+                        raise WorldBlueprintError("world structure repair attempted to change non-structural inputs")
+                    if not all(isinstance(structure.get(key), list)
+                               and all(isinstance(item, dict) for item in structure[key])
+                               for key in ("relations", "events")):
+                        raise WorldBlueprintError("world structure repair needs complete relations/events arrays")
+                    if existing is not None:
+                        _check_repair_baseline(structure, existing, blueprint)
                 _wire_declared_causality(structure, blueprint)
+                if joint_enabled:
+                    from pipeline.value_types import ValueComparisonError
+                    try:
+                        new_entities, new_initial_states = world_joint_plan.apply_initial_states(
+                            merged, structure, blueprint, base_ents, initial_states)
+                    except (WorldBlueprintError, ValueComparisonError) as error:
+                        # Author-format/ownership errors use the same bounded structure
+                        # feedback loop. The helper has not mutated the prior candidate.
+                        attempt_record.update(status="invalid_initial_state", issues=[str(error)])
+                        if attempt == 2:
+                            raise WorldBlueprintError(
+                                "world structure initial-state validation exhausted: " + str(error)) from error
+                        hint = ("\n【上轮初态机械校验失败，必须基于该候选修正】\n- "
+                                + str(error)
+                                + "\n初态与事件不得占同一 session-0 槽，不得略过校验或修改已发布世界。"
+                                  "修正本候选初态或合法事件安排；返回完整 relations/events/initial_states。"
+                                + "\n【上轮未接受的完整候选 JSON】\n"
+                                + json.dumps(structure, ensure_ascii=False))
+                        log(f"  ⟳ 世界骨架初态修复轮{attempt+1}:{error}")
+                        continue
+                    merged["entities"] = new_entities
+                    initial_states = new_initial_states
+                    if _draft_state is not None:
+                        _draft_state["initial_states"] = deepcopy(initial_states)
                 relations = [x for x in structure.get("relations", []) if isinstance(x, dict)]
                 events = [x for x in structure.get("events", []) if isinstance(x, dict)]
                 if existing is not None:
                     relations, events = _filter_incremental_structure(structure, existing, blueprint)
                 merged["relations"], merged["events"] = relations, events
+                if _draft_state is not None:
+                    if _draft_state["raw_merged"] is None:
+                        _draft_state["raw_merged"] = deepcopy(merged)
+                    if repairing:
+                        tracer.record_changes(structure, before_structure, merged,
+                                              allowed_structure=["relations", "events"]
+                                              + (["initial_states"] if joint_enabled else []))
             trial, trial_issues = assemble_world(merged, blueprint=blueprint, existing=existing)
             if narrative and isinstance(structure, dict):
                 connected = 0
@@ -678,6 +1264,10 @@ def build_world(wp, tracer, log=print, existing=None, narrative: bool = False) -
                         merged, blueprint=blueprint, existing=existing)
                 if connected:
                     log(f"  ✓ 代码连接 {connected} 个断开剧情事件到主角分量")
+                if repairing:
+                    tracer.record_changes(structure, before_structure, merged,
+                                          allowed_structure=["relations", "events"]
+                                          + (["initial_states"] if joint_enabled else []))
             structural_issues = [x for x in trial_issues if x.startswith(structural_markers)]
             structural_issues.extend(seed_world_issues(wp, trial))
             trial_defects = _blocking_world_defects(
@@ -702,6 +1292,8 @@ def build_world(wp, tracer, log=print, existing=None, narrative: bool = False) -
                     + "\n【上轮候选 JSON】\n"
                     + json.dumps(structure, ensure_ascii=False))
 
+    if _draft_state is not None and _draft_state["raw_merged"] is None:
+        _draft_state["raw_merged"] = deepcopy(merged)
     ws, compile_issues = assemble_world(merged, blueprint=blueprint, existing=existing)
     structural_issues = [x for x in compile_issues if x.startswith(structural_markers)]
     final_defects = _blocking_world_defects(validate(ws, merged, profile), narrative,
@@ -741,9 +1333,14 @@ def build_world(wp, tracer, log=print, existing=None, narrative: bool = False) -
         by_ent: dict = {}
         for d in defects:
             by_ent.setdefault(d["entity"], []).append(d)
+        if repairing and any(ent not in repair_fields or
+                             not {d["field"] for d in ds}.issubset(repair_fields[ent])
+                             for ent, ds in by_ent.items()):
+            raise WorldBlueprintError("mechanical repair would exceed the reviewed intrinsic targets")
         log(f"  ⟳ 世界修复轮{rep+1}:{len(defects)} 个字段缺陷({len(by_ent)} 实体)→ 定向重生成坏字段")
 
         def _repair(item):
+            check_joint_plan()
             ent, ds = item
             cur = (ent_idx.get(ent) or {}).get("fields", {})
             tid = (ent_idx.get(ent) or {}).get("type") or getattr(ws, "entity_types", {}).get(ent)
@@ -753,14 +1350,22 @@ def build_world(wp, tracer, log=print, existing=None, narrative: bool = False) -
                 for d in ds)
             return ent, tracer.chat_json("world.repair",
                 [{"role": "system", "content": render("world.repair", noun=repair_noun, smax=n_sessions - 1)},
-                 {"role": "user", "content": render("world.repair_user", noun=repair_noun, ent=ent, defects=lines, smax=n_sessions - 1) + seed_entity_prompt(wp, tid)}],
+                 {"role": "user", "content": render("world.repair_user", noun=repair_noun, ent=ent, defects=lines, smax=n_sessions - 1)
+                  + seed_entity_prompt(wp, tid) + joint_text}],
                 temperature=0.8, max_tokens=4096)
 
         for ent, out in config.pmap(_repair, list(by_ent.items()), workers=min(8, len(by_ent))):
+            check_joint_plan()
             e = ent_idx.get(ent)
             newf = (out.get("fields") if isinstance(out, dict) else None) or {}
+            if repairing and not set(newf).issubset(repair_fields[ent]):
+                raise WorldBlueprintError("mechanical author changed fields outside repair targets")
             if e and newf:                                # 只覆盖被点名的坏字段,不新增/不动其它字段
+                before_fields = deepcopy(merged) if repairing else None
                 e["fields"].update({k: v for k, v in newf.items() if k in e.get("fields", {})})
+                if repairing:
+                    tracer.record_changes(out, before_fields, merged, entity=ent,
+                                          allowed_fields=sorted(repair_fields[ent]))
         ws, compile_issues = assemble_world(merged, blueprint=blueprint, existing=existing)
         structural_issues = [x for x in compile_issues if x.startswith(structural_markers)]
         if structural_issues:
@@ -783,8 +1388,8 @@ def build_world(wp, tracer, log=print, existing=None, narrative: bool = False) -
     rem = validate(ws, merged, profile)               # ★validate 在【注趋势前】跑(对 merged 一致,不误报);imprint 产出本就良构,无需复验
     blocking_rem = _blocking_world_defects(rem, narrative,
                                           protected_fields=protected_fields, entity_types=ws.entity_types)
-    if narrative and len(rem) > len(blocking_rem):
-        log(f"  · 保留 {len(rem) - len(blocking_rem)} 个自然轨迹提示，不为题型强扭剧情世界")
+    if len(rem) > len(blocking_rem):
+        log(f"  · 保留 {len(rem) - len(blocking_rem)} 个非阻塞轨迹提示，不为题型强扭世界")
     if typed_contract and blocking_rem:
         details = [f"{d.get('entity')}.{d.get('field')}[{d.get('type')}]:{d.get('detail')}"
                    for d in blocking_rem]
@@ -841,7 +1446,8 @@ def build_world(wp, tracer, log=print, existing=None, narrative: bool = False) -
             raise WorldBlueprintError("game Story Ledger 四轮修复后仍不合法:\n- "
                                       + "\n- ".join(story_issues))
     coll = name_collisions(ws)                        # ★Fix3:表面塌缩兜底检测(收集期已按主干去重,这里抓漏网)
-    log(f"  ✓ 基础世界:{len(ws.entities)} 实体 / {ws.n_sessions} {time_unit} / 修复后残留缺陷 {len(rem)}"
+    log(f"  ✓ 基础世界:{len(ws.entities)} 实体 / {ws.n_sessions} {time_unit} / 残留真值缺陷 {len(blocking_rem)}"
+        f" / 非阻断生成提示 {len(rem) - len(blocking_rem)}"
         + (f" / ⚠表面塌缩近重名 {coll}" if coll else ""))  # 产线基质由 stage_world 的 line.prepare() 叠加
     # ★声明-世界对齐自检(刀1审计:声明字段在世界中无命中时静默 no-op,漂移不可观测)
     all_fields = {f for flds in ws.entities.values() for f in flds}
@@ -849,15 +1455,4 @@ def build_world(wp, tracer, log=print, existing=None, narrative: bool = False) -
     ghost += [f.get("name") for f in profile.get("field_schema", []) if f.get("unit") and f.get("name") not in all_fields]
     if ghost:
         log(f"  ⚠声明字段未在世界命中(states/unit 约束将空转,检查议会命名一致性):{sorted(set(ghost))}")
-    if typed_contract:
-        active_l7 = any(str(item.get("line") or "").strip().lower().startswith("l7")
-                        and float(item.get("weight") or 0) > 0
-                        for item in wp.get("active_lines", []) if isinstance(item, dict))
-        planted = imprint_structure(ws, log, profile) if active_l7 else 0
-        log("  ✓ typed world 冻结:跳过 legacy 单位补写，关系/事件字段保持同一真源"
-            + (f"；L7 对 {planted} 个内在数值字段完成确定性基质整形" if active_l7 else ""))
-    else:
-        _affix_units(ws, profile, log)                # legacy 保持历史单位真源化行为
-        imprint_structure(ws, log, profile)           # legacy 保持历史 L7 基质整形行为
-    validate_seed_world(wp, ws)
-    return ws
+    return _finish_world(wp, ws, merged, profile, blueprint, narrative, protected_fields, log)

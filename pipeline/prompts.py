@@ -16,7 +16,7 @@ from string import Template
 PROMPTS: dict[str, str] = {
 
     # ── §5 世界生成(system;域参数化:$noun $fdesc $stopped）──────────────
-    "world.system": """你是 memory benchmark 的 ground-truth 世界设计师。只为蓝图实体类型【$type_id / $noun】设计一批随时间($time_unit)演化的真值表。\
+    "world.system": """你是 memory benchmark 的 ground-truth 世界设计师。$world_scope\
 代码会据此机械算标准答案,你只填表——★严禁写问题/答案,严禁"最新/当前/截至…仍为"这类结论性措辞。
 
 【每个 $noun = 一个 entity】★核心:name 是这个【$noun】个体的【正式专名】,且必须【与「$noun」这个类别相称】——\
@@ -26,7 +26,7 @@ $numeric_policy
 - person/status/category 字段:给 trajectory(随时间换),或 stable 给单一 value；但 user 若标为【domain event 驱动】，这里只能给可选初态，后续变化留给 event effect
 $coverage_policy
 
-【硬约束】1.全新虚构值(防泄漏);2.session 用 0..N-1 整数,不写日期;3.evolving≥2 个不同值,★字段就用给定清单里的全部【非结构驱动】字段(不另加、不少给；关系/event 驱动字段遵从 user 的单独说明);4.★所有专名(实体名 + 人名类字段值)**表面互不近似**:禁止"张三/张三(数据)/张三_数据"这类共享主干的近重名(下游机械校验表面塌缩,近重名整条作废)。
+【硬约束】1.全新虚构值(防泄漏);2.session 用 0..N-1 整数,不写日期;3.evolving≥2 个不同值,★字段就用给定清单里的全部【非结构驱动】字段(不另加、不少给；关系/event 驱动字段遵从 user 的单独说明);4.$identity_policy
 
 若给定字段清单是“无内在字段”,就输出空 fields,不要发明字段；关系字段会由结构编译器另行写入。
 
@@ -38,18 +38,20 @@ $coverage_policy
     # ── 世界骨架实例化：只连已生成实体，不再发明实体/字段/关系/事件类型 ──
     "world.structure": """你是世界蓝图实例化器。给定【已经生成的 typed entities】和【机器契约 blueprint】，只实例化契约声明的关系与领域事件。
 【硬约束】
-1. 只能引用给定实体专名；relation 的 from/to 类型必须匹配声明，且每种【恰好生成 min_count 个】（不要为每个实体铺满、不要额外多造）；每个 relation id 唯一，禁止重复边；temporal=false 的静态关系 session 必须为 0。代码会根据 relation.field 在哪一端声明，将另一端专名写入该 owner 的 Timeline。对同一 owner.field，按 session 递增时必须是真实引用变化，禁止连续重复同一目标凑数量。
-2. event 的 participants 必须逐角色匹配声明类型，同一事件的不同角色必须由不同实体承担；每种【恰好生成 min_count 个】（因果规则所需见证也包含在这个数量内，不额外扩张）；session 为 0..$smax。event id 唯一，且同一 type/session/完整 participants 只能出现一次，禁止只换 id 重复计数。
+1. 只能引用给定实体专名；relation 的 from/to 类型必须匹配声明，且每种至少满足 min_count（这是最低数量，不是恰好数量或上限）。在给定实体和时间范围内，只增加任务与业务过程确有需要的有限实例，不必为每个实体铺满，不为题型或难度强造关系变化。每个 relation id 唯一，禁止重复边；temporal=false 的静态关系 session 必须为 0。代码会根据 relation.field 在哪一端声明，将另一端专名写入该 owner 的 Timeline。对同一 owner.field，按 session 递增时必须是真实引用变化，禁止连续重复同一目标凑数量。
+2. event 的 participants 必须逐角色匹配声明类型，同一事件的不同角色必须由不同实体承担；每种至少满足 min_count，因果规则和任务机制需要的事件可以超过最低数量，但不得为凑数量或出难题制造无业务依据的事件；session 为 0..$smax。event id 唯一，且同一 type/session/完整 participants 只能出现一次，禁止只换 id 重复计数。
 3. 每个 event 的 effects 必须逐项且恰好一次覆盖该类型全部 effect_fields，不得漏项、重复或增加；输出时 entity 必须等于 participants 中该 role 对应实体，并给 set 值。全局每个 (entity,field,session) effect slot 只能被一个事件使用；set 必须相对 initial_state 与此前事件造成真实变化。多个事件写同一状态字段时，分配到递增 session，并沿 fields.states 合法推进；numeric 遵守 monotonic 且数值不同。禁止冲突、同 session 双写或空操作。
 4. causal_rules 声明 A→B 时，至少造一对真实 A/B 事件；B 写 caused_by=A 的事件 id，session 差严格等于 delay_sessions。
-5. typed entities 目录可能给出 event-owned 字段的 initial_state；effect 必须写成不同于其当时状态的真实变化，不能空操作。
+5. typed entities 给出本轮已生成的 intrinsic_fields（稳定值或完整轨迹），增量已有实体给出 canonical_fields（已编译的完整操作历史）；它们是安排关系、参与者、时点和效果的事实背景，不得重写。目录也可能给出 event-owned 字段的 initial_state；effect 必须写成不同于其当时状态的真实变化，不能空操作。已有 canonical 关系与事件保持不变；增量只补必要的新实例，最低数量按已有与新增合计。
 6. 严禁输出 cascades；代码会从验证过的事件因果机械编译。严禁新增类型、字段或实体。
 【严格 JSON】{"relations":[{"id":"rel-1","type":"<relation id>","from":"<实体>","to":"<实体>","session":0}],"events":[{"id":"evt-1","type":"<event id>","session":1,"participants":{"<role>":"<实体>"},"effects":[{"entity":"<该 role 实体>","field":"<声明字段>","set":"<新值>"}],"caused_by":"<可省,父事件id>"}]}""",
 
     "world.structure_user": """【时间制度】unit=$time_unit,cadence=$cadence,session=0..$smax
+【session 对应实际日期】$session_dates
 【world_blueprint】$blueprint
 【typed entities】$entities
-实例化全部 min_count 约束，严格 JSON。""",
+【已有 canonical 结构；空数组表示没有已有实例】$existing_canonical
+结合完整字段事实和任务背景实例化全部最低数量约束；不要更改已给定事实，不为题型或难度增造实例。严格 JSON。""",
 
     # ── game-only 轻量 Story Ledger；canonical world 冻结后独立生成 ──
     "world.story": """你是游戏剧情编排器。给你的世界实体和事件已经通过机器契约并被冻结；不得修改、补写或重新生成它们。
@@ -102,9 +104,50 @@ $defects
 【严格 JSON】{"docs":[{"type":"$genre0","content":"...","fact_refs":["实体.字段"]}]}""",
 
     # ── 信号 user($s $date $facts $hint)────────────────────────────────────
+    "corpus.quality_system": """你是【$noun】领域的语料作者。对象类型：$type_legend。体裁可选：$genres。
+【白皮书写作规格】$style_spec
+把给定本期需要披露的 facts 和 events 自然写进 1-3 篇文档。篇幅以完整、忠实承载为先。
+清楚表达主体、字段含义、时点、值的单位量纲，以及事件参与者的角色、动作和全部结果。
+允许自然同义表述和清楚指代，不必照抄字段名或枚举值，也不以出现某些关键词代替事实。
+正文以本期记录为中心并含给定日期；可以准确区分已知历史与本期变化，不能预告未来真值。
+停用字段应按其给定的原生效时点自然说明$stopped，不把较晚的披露日期改写成停用生效日期，也不把旧值继续写作有效值。
+数值与关系含义不得改变，不能猜补未给定的主体、单位、来源身份或业务动作。
+计划、传闻、否定、角色误写和载体登记须保留其语气，不把它们升级成实际业务状态。
+完整上下文只用于核实含义，不要求把全世界历史重复到正文。本组要求不能依赖标题或隐藏元数据。
+正文只写文档本身，不复述生成约束或答案提示。
+严格 JSON：{"docs":[{"type":"$genre0","content":"自然正文"}]}。""",
+
+    "corpus.quality_user": """【第 $s $time_unit / $date】本组需要公开表达的事实（各事实保留自身时点）：$facts
+【本组需要公开表达的事件（保留原发生时点）】$events$story_context$hint
+这些是待表达的冻结事实，不是固定句式。用自然文档准确传达，严格 JSON。""",
+
+    "discriminate.quality_system": """你是只读给定文档的盲读者，不知道隐藏世界或期望答案。
+逐项说明正文对该实体字段表达的值或状态；字段停用时说明正文的停用含义。
+允许用自然语言说明读到的含义，保留主体、时间、单位、否定、条件和不确定性。
+不要从外部常识或缺失前提补答案。正文不足、指代不清或说法不一致时如实说明。
+每个输入 key 必须且只能返回一次。严格 JSON：{"answers":[{"key":"q0","answer":"据正文读到的含义或不确定原因"}]}。""",
+
+    "discriminate.quality_user": """【文档】
+$docs
+【查询】$queries
+只依据这些文档逐项回答，不存在额外答案。严格 JSON {"answers":[{"key":"q0","answer":"..."}]}。""",
+
     "corpus.user": """【第 $s $time_unit / $date】各 typed entity 当期字段值(只写这些、只写本期):$facts
 【本期 domain_events】$events$story_context$hint
 严格 JSON。""",
+
+    "corpus.public_rules.system": """你是本场景原语料的作者。根据已冻结的类型/字段阶段定义，写自然的流程说明或操作说明，供阅读本场景文档的人使用。
+【白皮书写作规格】$style_spec
+正文完整说明每一项的适用对象类型、字段及全部阶段的先后顺序，可以分成数篇自然文档。正文使用给定文档日期。
+这是阶段顺序，不是具体实体的状态记录：不写任何实体当前处于哪里、下一步答案或未来会发生什么；不创造额外生效事件、签批人和生效日期。
+实际记录可跳级、不可倒退；不能把序列中紧邻的后一阶段写成实际每次变更必须到达的唯一阶段。
+不得引用题号、答案、私有来源路径或规则ID等生成元数据。不能省略规则而依赖读者常识。
+只返回 JSON:{"docs":[{"type":"流程说明","title":"自然标题","content":"完整正文"}]}。""",
+
+    "corpus.public_rules.user": """【文档日期】$date
+【冻结的公共阶段定义】$rules
+$hint
+只写这些类型级规则，不增加具体实体事实。严格 JSON。""",
 
     # ── 渲染链·盲判别器(Blinded Discriminator;只读渲染文档、对世界一无所知)──────
     #   死钉③:user 只喂 $docs(渲染正文)+ 要问的 ($entity,$field);★绝不喂 value/gt/fact_refs。

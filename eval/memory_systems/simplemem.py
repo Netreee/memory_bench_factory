@@ -11,7 +11,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT))
 
-from eval.memory_systems.base import MemorySystem
+from eval.memory_systems.base import MemorySystem, execution_stage, ingest_receipt
 from eval.memory_interface import EmbedMemory, _chunk
 from eval.embed_cache import cached_embed
 from eval.multi_system import header, build_embed_memory
@@ -25,6 +25,13 @@ class SimpleMem(MemorySystem):
         self._docs_buf: list = []
         self._last_context = ""
 
+    def evaluation_config(self) -> dict:
+        memory_config = (self._mem.evaluation_config() if self._mem is not None
+                         and callable(getattr(self._mem, "evaluation_config", None))
+                         else {"configuration_status": "undeclared"})
+        return {"configuration_status": memory_config.get("configuration_status", "undeclared"),
+                "top_k": self.top_k, "embedding": memory_config}
+
     def ingest_session(self, session: dict) -> dict:
         sid = session["session_id"]
         date = session["date"]
@@ -32,16 +39,19 @@ class SimpleMem(MemorySystem):
         for doc in session["docs"]:
             self._docs_buf.append((int(sid), date, doc))
             n += 1
-        return {"n_docs": n}
+        return ingest_receipt(n, completion="accepted")
 
     def finalize_ingest(self, on_progress=None) -> None:
         if self._mem is not None:
             return
-        self._mem = build_embed_memory(self._docs_buf, on_progress=on_progress)
+        with execution_stage("finalize"):
+            self._mem = build_embed_memory(self._docs_buf, on_progress=on_progress)
 
     def retrieve(self, question: str, top_k: int = None) -> str:
+        self._last_context = ""
         k = top_k or self.top_k
-        snippets = self._mem.retrieve(question, top_k=k)
+        with execution_stage("retrieve"):
+            snippets = self._mem.retrieve(question, top_k=k)
         if not snippets:
             ctx = "(无检索结果)"
         else:

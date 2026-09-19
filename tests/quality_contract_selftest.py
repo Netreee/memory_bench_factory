@@ -13,8 +13,12 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 os.environ.setdefault("OPENAI_API_KEY", "offline-audit")
 os.environ.setdefault("MODEL", "offline-audit")
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from corpus_fixture_helpers import fixed_document_reviews
 from pipeline.corpus_contract import (canonical_context, explicit_future_claims,
-                                      review_documents, attach_receipts, validate_corpus)
+                                      review_documents, attach_receipts, validate_corpus, fidelity_requirements)
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from corpus_fixture_helpers import fixed_positive_review
 from pipeline.quality import (evaluate_release, quality_snapshot, require_release, ReleaseError)
 from pipeline.question_contract import attach_question_contract
 from pipeline.world_state import WorldState, Timeline, Op, SET, UPDATE
@@ -22,14 +26,14 @@ from pipeline.world_state import WorldState, Timeline, Op, SET, UPDATE
 
 class Reviewer:
     def __init__(self, response=None):
-        self.response = response if response is not None else {"verdict": "pass", "unsupported_claims": []}
+        self.response = response
         self.calls = 0
 
     def chat_json(self, *args, **kwargs):
         self.calls += 1
         if isinstance(self.response, Exception):
             raise self.response
-        return self.response
+        return fixed_positive_review(args[1]) if self.response is None else self.response
 
 
 def world():
@@ -48,7 +52,7 @@ def fixture(directory):
     corpus = {"sessions": []}
     for sid, value in enumerate(("待接收", "已登记")):
         docs = [{"doc_id": f"s{sid}", "content": f"测试报告的状态为{value}。", "is_filler": False}]
-        report = review_documents(Reviewer(), ws, sid, docs)
+        report = review_documents(Reviewer(), ws, sid, docs, requirements=fidelity_requirements(ws, sid))
         attach_receipts(docs, report, sid)
         corpus["sessions"].append({"session_id": sid, "docs": docs})
     payloads = {"01_whitepaper.json": wp, "02_world.json": ws.to_dict(), "04_questions.json": [q],
@@ -91,11 +95,12 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(explicit_future_claims(ws, 0, text)[0]["first_observed_session"], 1)
 
     def test_failed_review_cannot_certify_documents(self):
-        tracer = Reviewer()
+        tracer = Reviewer({"document_reviews": fixed_document_reviews([{}], unsupported_indices=[0]), "verdict": "fail", "unsupported_claims": [
+            {"doc_index": 0, "quote": "测试报告状态为已登记。", "reason": "截至本期只有待接收记录"}], "coverage": []})
         docs = [{"content": "测试报告状态为已登记。"}]
         result = review_documents(tracer, world(), 0, docs)
         self.assertEqual(result["status"], "failed")
-        self.assertEqual(tracer.calls, 0)
+        self.assertEqual(tracer.calls, 1)
         with self.assertRaises(ValueError):
             attach_receipts(docs, result, 0)
 

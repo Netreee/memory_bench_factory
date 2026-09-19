@@ -1,0 +1,858 @@
+{
+  "schema_version": 2,
+  "seed_id": "retail_attachment_review_v2",
+  "family": "retail_attachment_review",
+  "title": "零食行业复核：单月累计、公司指标与行业口径",
+  "description": "从两份公司季报、行业综述和消费统计表提炼指标归属、期间、单位及缺项边界，生成合成零食行业研究底稿。",
+  "sources": [
+    {
+      "id": "retail_01",
+      "path": "data/real_seed/yanpan_2026-09-19/extracted/零食零售行业分析/附件3_食品饮料行业2025年报和2026一季报综.pdf",
+      "sha256": "96fe7763e2a6b9f2f0d81fe5846c69c70ddddc139f2ba9049bf28bbae0e218bf",
+      "role": "corpus",
+      "source_kind": "analytical",
+      "title": "食品饮料行业2025年报和2026一季报综述",
+      "allowed_use": [
+        "ontology",
+        "mechanism",
+        "exemplar_style"
+      ],
+      "sensitivity": "public_reference",
+      "date_scope": {
+        "published": "2026-05-22",
+        "reporting_period": "2025年及2026年第一季度"
+      }
+    },
+    {
+      "id": "retail_02",
+      "path": "data/real_seed/yanpan_2026-09-19/extracted/零食零售行业分析/附件4_2026年3月份社会消费品零售总额主要数据.xls",
+      "sha256": "b8883855425a860135bc75ac476c409db85b6d55fe1ff2c561b9f2c7ded2b549",
+      "role": "corpus",
+      "source_kind": "structured_dataset",
+      "title": "2026年3月份社会消费品零售总额主要数据",
+      "allowed_use": [
+        "ontology",
+        "mechanism",
+        "exemplar_style"
+      ],
+      "sensitivity": "public_reference",
+      "date_scope": {
+        "observation_month": "2026-03",
+        "cumulative_period": "2026年1至3月"
+      }
+    },
+    {
+      "id": "retail_03",
+      "path": "data/real_seed/yanpan_2026-09-19/extracted/零食零售行业分析/附件1_盐津铺子食品股份有限公司2026年第一季度报告.pdf",
+      "sha256": "20ce23f7869a139efd98dac357e6771b4db8db0c006271db5b0a7a69f0d3fcda",
+      "role": "corpus",
+      "source_kind": "factual_record",
+      "title": "盐津铺子2026年第一季度报告",
+      "allowed_use": [
+        "ontology",
+        "mechanism",
+        "exemplar_style"
+      ],
+      "sensitivity": "public_reference",
+      "date_scope": {
+        "reporting_period": "2026年第一季度"
+      }
+    },
+    {
+      "id": "retail_04",
+      "path": "data/real_seed/yanpan_2026-09-19/extracted/零食零售行业分析/附件2_恰恰食品股份有限公司2026年第一季度报告.pdf",
+      "sha256": "b8af67772d22e9dba0dfba99f72f798c743bf5131cfa9e4e58342dcffe808ff1",
+      "role": "corpus",
+      "source_kind": "factual_record",
+      "title": "洽洽食品2026年第一季度报告",
+      "allowed_use": [
+        "ontology",
+        "mechanism",
+        "exemplar_style"
+      ],
+      "sensitivity": "public_reference",
+      "date_scope": {
+        "reporting_period": "2026年第一季度"
+      }
+    }
+  ],
+  "task": {
+    "objective": "零食行业复核：单月累计、公司指标与行业口径",
+    "instructions": [
+      "合成连续工作档案，公开材料说明每条信息何时、经何种途径获知；计划、实际发生和事后回顾保持各自含义。",
+      "决定答案的业务条件、口径和关键理由必须出现在公开语料；审阅只依据受测者可见材料。",
+      "按批次分线题量规划足够的独立实体、时间跨度和事件；种子所列数量只设下限，并非每轮生产规模。",
+      "研究对象同时保留公司与行业统计范围；指标记录公开说明期间、数值、单位和性质。",
+      "只在所需口径已经确认时更新对应底稿。未提供、未核对和明确为零分别记录。"
+    ],
+    "forbidden_inferences": []
+  },
+  "exemplars": [
+    {
+      "title": "期间核对",
+      "content": "第一期统计表同时列出三月消费额和一至三月累计消费额；网上商品零售额的三月栏未提供数值。底稿分别登记累计数和单月缺项。",
+      "doc_type": "业务复核记录",
+      "date": "2027-01-22",
+      "origin": "synthetic",
+      "source_refs": [],
+      "mechanism_refs": [
+        "period_unit_scope",
+        "missing_actual_forecast"
+      ]
+    },
+    {
+      "title": "单位补正",
+      "content": "第二期青禾食品季报摘要把单位转录成元；第三期原表核对确认为万元，第四期只更新引用该记录的青禾底稿，林溪食品的条目保持原依据。",
+      "doc_type": "业务复核记录",
+      "date": "2027-01-22",
+      "origin": "synthetic",
+      "source_refs": [],
+      "mechanism_refs": [
+        "period_unit_scope"
+      ]
+    }
+  ],
+  "mechanisms": [
+    {
+      "id": "period_unit_scope",
+      "description": "指标与主体、单月或累计期间、单位和统计范围共同归档，底稿沿引用关系更新。",
+      "source_refs": [
+        {
+          "source_id": "retail_02",
+          "locator": "sheet:表!A1:E33"
+        },
+        {
+          "source_id": "retail_03",
+          "locator": "page:1-3"
+        },
+        {
+          "source_id": "retail_04",
+          "locator": "page:1-3"
+        }
+      ],
+      "required_entity_types": [
+        "subject",
+        "observation",
+        "worksheet"
+      ],
+      "required_relation_types": [
+        "observation_for_subject",
+        "worksheet_uses_observation"
+      ],
+      "required_event_types": [
+        "observation_entered",
+        "basis_checked",
+        "worksheet_updated"
+      ],
+      "required_causal_rules": [
+        "entry_to_check",
+        "check_to_worksheet"
+      ],
+      "failure_modes": [
+        "把累计数当单月数",
+        "把亿元当元",
+        "把全国统计当公司营收"
+      ],
+      "capability_hooks": [
+        "L1_timeline",
+        "L2_relational",
+        "L3_process"
+      ]
+    },
+    {
+      "id": "missing_actual_forecast",
+      "description": "保留未提供的单月数、明确零增长、名义增长、实际报告和分析师预测的不同含义。",
+      "source_refs": [
+        {
+          "source_id": "retail_02",
+          "locator": "sheet:表!A1:E33"
+        },
+        {
+          "source_id": "retail_01",
+          "locator": "page:1-3"
+        }
+      ],
+      "required_entity_types": [
+        "observation",
+        "worksheet"
+      ],
+      "required_relation_types": [
+        "worksheet_uses_observation"
+      ],
+      "required_event_types": [
+        "basis_checked",
+        "worksheet_updated"
+      ],
+      "required_causal_rules": [
+        "check_to_worksheet"
+      ],
+      "failure_modes": [
+        "把短横线自动填零",
+        "把预测值当已实现值",
+        "把名义同比当剔除价格后的增长"
+      ],
+      "capability_hooks": [
+        "L5_conflict",
+        "L6_refusal"
+      ]
+    }
+  ],
+  "blueprint_requirements": {
+    "entity_types": [
+      {
+        "id": "subject",
+        "noun": "零食研究对象",
+        "count": 3,
+        "fields": [
+          {
+            "name": "对象层级",
+            "kind": "category",
+            "source_refs": [
+              {
+                "source_id": "retail_02",
+                "locator": "sheet:表!A1:E33"
+              },
+              {
+                "source_id": "retail_03",
+                "locator": "page:1-3"
+              },
+              {
+                "source_id": "retail_04",
+                "locator": "page:1-3"
+              }
+            ]
+          },
+          {
+            "name": "统计范围",
+            "kind": "text",
+            "source_refs": [
+              {
+                "source_id": "retail_02",
+                "locator": "sheet:表!A1:E33"
+              },
+              {
+                "source_id": "retail_03",
+                "locator": "page:1-3"
+              },
+              {
+                "source_id": "retail_04",
+                "locator": "page:1-3"
+              }
+            ]
+          }
+        ],
+        "source_refs": [
+          {
+            "source_id": "retail_02",
+            "locator": "sheet:表!A1:E33"
+          },
+          {
+            "source_id": "retail_03",
+            "locator": "page:1-3"
+          },
+          {
+            "source_id": "retail_04",
+            "locator": "page:1-3"
+          }
+        ],
+        "primary": true
+      },
+      {
+        "id": "observation",
+        "noun": "零售指标记录",
+        "count": 3,
+        "fields": [
+          {
+            "name": "关联对象",
+            "kind": "reference",
+            "source_refs": [
+              {
+                "source_id": "retail_02",
+                "locator": "sheet:表!A1:E33"
+              },
+              {
+                "source_id": "retail_03",
+                "locator": "page:1-3"
+              },
+              {
+                "source_id": "retail_04",
+                "locator": "page:1-3"
+              }
+            ]
+          },
+          {
+            "name": "指标名称",
+            "kind": "category",
+            "source_refs": [
+              {
+                "source_id": "retail_02",
+                "locator": "sheet:表!A1:E33"
+              },
+              {
+                "source_id": "retail_03",
+                "locator": "page:1-3"
+              },
+              {
+                "source_id": "retail_04",
+                "locator": "page:1-3"
+              }
+            ]
+          },
+          {
+            "name": "期间口径",
+            "kind": "text",
+            "source_refs": [
+              {
+                "source_id": "retail_02",
+                "locator": "sheet:表!A1:E33"
+              },
+              {
+                "source_id": "retail_03",
+                "locator": "page:1-3"
+              },
+              {
+                "source_id": "retail_04",
+                "locator": "page:1-3"
+              }
+            ]
+          },
+          {
+            "name": "数值与单位",
+            "kind": "text",
+            "source_refs": [
+              {
+                "source_id": "retail_02",
+                "locator": "sheet:表!A1:E33"
+              },
+              {
+                "source_id": "retail_03",
+                "locator": "page:1-3"
+              },
+              {
+                "source_id": "retail_04",
+                "locator": "page:1-3"
+              }
+            ]
+          },
+          {
+            "name": "数据性质",
+            "kind": "category",
+            "source_refs": [
+              {
+                "source_id": "retail_02",
+                "locator": "sheet:表!A1:E33"
+              },
+              {
+                "source_id": "retail_01",
+                "locator": "page:1-3"
+              }
+            ]
+          },
+          {
+            "name": "核对状态",
+            "kind": "status",
+            "source_refs": [
+              {
+                "source_id": "retail_02",
+                "locator": "sheet:表!A1:E33"
+              },
+              {
+                "source_id": "retail_03",
+                "locator": "page:1-3"
+              },
+              {
+                "source_id": "retail_04",
+                "locator": "page:1-3"
+              }
+            ]
+          }
+        ],
+        "source_refs": [
+          {
+            "source_id": "retail_02",
+            "locator": "sheet:表!A1:E33"
+          },
+          {
+            "source_id": "retail_03",
+            "locator": "page:1-3"
+          },
+          {
+            "source_id": "retail_04",
+            "locator": "page:1-3"
+          }
+        ]
+      },
+      {
+        "id": "worksheet",
+        "noun": "零食研究底稿条目",
+        "count": 2,
+        "fields": [
+          {
+            "name": "关键指标记录",
+            "kind": "reference",
+            "source_refs": [
+              {
+                "source_id": "retail_01",
+                "locator": "page:1-3"
+              }
+            ]
+          },
+          {
+            "name": "采用状态",
+            "kind": "status",
+            "source_refs": [
+              {
+                "source_id": "retail_01",
+                "locator": "page:1-3"
+              }
+            ]
+          },
+          {
+            "name": "结论范围",
+            "kind": "category",
+            "source_refs": [
+              {
+                "source_id": "retail_01",
+                "locator": "page:1-3"
+              }
+            ]
+          }
+        ],
+        "source_refs": [
+          {
+            "source_id": "retail_01",
+            "locator": "page:1-3"
+          }
+        ]
+      }
+    ],
+    "relation_types": [
+      {
+        "id": "observation_for_subject",
+        "from_type": "observation",
+        "to_type": "subject",
+        "field": "关联对象",
+        "temporal": false,
+        "min_count": 1,
+        "source_refs": [
+          {
+            "source_id": "retail_02",
+            "locator": "sheet:表!A1:E33"
+          },
+          {
+            "source_id": "retail_03",
+            "locator": "page:1-3"
+          },
+          {
+            "source_id": "retail_04",
+            "locator": "page:1-3"
+          }
+        ]
+      },
+      {
+        "id": "worksheet_uses_observation",
+        "from_type": "worksheet",
+        "to_type": "observation",
+        "field": "关键指标记录",
+        "temporal": true,
+        "min_count": 1,
+        "source_refs": [
+          {
+            "source_id": "retail_01",
+            "locator": "page:1-3"
+          }
+        ]
+      }
+    ],
+    "event_types": [
+      {
+        "id": "observation_entered",
+        "label": "登记指标及来源口径",
+        "roles": {
+          "observation": "observation"
+        },
+        "effect_fields": [
+          {
+            "role": "observation",
+            "field": "核对状态"
+          }
+        ],
+        "min_count": 1,
+        "source_refs": [
+          {
+            "source_id": "retail_02",
+            "locator": "sheet:表!A1:E33"
+          },
+          {
+            "source_id": "retail_03",
+            "locator": "page:1-3"
+          },
+          {
+            "source_id": "retail_04",
+            "locator": "page:1-3"
+          }
+        ],
+        "status": "synthetic_design",
+        "basis": "依据所引资料的工作关系安排合成事件；次数和具体间隔由本种子设计。"
+      },
+      {
+        "id": "basis_checked",
+        "label": "核对期间单位和统计范围",
+        "roles": {
+          "observation": "observation",
+          "worksheet": "worksheet"
+        },
+        "effect_fields": [
+          {
+            "role": "observation",
+            "field": "核对状态"
+          }
+        ],
+        "min_count": 1,
+        "source_refs": [
+          {
+            "source_id": "retail_02",
+            "locator": "sheet:表!A1:E33"
+          },
+          {
+            "source_id": "retail_03",
+            "locator": "page:1-3"
+          },
+          {
+            "source_id": "retail_04",
+            "locator": "page:1-3"
+          }
+        ],
+        "status": "synthetic_design",
+        "basis": "依据所引资料的工作关系安排合成事件；次数和具体间隔由本种子设计。",
+        "relation_bindings": [
+          {
+            "relation": "worksheet_uses_observation",
+            "from_role": "worksheet",
+            "to_role": "observation"
+          }
+        ]
+      },
+      {
+        "id": "worksheet_updated",
+        "label": "更新对应研究底稿",
+        "roles": {
+          "observation": "observation",
+          "worksheet": "worksheet"
+        },
+        "effect_fields": [
+          {
+            "role": "worksheet",
+            "field": "采用状态"
+          }
+        ],
+        "min_count": 1,
+        "source_refs": [
+          {
+            "source_id": "retail_01",
+            "locator": "page:1-3"
+          }
+        ],
+        "status": "synthetic_design",
+        "basis": "依据所引资料的工作关系安排合成事件；次数和具体间隔由本种子设计。",
+        "relation_bindings": [
+          {
+            "relation": "worksheet_uses_observation",
+            "from_role": "worksheet",
+            "to_role": "observation"
+          }
+        ]
+      }
+    ],
+    "causal_rules": [
+      {
+        "id": "entry_to_check",
+        "trigger_event": "observation_entered",
+        "effect_event": "basis_checked",
+        "delay_sessions": 1,
+        "shared_roles": [
+          "observation"
+        ],
+        "source_refs": [
+          {
+            "source_id": "retail_02",
+            "locator": "sheet:表!A1:E33"
+          },
+          {
+            "source_id": "retail_03",
+            "locator": "page:1-3"
+          },
+          {
+            "source_id": "retail_04",
+            "locator": "page:1-3"
+          }
+        ],
+        "status": "synthetic_design",
+        "basis": "原资料支持材料与后续工作之间的依赖；一期间隔为合成调度选择。"
+      },
+      {
+        "id": "check_to_worksheet",
+        "trigger_event": "basis_checked",
+        "effect_event": "worksheet_updated",
+        "delay_sessions": 1,
+        "shared_roles": [
+          "observation",
+          "worksheet"
+        ],
+        "source_refs": [
+          {
+            "source_id": "retail_02",
+            "locator": "sheet:表!A1:E33"
+          },
+          {
+            "source_id": "retail_01",
+            "locator": "page:1-3"
+          }
+        ],
+        "status": "synthetic_design",
+        "basis": "原资料支持材料与后续工作之间的依赖；一期间隔为合成调度选择。"
+      }
+    ],
+    "evidence_channels": [
+      "合成公司季报摘录",
+      "消费统计表",
+      "行业综述",
+      "指标登记表",
+      "口径核对单",
+      "研究底稿"
+    ],
+    "temporal_model": {
+      "min_sessions": 4,
+      "time_granularity": "期",
+      "allow_retrospective": true,
+      "description": "最少四期为合成设计；获取时间、发生时间、报告期间分别交代。"
+    }
+  },
+  "document_map": [
+    {
+      "source_id": "retail_01",
+      "segments": [
+        {
+          "locator": "page:1-3",
+          "topic": "行业汇总、公司预测与实际值标记",
+          "reading_method": "text"
+        }
+      ]
+    },
+    {
+      "source_id": "retail_02",
+      "segments": [
+        {
+          "locator": "sheet:表!A1:E33",
+          "topic": "3月、1至3月、亿元、同比和名义增速脚注",
+          "reading_method": "structured_parse"
+        }
+      ]
+    },
+    {
+      "source_id": "retail_03",
+      "segments": [
+        {
+          "locator": "page:1-3",
+          "topic": "公司季度流量、时点存量和非经常性损益",
+          "reading_method": "text"
+        }
+      ]
+    },
+    {
+      "source_id": "retail_04",
+      "segments": [
+        {
+          "locator": "page:1-3",
+          "topic": "公司主体、季度数值及元和万元表格",
+          "reading_method": "text"
+        }
+      ]
+    }
+  ],
+  "generation_contract": {
+    "syntheticization": {
+      "names": "generate_fictional",
+      "case_numbers": "generate_fictional",
+      "numeric_values": "generate_with_explicit_units",
+      "dates": "generate_with_explicit_period_and_disclosure"
+    },
+    "must_include": [],
+    "must_distinguish": [
+      {
+        "text": "单月与累计、时点存量与期间流量、元与万元或亿元分别保留。",
+        "status": "accepted",
+        "source_refs": [
+          {
+            "source_id": "retail_02",
+            "locator": "sheet:表!A1:E33"
+          },
+          {
+            "source_id": "retail_03",
+            "locator": "page:1-3"
+          },
+          {
+            "source_id": "retail_04",
+            "locator": "page:1-3"
+          }
+        ]
+      },
+      {
+        "text": "行业综述的预测标记与公司报告的实际期间分开。",
+        "status": "accepted",
+        "source_refs": [
+          {
+            "source_id": "retail_03",
+            "locator": "page:1-3"
+          },
+          {
+            "source_id": "retail_04",
+            "locator": "page:1-3"
+          },
+          {
+            "source_id": "retail_01",
+            "locator": "page:1-3"
+          }
+        ]
+      }
+    ],
+    "must_not_infer": [
+      {
+        "text": "统计表短横线只表示该栏未提供数值，不得补成零；名义同比不得称为实际同比。",
+        "status": "accepted",
+        "source_refs": [
+          {
+            "source_id": "retail_02",
+            "locator": "sheet:表!A1:E33"
+          }
+        ]
+      },
+      {
+        "text": "不得把公司财务指标与全国消费额直接比较成市场份额；涉及计算时必须在公开语料交代完整口径和公式。",
+        "status": "accepted",
+        "source_refs": [
+          {
+            "source_id": "retail_02",
+            "locator": "sheet:表!A1:E33"
+          },
+          {
+            "source_id": "retail_03",
+            "locator": "page:1-3"
+          },
+          {
+            "source_id": "retail_04",
+            "locator": "page:1-3"
+          }
+        ]
+      }
+    ],
+    "sensitive_fields": [],
+    "active_lines": [],
+    "traps": [],
+    "unresolved": [],
+    "synthetic_designs": [
+      {
+        "text": "实体数量、至少四期和每种事件至少一次为本次合成世界的覆盖选择；原资料未规定这些数目。",
+        "status": "synthetic_design",
+        "source_refs": []
+      },
+      {
+        "text": "事件之间的一期间隔只安排合成节奏，实际因果成立条件由作者和审阅者结合材料判断。",
+        "status": "synthetic_design",
+        "source_refs": []
+      },
+      {
+        "text": "附件未给出统一的原任务提示词；本种子的持续维护任务由编制者依据材料结构设计。",
+        "status": "synthetic_design",
+        "source_refs": []
+      },
+      {
+        "text": "示例文书日期2027-01-22为合成日期，示例中的期数用于表达先后；实际世界另行规划日期与对应关系。",
+        "status": "synthetic_design",
+        "source_refs": []
+      }
+    ]
+  },
+  "review": {
+    "quality_status": "curated_for_original_pipeline_trial",
+    "blocking_issues": [],
+    "reviewer": "Codex source reading and seed curation",
+    "independent_review_performed": false,
+    "coverage": {
+      "sources_inventoried": 4,
+      "source_records": [
+        {
+          "source_id": "retail_01",
+          "file_pages": 24,
+          "file_rows": null,
+          "file_columns": null,
+          "reviewed_segments": [
+            [
+              "page:1-3",
+              "行业汇总、公司预测与实际值标记",
+              "text"
+            ]
+          ],
+          "limitations": []
+        },
+        {
+          "source_id": "retail_02",
+          "file_pages": null,
+          "file_rows": null,
+          "file_columns": null,
+          "reviewed_segments": [
+            [
+              "sheet:表!A1:E33",
+              "3月、1至3月、亿元、同比和名义增速脚注",
+              "structured_parse"
+            ]
+          ],
+          "limitations": []
+        },
+        {
+          "source_id": "retail_03",
+          "file_pages": 12,
+          "file_rows": null,
+          "file_columns": null,
+          "reviewed_segments": [
+            [
+              "page:1-3",
+              "公司季度流量、时点存量和非经常性损益",
+              "text"
+            ]
+          ],
+          "limitations": []
+        },
+        {
+          "source_id": "retail_04",
+          "file_pages": 10,
+          "file_rows": null,
+          "file_columns": null,
+          "reviewed_segments": [
+            [
+              "page:1-3",
+              "公司主体、季度数值及元和万元表格",
+              "text"
+            ]
+          ],
+          "limitations": [
+            "文件名将洽洽写为恰恰，正文主体采用洽洽。"
+          ]
+        }
+      ],
+      "full_document_semantic_reading_claimed": false
+    },
+    "scope": "所引关键段落和表格支持合成领域设计；未进行现行法规核验、真实案件判定或投资分析。",
+    "source_findings": [
+      "消费统计XLS已读取唯一工作表33行6列，保留合并标题和名义增速脚注。",
+      "表内同时存在明确0.0和短横线缺项；公司季报表格中存在元和万元口径。",
+      "零食综述含年度实际及未来预测，未将预测转成真实业绩。"
+    ],
+    "synthetic_designs": [
+      "实体数量、至少四期和每种事件至少一次为本次合成世界的覆盖选择；原资料未规定这些数目。",
+      "事件之间的一期间隔只安排合成节奏，实际因果成立条件由作者和审阅者结合材料判断。",
+      "附件未给出统一的原任务提示词；本种子的持续维护任务由编制者依据材料结构设计。",
+      "示例文书日期2027-01-22为合成日期，示例中的期数用于表达先后；实际世界另行规划日期与对应关系。"
+    ]
+  }
+}

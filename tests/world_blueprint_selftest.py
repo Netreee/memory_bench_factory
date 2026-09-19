@@ -837,8 +837,13 @@ prompt_text = "\n".join(text for tag, text in tracer.calls if tag.startswith("wo
 ck("③ prompt 消费全部 entity type", all(x in prompt_text for x in ("player", "boss", "equipment")))
 ck("③ prompt 消费 relation type", "equips" in prompt_text)
 ck("③ prompt 消费 event type", "defeat_boss" in prompt_text and "acquire_loot" in prompt_text)
+structure_text = next(text for tag, text in tracer.calls if tag == "world.structure")
+structure_entities = json.JSONDecoder().raw_decode(
+    structure_text.split("【typed entities】", 1)[1].lstrip())[0]
+structure_boss = next(entity for entity in structure_entities if entity["name"] == "熔岩巨兽")
 ck("③ event-owned 字段不从 entity batch 泄入 structure 初态",
-   '{"name": "熔岩巨兽", "type": "boss", "initial_state": {}}' in prompt_text)
+   structure_boss["initial_state"] == {}
+   and "defeat_status" not in structure_boss["intrinsic_fields"])
 structure_kwargs = next(kwargs for tag, kwargs in tracer.kwargs if tag == "world.structure")
 ck("③ structure 固定模型、严格 JSON 且无内部重试",
    structure_kwargs.get("model") == config.STRUCTURE_MODEL

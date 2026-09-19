@@ -15,10 +15,12 @@ import math
 from pathlib import Path
 import shutil
 from eval.grading import JUDGE_VERSION, is_scored
+from eval.provenance import (REFERENCE_FIELDS, load_public_protocol, load_visible_corpus,
+                             make_evaluation_context, preserve_result_contexts, provenance_issue)
 
 
 DISPOSITIONS = ("removed_easy", "kept_easy_sample", "kept_not_all_correct", "kept_incomplete")
-IDENTITY_FIELDS = ("line", "capability", "question", "gt", "aux", "strict_scoring", "question_contract")
+IDENTITY_FIELDS = ("question", *REFERENCE_FIELDS)
 
 
 def question_key(item: dict) -> str:
@@ -46,14 +48,15 @@ def _rows(value, label: str) -> list[dict]:
     for row in value:
         if not isinstance(row.get("question"), str) or not row["question"].strip():
             raise ValueError(f"{label} 中存在空题面或缺失 question 的记录")
-        if "gt" not in row or not row.get("capability"):
-            raise ValueError(f"{label} 中存在缺失 gt 或 capability 的记录")
+        # Semantic tasks may have no legacy capability label or code-computable
+        # gold. Their versioned review/grade provenance is checked separately.
     return value
 
 
 def _invalid_reason(record: dict) -> str | None:
     """只有成功、可判分且带布尔判分的回答才参与难度判断。"""
-    if record.get("error") or record.get("judge_error"):
+    if (record.get("error") or record.get("judge_error")
+            or record.get("execution_status", "ok") not in ("ok", "success")):
         return "evaluation_error"
     if record.get("judgeable", True) is not True:
         return "not_judgeable"
@@ -75,8 +78,9 @@ def _invalid_reason(record: dict) -> str | None:
 
 
 def filter_questions(questions: list[dict], results: dict[str, list[dict]], *,
-                     keep_easy_ratio: float = 0.0, seed: int = 0,
-                     preserve_capabilities: tuple[str, ...] | list[str] = ()) -> tuple[list[dict], dict]:
+                      keep_easy_ratio: float = 0.0, seed: int = 0,
+                      preserve_capabilities: tuple[str, ...] | list[str] = (),
+                      expected_context: dict | None = None) -> tuple[list[dict], dict]:
     """筛选全员答对题并返回审计报告；输入不变，缺测或异常题一律保留。"""
     systems = sorted(results)
     validate_options(systems, keep_easy_ratio, seed)
@@ -111,7 +115,7 @@ def filter_questions(questions: list[dict], results: dict[str, list[dict]], *,
                 grades[system] = None
                 continue
             record = records[0]
-            reason = _invalid_reason(record)
+            reason = _invalid_reason(record) or provenance_issue(record, q, expected_context)
             if q.get("qid") is not None and record.get("qid") is not None and q["qid"] != record["qid"]:
                 reason = "qid_mismatch"
             grades[system] = None if reason else record["correct"]
@@ -151,7 +155,7 @@ def filter_questions(questions: list[dict], results: dict[str, list[dict]], *,
         by_line[str(item["line"])].append(item)
         by_capability[str(item["capability"])].append(item)
     report = {
-        "schema_version": 2, "rule": "all_selected_systems_correct", "judge_version": JUDGE_VERSION,
+        "schema_version": 3, "rule": "all_selected_systems_correct", "judge_version": JUDGE_VERSION,
         "systems": systems, "keep_easy_ratio": keep_easy_ratio, "seed": seed,
         "preserve_capabilities": sorted(preserved),
         "sampling": "floor(n_easy * keep_easy_ratio); seeded SHA-256 order",
@@ -160,8 +164,14 @@ def filter_questions(questions: list[dict], results: dict[str, list[dict]], *,
         "by_line": {key: counts(rows) for key, rows in sorted(by_line.items())},
         "by_capability": {key: counts(rows) for key, rows in sorted(by_capability.items())},
         "unmatched_result_rows": unmatched,
-        "judgement_basis": "validated_versioned_primary_judgements_without_rejudging",
+        "expected_evaluation_context": deepcopy(expected_context),
+        "judgement_basis": "context_and_reference_bound_primary_judgements_without_rejudging",
+        "legacy_results": "readable_but_unidentified_records_cannot_establish_all_correct",
         "items": items,
+        "result_scope": "research_only" if any(
+            "research_only" in getattr(rows, "result_scopes", []) or any(
+                row.get("evaluation_scope") == "research_only" or "research_only" in (row.get("_result_scopes") or [])
+                for row in rows) for rows in results.values()) else "validated_input_identity",
     }
     return kept, report
 
@@ -195,7 +205,8 @@ def load_results(*, aggregate: Path | None = None, system_files: dict[str, Path]
         for system in selected:
             if system not in raw or not isinstance(raw[system], dict):
                 raise ValueError(f"缺少所选系统的结果: {system}")
-            result[system] = _rows(raw[system].get("records"), system)
+            result[system] = preserve_result_contexts(_rows(raw[system].get("records"), system),
+                                                       data, raw[system])
         return result
     selected = list(system_files) if systems is None else systems
     validate_options(selected, 0.0, 0)
@@ -206,10 +217,12 @@ def load_results(*, aggregate: Path | None = None, system_files: dict[str, Path]
         path = system_files[system]
         if path.suffix.lower() == ".jsonl":
             rows = [json.loads(line) for line in path.read_text(encoding="utf-8-sig").splitlines() if line.strip()]
+            envelope = None
         else:
             data = _read_json(path)
             rows = data.get("records") if isinstance(data, dict) else data
-        result[system] = _rows(rows, system)
+            envelope = data if isinstance(data, dict) else None
+        result[system] = preserve_result_contexts(_rows(rows, system), envelope)
     return result
 
 
@@ -233,46 +246,127 @@ def _markdown_report(report: dict) -> str:
 
 def export_filtered_benchmark(bench: Path, results: dict[str, list[dict]], out_dir: Path, *,
                               keep_easy_ratio: float = 0.0, seed: int = 0,
-                              preserve_capabilities: tuple[str, ...] | list[str] = (),
-                              corpus: Path | None = None, about: Path | None = None,
-                              result_paths: list[Path] = (), allow_unverified: bool = False) -> dict:
+                               preserve_capabilities: tuple[str, ...] | list[str] = (),
+                               corpus: Path | None = None, about: Path | None = None,
+                               result_paths: list[Path] = (), allow_unverified: bool = False,
+                               protocol_enabled: bool = True) -> dict:
     """导出独立派生题库并重验发布资格，保留源交付约束和研究用途边界。"""
     bench, out_dir = Path(bench), Path(out_dir)
     questions = load_questions(bench)
     from pipeline.quality import require_release, evaluate_release
     release = require_release(bench, allow_unverified=allow_unverified, corpus_path=corpus)
-    filtered, report = filter_questions(questions, results, keep_easy_ratio=keep_easy_ratio, seed=seed,
-                                        preserve_capabilities=preserve_capabilities)
-    report["source_release"] = release
+    source_manifest_path = bench.parent / "manifest.json"
+    source_manifest = _read_json(source_manifest_path) if source_manifest_path.exists() else {}
+    if not isinstance(source_manifest, dict):
+        raise ValueError("源 manifest 必须为对象")
     copies = {}
+    from pipeline.grounding_review import REVIEW_ARTIFACT
     for name, supplied in (("01_whitepaper.json", None), ("02_world.json", None),
-                           ("04_questions.json", None), ("05_corpus.json", corpus), ("00_about.json", about)):
+                           ("04_questions.json", None), ("05_corpus.json", corpus), ("00_about.json", about),
+                           (REVIEW_ARTIFACT, None)):
         path = Path(supplied) if supplied is not None else bench.parent / name
         if supplied is not None or path.exists():
             if not path.is_file():
                 raise ValueError(f"配套文件不存在: {path}")
             copies[name] = path
-    source_manifest_path = bench.parent / "manifest.json"
-    source_manifest = _read_json(source_manifest_path) if source_manifest_path.exists() else {}
-    if not isinstance(source_manifest, dict):
-        raise ValueError("源 manifest 必须为对象")
+    # Filtering does not change the world. Carry its actual review inputs and
+    # effective obligation with it, including old whitepapers opted in by config.
+    # Freeze the bytes we validate so later copying cannot substitute another
+    # world/review pair. Explicit research exports keep failures, never approval.
+    from pipeline import world_semantics
+    wp_path = bench.parent / "01_whitepaper.json"
+    wp_bytes = wp_path.read_bytes() if wp_path.is_file() else None
+    wp = json.loads(wp_bytes) if wp_bytes is not None else {}
+    seed_v2 = (wp.get("seed_contract") or {}).get("schema_version") == 2
+    world_review_enabled = world_semantics.enabled(wp, source_manifest.get("config", {}))
+    world_snapshot, world_review_provenance = {}, None
+    if seed_v2:
+        from pipeline.seed_run import SEED_ARTIFACT, AUDIT_ARTIFACT, GENERATION_ARTIFACT
+        for name in (SEED_ARTIFACT, AUDIT_ARTIFACT, GENERATION_ARTIFACT, "00_input.json"):
+            path = bench.parent / name
+            if path.is_file():
+                world_snapshot[name] = path.read_bytes()
+                copies[name] = path
+            elif not allow_unverified:
+                raise ValueError(f"Seed v2 source snapshot missing: {name}")
+    if world_review_enabled:
+        required = ("01_whitepaper.json", "02_world.json", "00_input.json", world_semantics.REVIEW_ARTIFACT)
+        for name in required:
+            path = bench.parent / name
+            if path.is_file():
+                world_snapshot[name] = wp_bytes if name == "01_whitepaper.json" else path.read_bytes()
+                copies[name] = path
+        world_errors = [f"missing_world_review_input:{name}" for name in required if name not in world_snapshot]
+        world_review = None
+        if not world_errors:
+            try:
+                from pipeline.world_state import WorldState
+                world_review = json.loads(world_snapshot[world_semantics.REVIEW_ARTIFACT])
+                world_errors = world_semantics.validate_review(world_review, wp,
+                    WorldState.from_dict(json.loads(world_snapshot["02_world.json"])),
+                    task_input=json.loads(world_snapshot["00_input.json"]))
+                if not isinstance(world_review, dict) or world_review.get("status") != "passed":
+                    world_errors = [*world_errors, "source_world_review_not_passed"]
+            except (ValueError, TypeError, KeyError, AttributeError) as exc:
+                world_errors = [f"invalid_world_review_input:{type(exc).__name__}:{exc}"]
+        if world_errors and not allow_unverified:
+            raise ValueError("源世界业务审阅缺失、未通过或已过期: " + str(world_errors))
+        world_review_provenance = {
+            "artifact": world_semantics.REVIEW_ARTIFACT,
+            "scope": "unchanged_source_world_and_review_inputs",
+            "required": True,
+            "validation": {"status": "failed" if world_errors else "passed", "issues": world_errors},
+            "input_hashes": {name: hashlib.sha256(raw).hexdigest() for name, raw in world_snapshot.items()},
+        }
+    # A release override permits historical research, never an invented result
+    # identity. Missing corpus means there is no verified current input to match.
+    expected_context = None
+    if "05_corpus.json" in copies:
+        protocol = (load_public_protocol(copies.get("00_about.json", bench.parent / "00_about.json"))
+                    if protocol_enabled else "")
+        expected_context = make_evaluation_context(load_visible_corpus(copies["05_corpus.json"]), protocol)
+    filtered, report = filter_questions(questions, results, keep_easy_ratio=keep_easy_ratio, seed=seed,
+                                        preserve_capabilities=preserve_capabilities,
+                                        expected_context=expected_context)
+    report["source_release"] = release
+    report["protocol_enabled"] = protocol_enabled
     targetspec = deepcopy((source_manifest.get("algo") or {}).get("targetspec") or {})
     if not isinstance(targetspec, dict):
         raise ValueError("源 targetspec 必须为对象")
     source_receipt_path = bench.parent / "07_release.json"
     provenance_files = [p for p in (source_manifest_path, source_receipt_path) if p.is_file()]
     inputs = list(dict.fromkeys([bench, *map(Path, result_paths), *copies.values(), *provenance_files]))
+    frozen_by_path = {copies[name].resolve(): raw for name, raw in world_snapshot.items()}
     report["input_files"] = [{"path": str(path.resolve()),
-                              "sha256": hashlib.sha256(path.read_bytes()).hexdigest()} for path in inputs]
-    research_only = bool(release.get("override"))
+                              "sha256": hashlib.sha256(frozen_by_path[path.resolve()]
+                                  if path.resolve() in frozen_by_path else path.read_bytes()).hexdigest()} for path in inputs]
+    world_review_failed = (world_review_provenance is not None
+                           and world_review_provenance["validation"]["status"] != "passed")
+    research_only = bool(release.get("override")) or report["result_scope"] == "research_only" or world_review_failed
     provenance = {"operation": "filter_all_selected_systems_correct", "source_directory": str(bench.parent.resolve()),
                   "source_benchmark": str(bench.resolve()), "source_release_eligible": release.get("eligible") is True,
-                  "research_only": research_only, "input_files": deepcopy(report["input_files"])}
+                  "research_only": research_only, "input_files": deepcopy(report["input_files"]),
+                  "evaluation_context": deepcopy(expected_context), "protocol_enabled": protocol_enabled,
+                  "source_result_scope": report["result_scope"]}
+    if REVIEW_ARTIFACT in copies:
+        provenance["semantic_review"] = {
+            "artifact": REVIEW_ARTIFACT,
+            "sha256": hashlib.sha256(copies[REVIEW_ARTIFACT].read_bytes()).hexdigest(),
+            "scope": "unchanged_complete_source_review",
+            "source_final_count": len(questions),
+            "selected_qids": [q.get("qid") for q in filtered]}
+    if world_review_provenance is not None:
+        provenance["world_semantic_review"] = world_review_provenance
     manifest = {"schema_version": 1, "status": "research_only" if research_only else "derived_pending_quality",
                 "evaluation_mode": "unverified_research" if research_only else "release_required",
                 "algo": {"targetspec": targetspec}, "derived_from": provenance,
                 "filter": {"systems": report["systems"], "keep_easy_ratio": keep_easy_ratio, "seed": seed,
                            "preserve_capabilities": report["preserve_capabilities"], "counts": report["counts"]}}
+    if world_review_enabled:
+        manifest["config"] = {"world_semantic_review": True}
+    if seed_v2:
+        manifest.setdefault("config", {}).update({key: source_manifest.get("config", {}).get(key)
+            for key in ("seed_pack_digest", "seed_id")})
     if research_only:
         manifest["release_policy"] = {"inherited_research_only": True,
                                       "source_status": release.get("status"),
@@ -287,7 +381,10 @@ def export_filtered_benchmark(bench: Path, results: dict[str, list[dict]], out_d
     (out_dir / "06_grounded_questions.json").write_text(
         json.dumps(filtered, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     for name, source in copies.items():
-        shutil.copyfile(source, out_dir / name)
+        if name in world_snapshot:
+            (out_dir / name).write_bytes(world_snapshot[name])
+        else:
+            shutil.copyfile(source, out_dir / name)
     def write_json(name, value):
         (out_dir / name).write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
@@ -300,7 +397,7 @@ def export_filtered_benchmark(bench: Path, results: dict[str, list[dict]], out_d
     if research_only:
         if not any(issue.get("code") == "unverified_source_derivation" for issue in receipt["issues"]):
             receipt["issues"].append({"code": "unverified_source_derivation",
-                                      "message": "A research override source cannot certify a derived release."})
+                                      "message": "Research-only evaluation results or source cannot certify a derived release."})
         receipt.update(status="failed", eligible=False)
     else:
         manifest["status"] = "done" if receipt["eligible"] else "quality_failed"
@@ -329,6 +426,7 @@ def main(argv=None) -> int:
     parser.add_argument("--out-dir", required=True, type=Path, help="尚不存在的输出目录")
     parser.add_argument("--corpus", type=Path, help="默认复制 bench 同目录的 05_corpus.json")
     parser.add_argument("--about", type=Path, help="默认复制 bench 同目录的 00_about.json")
+    parser.add_argument("--no-protocol", action="store_true", help="核对未注入公开答题约定的实验成绩")
     parser.add_argument("--allow-unverified", action="store_true", help="仅历史研究：允许未取得发布资格的输入")
     args = parser.parse_args(argv)
     try:
@@ -346,7 +444,7 @@ def main(argv=None) -> int:
         report = export_filtered_benchmark(args.bench, results, args.out_dir,
             keep_easy_ratio=args.keep_easy_ratio, seed=args.seed, corpus=args.corpus,
             about=args.about, result_paths=paths, preserve_capabilities=args.preserve_capability,
-            allow_unverified=args.allow_unverified)
+            allow_unverified=args.allow_unverified, protocol_enabled=not args.no_protocol)
     except (OSError, ValueError) as exc:
         parser.error(str(exc))
     print(json.dumps({"out_dir": str(args.out_dir), "result_scope": report["result_scope"],

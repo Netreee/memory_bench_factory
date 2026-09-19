@@ -10,7 +10,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT))
 
-from eval.memory_systems.base import MemorySystem
+from eval.memory_systems.base import MemorySystem, execution_stage, ingest_receipt
 from eval.multi_system import header, build_full_context
 
 
@@ -24,6 +24,9 @@ class FullContext(MemorySystem):
         self._used_chars = 0
         self._last_context = ""
 
+    def evaluation_config(self) -> dict:
+        return {"configuration_status": "declared", "budget": self.budget}
+
     def ingest_session(self, session: dict) -> dict:
         sid = session["session_id"]
         date = session["date"]
@@ -31,11 +34,12 @@ class FullContext(MemorySystem):
         for doc in session["docs"]:
             self._docs_buf.append((int(sid), date, doc))
             n += 1
-        return {"n_docs": n}
+        return ingest_receipt(n, completion="accepted")
 
     def finalize_ingest(self, on_progress=None) -> None:
-        self._context, self._truncated, self._used_chars = build_full_context(
-            self._docs_buf, budget=self.budget)
+        with execution_stage("finalize"):
+            self._context, self._truncated, self._used_chars = build_full_context(
+                self._docs_buf, budget=self.budget)
 
     def retrieve(self, question: str, top_k: int = None) -> str:
         self._last_context = self._context

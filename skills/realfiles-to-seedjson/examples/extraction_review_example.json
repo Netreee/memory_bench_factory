@@ -1,0 +1,30 @@
+{
+  "seed_id": "synthetic_report_revision_v2",
+  "source_review": {
+    "blocking_issues": [],
+    "quality_status": "reviewed",
+    "notes": "完全合成的接口演示；没有执行 LLM 抽取或生成实验。",
+    "coverage": {
+      "sources_reviewed": 3,
+      "sources_used": 2
+    }
+  },
+  "files": [
+    {
+      "path": "design.txt",
+      "sha256": "396984ca1c29d4bfc34a299fd6443c48cd543f0798d63c5e1ae2a4d99930d8da",
+      "role": "builder_only"
+    },
+    {
+      "path": "public.txt",
+      "sha256": "160e1fdd343e6706dbc6829686a68b06c8da5731d3161d24b255bb9ea71e16d4",
+      "role": "corpus"
+    },
+    {
+      "path": "audit.txt",
+      "sha256": "44846f0b267b3170938fdef8aeb4e4fa8ccd6f8af9e2be2cb2a62bf89adb3aad",
+      "role": "evaluator_only"
+    }
+  ],
+  "scope": "Synthetic interface demonstration; no model extraction, generation or business-quality validation."
+}

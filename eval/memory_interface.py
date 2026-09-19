@@ -81,6 +81,11 @@ class EmbedMemory:
         self.chunk_chars = chunk_chars
         self.reset()
 
+    def evaluation_config(self) -> dict:
+        return {"configuration_status": "declared", "model": self.model,
+                "encoder_hf_id": _LOCAL_HF_ID, "normalize_embeddings": True,
+                "chunk": self.chunk, "chunk_chars": self.chunk_chars}
+
     def reset(self) -> None:
         self._docs: list = []     # list[str] 片段文本
         self._meta: list = []     # list[dict]
@@ -95,6 +100,11 @@ class EmbedMemory:
             return
         pieces = [text_prefix + p for p in pieces]
         vecs = embed_texts(pieces, self.model)
+        if len(vecs) != len(pieces):
+            # Do not silently zip a partial batch into a successful index.
+            from eval.memory_systems.base import MemoryExecutionError
+            raise MemoryExecutionError("ingest", "embedding_count_mismatch",
+                                       {"expected": len(pieces), "received": len(vecs)})
         for piece, v in zip(pieces, vecs):
             self._docs.append(piece)
             self._meta.append({**(metadata or {}), "doc_id": doc_id})

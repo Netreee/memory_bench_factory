@@ -16,7 +16,10 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT))
 
-from eval.memory_systems.base import MemorySystem
+from eval.memory_systems.base import (MemorySystem, MemoryExecutionError, execution_stage,
+                                      ingest_receipt, require_response, configuration_fingerprint)
+from eval.memory_systems.execution import (SDKGuard, validate_json_completion,
+                                           validate_chroma_search)
 from eval.multi_system import header
 
 _env_lock = threading.Lock()
@@ -77,13 +80,18 @@ def _harden_llm(sys_obj):
                         **kw, extra_body={"chat_template_kwargs": {"enable_thinking": False}})
                 except TypeError:
                     r = client.chat.completions.create(**kw)
-                return r.choices[0].message.content
+                choice = r.choices[0]
+                if getattr(choice, "finish_reason", None) == "length":
+                    raise MemoryExecutionError("ingest", "llm_truncated")
+                value = choice.message.content
+                validate_json_completion(value, (), {"response_format": response_format}, "ingest")
+                return value
             except Exception as e:
                 if attempt < 2:
                     time.sleep(2 ** attempt)
                     continue
-                print(f"[amem] LLM 3次重试耗尽: {type(e).__name__}: {str(e)[:80]}")
-                return "{}"
+                raise MemoryExecutionError("ingest", "llm_failed",
+                                           {"attempts": 3, "cause_type": type(e).__name__}) from e
 
     llm.get_completion = _gc
 
@@ -96,47 +104,74 @@ class AMemAdapter(MemorySystem):
         self._model = (llm_model
                        or os.getenv("INGEST_LLM_MODEL")
                        or os.getenv("MODEL", "gpt-4o-mini"))
-        self._sys = _build_amem(self._model)
-        _harden_llm(self._sys)
+        self._guard = SDKGuard()
+        with execution_stage("init"):
+            self._llm_endpoint_fingerprint = configuration_fingerprint(
+                os.getenv("INGEST_LLM_BASE_URL") or os.getenv("OPENAI_BASE_URL"))
+            self._sys = _build_amem(self._model)
+            _harden_llm(self._sys)
+            self._observe_dependencies()
+
+    def evaluation_config(self) -> dict:
+        return {"configuration_status": "declared", "top_k": self.top_k,
+                "llm_model": self._model, "llm_backend": "openai",
+                "llm_endpoint_fingerprint": self._llm_endpoint_fingerprint,
+                "embedding_model": "BAAI/bge-small-zh-v1.5",
+                "llm_max_tokens": 1024, "llm_temperature": 0.0,
+                "sdk_operations": "serialized", "sdk_defaults": "not_exposed"}
+
+    def _observe_dependencies(self):
+        # Pinned A-Mem catches failures in analyze_content, process_memory and
+        # search_agentic. Observe below those catch blocks, then check after return.
+        llm = getattr(getattr(self._sys, "llm_controller", None), "llm", None)
+        if llm is not None:
+            self._guard.watch(llm, "get_completion", validate_json_completion)
+        retriever = getattr(self._sys, "retriever", None)
+        if retriever is not None:
+            self._guard.watch(retriever, "search", validate_chroma_search)
+            for name in ("add_document", "delete_document"):
+                self._guard.watch(retriever, name)
 
     def ingest_session(self, session: dict) -> dict:
-        sid = session["session_id"]
-        date = session["date"]
+        sid, date = session["session_id"], session["date"]
         n = 0
         for doc in session["docs"]:
-            text = header(sid, date) + doc
-            try:
-                self._sys.add_note(content=text, time=date)
-            except Exception as e:
-                print(f"[amem] ingest 失败 session={sid}: {type(e).__name__}: {str(e)[:120]}")
+            with execution_stage("ingest", requested_docs=len(session["docs"]), completed_docs=n):
+                self._observe_dependencies()
+                note_id = self._guard.run("ingest", self._sys.add_note,
+                    content=header(sid, date) + doc, time=date)
+                require_response(isinstance(note_id, str) and bool(note_id), "ingest")
             n += 1
-        return {"n_docs": n}
+        return ingest_receipt(n)
 
     def retrieve(self, question: str, top_k: int = None) -> str:
-        k = top_k or self.top_k
-        results = self._sys.search_agentic(question, k=k)
-        if not results:
-            self._last_context = "(无检索结果)"
+        self._last_context = ""
+        with execution_stage("retrieve"):
+            self._observe_dependencies()
+            results = self._guard.run("retrieve", self._sys.search_agentic,
+                                      question, k=top_k or self.top_k)
+            require_response(isinstance(results, list), "retrieve")
+            lines = []
+            for r in results:
+                require_response(isinstance(r, dict) and isinstance(r.get("content"), str), "retrieve")
+                score = r.get("score", "")
+                neighbor = " [linked]" if r.get("is_neighbor") else ""
+                score_str = f"[score={score:.2f}]" if isinstance(score, (int, float)) else ""
+                lines.append(f"{score_str}{neighbor} {r['content']}".strip())
+            self._last_context = "\n".join(lines) or "(无检索结果)"
             return self._last_context
-        lines = []
-        for r in results:
-            content = r.get("content", "")
-            score = r.get("score", "")
-            neighbor = " [linked]" if r.get("is_neighbor") else ""
-            score_str = f"[score={score:.2f}]" if isinstance(score, (int, float)) else ""
-            lines.append(f"{score_str}{neighbor} {content}".strip())
-        self._last_context = "\n".join(lines)
-        return self._last_context
 
     def get_memory_snapshot(self) -> dict:
-        memories = self._sys.memories
-        lines = []
-        for mid, note in memories.items():
-            lines.append(f"[{note.keywords}] {note.content}")
-        text = "\n".join(lines) if lines else "(empty)"
-        return {"text": text, "n_notes": len(memories)}
+        with execution_stage("snapshot"):
+            memories = self._sys.memories
+            lines = [f"[{note.keywords}] {note.content}" for note in memories.values()]
+            return {"text": "\n".join(lines) or "(empty)", "n_notes": len(memories)}
 
     def reset(self) -> None:
-        self._sys = _build_amem(self._model)
-        _harden_llm(self._sys)
-        self._last_context = ""
+        with execution_stage("reset"):
+            self._llm_endpoint_fingerprint = configuration_fingerprint(
+                os.getenv("INGEST_LLM_BASE_URL") or os.getenv("OPENAI_BASE_URL"))
+            self._sys = _build_amem(self._model)
+            _harden_llm(self._sys)
+            self._observe_dependencies()
+            self._last_context = ""

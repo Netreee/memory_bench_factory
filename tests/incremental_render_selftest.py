@@ -126,13 +126,15 @@ ck("delta scope:新实体不重复进入 old-entity 精准 pair",
    all(pair[0] != "E3部" for pair in touched_pairs))
 
 # ── ⑤ release receipt 对增量扩容的约束（固定桩仅模拟审阅通过，不证明模型能力） ──
-from pipeline.corpus_contract import review_documents, attach_receipts, validate_corpus
+from pipeline.corpus_contract import review_documents, attach_receipts, validate_corpus, fidelity_requirements
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from corpus_fixture_helpers import fixed_positive_review
 
 
 class _ReviewPass:
     def chat_json(self, step, *args, **kwargs):
         assert step == "corpus.review"
-        return {"verdict": "pass", "unsupported_claims": []}
+        return fixed_positive_review(args[0])
 
 
 receipt_ws = _ws(1, 2)
@@ -140,7 +142,7 @@ receipt_corpus = {"sessions": []}
 for sid in range(2):
     documents = [{"doc_id": f"receipt-{sid}", "title": "当期记录",
                   "content": f"E0部本期f为v0_{sid}。"}]
-    report = review_documents(_ReviewPass(), receipt_ws, sid, documents)
+    report = review_documents(_ReviewPass(), receipt_ws, sid, documents, requirements=fidelity_requirements(receipt_ws, sid))
     attach_receipts(documents, report, sid)
     receipt_corpus["sessions"].append({"session_id": sid, "date": _date_of(sid), "docs": documents})
 ck("receipt:同一世界的固定审阅样例可验证", validate_corpus(receipt_ws, receipt_corpus)["status"] == "passed")

@@ -4,6 +4,7 @@ pipeline.render —— 文本渲染层(从 run_factory_v2 拆出,行为不变)�
 """
 from __future__ import annotations
 import json, re, threading, sys
+from math import ceil
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))   # 允许 `python pipeline/render.py` 直跑(找到根目录 config)
@@ -19,6 +20,8 @@ LEAK_BANNED = ["当前", "现在", "最新", "目前", "截至目前", "迄今",
 
 # 单篇正文不需要 JSON 容器；保留 16384 预算以避免 reasoning 挤空正文。
 FILLER_TEXT_MAX_TOKENS = 16_384
+DISCRIMINATOR_MAX_TOKENS = 16_384
+SIGNAL_MAX_TOKENS = 16_384
 
 # filler 是无关草堆，没有生成凭据形态 token 的业务理由。这里只拦常见、足够长的
 # 机器凭据前缀，不尝试做复杂“秘密检测”，避免把普通连字符文本误判。
@@ -64,7 +67,7 @@ def _strict_eq(read: str, gt: str) -> bool:
     return _dim_norm(read) == _dim_norm(gt)
 
 
-def _discriminate_many(docs, queries: list[dict], tracer) -> dict[str, str]:
+def _discriminate_many(docs, queries: list[dict], tracer, *, semantic=False) -> dict[str, str]:
     """派一个盲读者一次回答同组文档的全部 ``entity/field`` 查询。
 
     查询不含真值；返回值只在调用方与冻结真值逐项严格对账。调用层已经耗尽
@@ -72,14 +75,20 @@ def _discriminate_many(docs, queries: list[dict], tracer) -> dict[str, str]:
     """
     if not queries:
         return {}
+    system = render("discriminate.quality_system" if semantic else "discriminate.system")
+    if semantic and any("fact_session" in query for query in queries):
+        system += ("\n查询中的 fact_session/fact_date 指事实成立的原时点，不是材料公开日期。"
+                   "同一实体字段可以有不同历史时点的多个查询，请按各自时点阅读；"
+                   "disclosure_id/target_ref 只用于区分查询，不含答案也不是正文证据。")
     out = tracer.chat_json(
         "render.discriminate",
-        [{"role": "system", "content": render("discriminate.system")},
+        [{"role": "system", "content": system},
          {"role": "user", "content": render(
-             "discriminate.user",
+             "discriminate.quality_user" if semantic else "discriminate.user",
              docs="\n\n".join(d for d in docs if d),
              queries=json.dumps(queries, ensure_ascii=False))}],
-        temperature=0.0, max_tokens=2048, model=config.DISCRIMINATOR_MODEL)
+        temperature=0.0, max_tokens=DISCRIMINATOR_MAX_TOKENS, model=config.DISCRIMINATOR_MODEL,
+        **({"response_format": {"type": "json_object"}} if semantic else {}))
     if not isinstance(out, dict) or "__error__" in out:
         detail = out.get("__error__", "非 JSON object") if isinstance(out, dict) else "非 JSON object"
         raise RuntimeError(f"render.discriminate 调用失败:{detail}")
@@ -109,7 +118,7 @@ def _discriminator_recovers(docs, entity, field, true_value, tracer):
     return (_strict_eq(ans, str(true_value)), ans)
 
 
-def _corpus_system(profile, blueprint=None, style_spec=None) -> str:
+def _corpus_system(profile, blueprint=None, style_spec=None, *, semantic=False) -> str:
     """构造信号文档提示词，并把白皮书写作规格作为唯一风格约束传入。"""
     genres = "/".join(profile.get("doc_genres", ["周报", "通报", "邮件"]))
     stopped = profile.get("stopped_phrase", "停止统计")
@@ -123,7 +132,7 @@ def _corpus_system(profile, blueprint=None, style_spec=None) -> str:
         style_text = str(style_spec)
     else:
         style_text = "未另行指定；采用该领域真实文档的自然写法，篇幅以完整承载本组事实为准。"
-    return render("corpus.system", noun=noun, genres=genres, stopped=stopped,
+    return render("corpus.quality_system" if semantic else "corpus.system", noun=noun, genres=genres, stopped=stopped,
                   genre0=genres.split("/")[0], type_legend=legend, time_unit=time_unit,
                   style_spec=style_text)
 
@@ -154,6 +163,9 @@ def _filler_system(profile, blueprint=None) -> str:
 
 
 def _session_facts(ws, s):
+    if getattr(ws, "disclosure", None):
+        from pipeline.disclosure import session_facts
+        return session_facts(ws, s)
     facts = []
     for ent, flds in ws.entities.items():
         for fname, tl in flds.items():
@@ -253,13 +265,16 @@ def _canonical_fact_refs(content: str, facts: list[dict], events: list[dict]) ->
     return list(dict.fromkeys(ref for ref in refs if ref))
 
 
-def _sanitize_corpus(corpus: dict, ws, profile=None) -> dict:
+def _sanitize_corpus(corpus: dict, ws, profile=None, *, semantic=False) -> dict:
     """收口语料元数据，尤其处理扩世界后的增量一致性。
 
     - 所有信号文档的 fact_refs 都从同 session 冻结事实与正文重算；模型自报引用
       不是真源。无法反推则删掉该文档。
     - 扩容后新实体名可能撞上旧 filler，此时删掉撞词 filler，不让草堆变证据。
     """
+    from pipeline.corpus_contract import (public_stage_rules, _review_receipt_matches,
+                                         authoritative_source_assertions, reviewed_fidelity_provenance)
+    public_rules = {rule["rule_id"] for rule in public_stage_rules(ws)}
     blocked = {str(x) for x in _tracked_blocklist(ws, profile) if x}
     events_by_session = {}
     for event in getattr(ws, "events", None) or []:
@@ -281,15 +296,98 @@ def _sanitize_corpus(corpus: dict, ws, profile=None) -> dict:
                     continue
                 doc["fact_refs"] = []
             elif "_sig_" in str(doc.get("doc_id", "")):
-                doc["fact_refs"] = _canonical_fact_refs(
-                    content, facts, events_by_session.get(sid, []))
-                if not doc["fact_refs"]:
+                if semantic and getattr(ws, "disclosure", None) and not _review_receipt_matches(ws, sid, doc):
+                    raise ValueError("Public disclosure material has no current semantic receipt")
+                fidelity = reviewed_fidelity_provenance(ws, sid, doc) if semantic else None
+                doc["fact_refs"] = (fidelity["fact_refs"] if fidelity is not None else
+                                    _canonical_fact_refs(content, facts, events_by_session.get(sid, [])))
+                if fidelity is not None:
+                    doc["event_refs"] = fidelity["event_refs"]
+                rule_refs = doc.get("public_rule_refs", [])
+                reviewed_rules = (isinstance(rule_refs, list) and bool(rule_refs)
+                                  and all(isinstance(ref, str) for ref in rule_refs)
+                                  and set(rule_refs) <= public_rules
+                                  and _review_receipt_matches(ws, sid, doc))
+                source_refs = doc.get("public_source_refs", [])
+                reviewed_sources = (isinstance(source_refs, list) and bool(source_refs)
+                                    and all(isinstance(ref, str) for ref in source_refs)
+                                    and set(source_refs) <= {item["assertion_id"] for item in
+                                                            authoritative_source_assertions(ws, sid)}
+                                    and _review_receipt_matches(ws, sid, doc))
+                if not doc["fact_refs"] and not reviewed_rules and not reviewed_sources and fidelity is None:
                     stats["dropped_unref"] += 1
                     continue
                 stats["canonicalized_refs"] += 1
             kept.append(doc)
         session["docs"] = kept
     return stats
+
+
+def _render_public_stage_material(wp, ws, tracer, corpus):
+    """Render scenario-level definitions inside the original corpus stage.
+
+    The author receives no questions, answers, current entity values or future
+    trajectories. Existing reviewed material is reused only when still bound to
+    this frozen world. Missing rule material never falls back to a gold snippet.
+    """
+    from pipeline.corpus_contract import (public_stage_rules, public_rule_coverage_issues,
+                                         canonical_context, review_documents, attach_receipts,
+                                         CorpusReviewExecutionError)
+    rules = public_stage_rules(ws)
+    if not rules:
+        return False
+    problems = public_rule_coverage_issues(ws, corpus)
+    if not problems:
+        return False
+    if any(item["code"] != "missing_public_rule_material" for item in problems):
+        raise RuntimeError(f"Existing public stage material is stale or invalid: {problems}")
+    missing_ids = {item["rule_id"] for item in problems}
+    required = [rule for rule in rules if rule["rule_id"] in missing_ids]
+    context = canonical_context(ws, 0)
+    date = context["document_date"]
+    first = next((session for session in corpus.get("sessions", []) if session.get("session_id") == 0), None)
+    if first is None or first.get("date") != date:
+        raise RuntimeError("Public stage material requires the correctly dated first corpus period")
+    system = render("corpus.public_rules.system",
+                    style_spec=json.dumps(wp.get("style_spec") or {}, ensure_ascii=False))
+    hint = ""
+    for attempt in range(4):
+        out = tracer.chat_json("render.signal",
+            [{"role": "system", "content": system},
+             {"role": "user", "content": render("corpus.public_rules.user", date=date,
+                 rules=json.dumps(required, ensure_ascii=False), hint=hint)}],
+            temperature=0.6 if attempt == 0 else 0.2, max_tokens=SIGNAL_MAX_TOKENS,
+            **({"response_format": {"type": "json_object"}}
+               if (wp.get("quality_contract") or {}).get("corpus_review") else {}))
+        if not isinstance(out, dict) or "__error__" in out:
+            raise RuntimeError("Public stage material author call failed")
+        docs = [{**{key: doc[key] for key in ("title", "type", "content") if key in doc},
+                 "is_filler": False, "fact_refs": []}
+                for doc in _dicts(out.get("docs")) if isinstance(doc.get("content"), str)
+                and doc["content"].strip()]
+        if not docs:
+            raise RuntimeError("Public stage material author returned no document body")
+        report = review_documents(tracer, ws, 0, docs, context=context,
+                                  required_public_rule_ids=[rule["rule_id"] for rule in required])
+        if report["status"] == "error":
+            raise CorpusReviewExecutionError(report, 0)
+        if report["status"] == "passed":
+            attach_receipts(docs, report, 0)
+            # A document unreferenced by this complete-body review is not public
+            # rule evidence. Do not retain unrelated author additions.
+            docs = [doc for doc in docs if doc.get("public_rule_refs")]
+            used = {doc.get("doc_id") for session in corpus["sessions"] for doc in session.get("docs", [])}
+            index = len(first["docs"])
+            for doc in docs:
+                while f"s0_sig_{index}" in used:
+                    index += 1
+                doc["doc_id"] = f"s0_sig_{index}"
+                used.add(doc["doc_id"])
+                first["docs"].append(doc)
+                index += 1
+            return True
+        hint = "上一版的具体语义缺口，请只据冻结定义修复：" + json.dumps(report["issues"], ensure_ascii=False)
+    raise RuntimeError("Public stage material failed its existing corpus review repair budget: " + hint)
 
 
 def _render_conflict_docs(ws, s, date, _tracer):
@@ -416,7 +514,7 @@ def _story_context_for_group(ledger, scenes, session, event_ids, event_by_id):
     return context
 
 
-def _attach_story_provenance(docs, events, scenes) -> None:
+def _attach_story_provenance(docs, events, scenes, *, ws=None, session=None) -> None:
     """按单篇实际承载的事件写 provenance，避免把整组 refs 复制给每篇。"""
     event_to_scene = {
         event_ref: scene.get("scene_id")
@@ -425,11 +523,49 @@ def _attach_story_provenance(docs, events, scenes) -> None:
     }
     for doc in docs:
         content = str(doc.get("content") or "")
-        refs = [event.get("id") for event in events
-                if event.get("id") and _event_is_narrated(event, content)]
+        if ws is not None:
+            from pipeline.corpus_contract import reviewed_fidelity_provenance
+            provenance = reviewed_fidelity_provenance(ws, session, doc)
+            refs = provenance["event_refs"] if provenance is not None else []
+        else:
+            refs = [event.get("id") for event in events
+                    if event.get("id") and _event_is_narrated(event, content)]
         doc["event_refs"] = refs
         doc["scene_refs"] = list(dict.fromkeys(
             event_to_scene[ref] for ref in refs if ref in event_to_scene))
+
+
+class _CorpusReviewCallGuard:
+    """Stop new corpus calls after a review execution failure in this render.
+
+    Calls admitted before the failure may finish and retain their original trace.
+    The lock only protects admission/failure state; provider calls stay parallel.
+    """
+
+    def __init__(self, tracer):
+        self._tracer = tracer
+        self._lock = threading.Lock()
+        self._failure = None
+
+    def check(self):
+        with self._lock:
+            if self._failure is not None:
+                raise self._failure
+
+    def fail(self, error):
+        with self._lock:
+            if self._failure is None:
+                self._failure = error
+            failure = self._failure
+        raise failure
+
+    def chat_json(self, *args, **kwargs):
+        self.check()
+        return self._tracer.chat_json(*args, **kwargs)
+
+    def chat_text(self, *args, **kwargs):
+        self.check()
+        return self._tracer.chat_text(*args, **kwargs)
 
 
 def render_corpus(wp, ws, target_tokens, tracer, corpus, done_weeks, save_cb, log=print,
@@ -437,9 +573,26 @@ def render_corpus(wp, ws, target_tokens, tracer, corpus, done_weeks, save_cb, lo
     """only_entities=None:全量渲(每周全实体+filler)。
     only_entities=set:★增量 delta(§10.1)——【只渲这些新实体的 signal】并【追加】到已有周 docs,
     ``only_entity_sessions`` 精确补渲被新关系/事件改变的旧实体周；不重灌 filler。"""
+    if target_tokens < 0:
+        raise ValueError("语料规模不能为负数")
     story_ledger = getattr(ws, "narrative", None) or {}
     quality_enabled = bool((wp.get("quality_contract") or {}).get("corpus_review"))
-    from pipeline.corpus_contract import canonical_context, review_documents, attach_receipts
+    from pipeline.corpus_contract import (canonical_context, review_documents, attach_receipts,
+                                          authoritative_source_assertions, SOURCE_ASSERTION_INSTRUCTIONS,
+                                          public_source_coverage_issues, CorpusReviewExecutionError,
+                                          fidelity_requirements, fidelity_coverage_issues)
+    projected = bool(getattr(ws, "disclosure", None))
+    if (wp.get("quality_contract") or {}).get("public_disclosure") is True and not projected:
+        raise ValueError("Public disclosure rendering was declared but its frozen plan is missing")
+    if projected:
+        from pipeline.disclosure import validate_plan, session_events as public_session_events
+        issues = validate_plan(ws)
+        if issues:
+            raise ValueError(f"Public disclosure plan is invalid: {issues}")
+        if not quality_enabled:
+            raise ValueError("Public disclosure rendering requires the original semantic corpus review")
+    review_guard = _CorpusReviewCallGuard(tracer)
+    tracer = review_guard
     story_scenes = replay_story_ledger(ws, story_ledger) if story_ledger else []
     profile = wp.get("domain_profile", {})
     blueprint = getattr(ws, "world_blueprint", None) or wp.get("world_blueprint") or {}
@@ -448,12 +601,19 @@ def render_corpus(wp, ws, target_tokens, tracer, corpus, done_weeks, save_cb, lo
     # 同一个人类可读单位（章/周）；否则会生成“第5章”却授权“第5chapter”。
     time_unit = ws.period_unit()
     step_days = int(temporal.get("step_days", 7) or 7)
-    sys_sig = _corpus_system(profile, blueprint, wp.get("style_spec"))
+    sys_sig = _corpus_system(profile, blueprint, wp.get("style_spec"), semantic=quality_enabled)
+    if projected:
+        sys_sig += ("\n本任务按披露计划公开具体事实版本。文档日期是公开日期；"
+                    "fact_session/fact_date 以及事件 session/date 是事实的原时点，两者不得混同。"
+                    "依据各 disclosure_id 的 channel/acquisition_context 安排行文；这些载体说明不改变业务真值。"
+                    "可以自然回顾旧事实或对比多个版本，但不得把旧值写成本期新发生的状态变化；"
+                    "只使用本组公开目标和 CANON 已公开历史，不能补入其他私有事实。")
     sys_fil = _filler_system(profile, blueprint)
     blocked = _tracked_blocklist(ws, profile)
     # 估算 filler/周 以达目标 token(~1字≈1token)。周并行后不再 early-stop;filler_per_week 已按目标分摊。
     n_sessions = ws.n_sessions
-    filler_per_week = max(8, round(target_tokens / max(1, n_sessions) / 800))   # 每篇≈800字
+    filler_per_week = (max(1, ceil(target_tokens / max(1, n_sessions) / 800))
+                       if target_tokens > 0 else 0)  # 每篇约800字；小样本不强制每期8篇草堆
     by_id = {x["session_id"]: x for x in corpus["sessions"]}
     delta_mode = only_entities is not None or only_entity_sessions is not None
     only_entities = set(only_entities or [])
@@ -467,32 +627,57 @@ def render_corpus(wp, ws, target_tokens, tracer, corpus, done_weeks, save_cb, lo
         review_context = canonical_context(ws, s)
         facts = _session_facts(ws, s)
         event_decls = {e.get("id"): e for e in blueprint.get("event_types", [])}
+        event_candidates = (public_session_events(ws, s) if projected else
+                            (getattr(ws, "events", None) or []))
         labeled_events = [
             {**event, "label": (event_decls.get(event.get("type")) or {}).get(
                 "label", event.get("type", ""))}
-            for event in (getattr(ws, "events", None) or [])
+            for event in event_candidates
         ]
         event_by_id = {event.get("id"): event for event in labeled_events if event.get("id")}
-        session_events = [event for event in labeled_events if event.get("session") == s]
+        session_events = (labeled_events if projected else
+                          [event for event in labeled_events if event.get("session") == s])
         if delta_mode:                                    # ★delta:新实体全程 + 旧实体受结构变化的精确 session
             facts = [f for f in facts if (f["entity"] in only_entities
                                           or (f["entity"], s) in only_entity_sessions)]
-            if not facts:
+            if projected:
+                session_events = [event for event in session_events if any(
+                    name in only_entities or (name, s) in only_entity_sessions
+                    for name in (event.get("participants") or {}).values())]
+            if not facts and not (projected and session_events):
                 return s                                  # 新实体本周无事实 → 不加 doc
         bysku = {}
         for f in facts:
             bysku.setdefault(f["entity"], []).append(f)
-        if story_ledger:
-            sig_groups = _story_signal_groups(bysku, session_events)
+        if projected:
+            # Publication occurrences, rather than truth-change periods, are
+            # the authoring units. An event-only publication still needs a group.
+            occurrence_ids = list(dict.fromkeys(item["disclosure_id"] for item in facts + session_events))
+            sig_groups = []
+            for occurrence in occurrence_ids:
+                group_facts = [item for item in facts if item["disclosure_id"] == occurrence]
+                group_events = [item for item in session_events if item["disclosure_id"] == occurrence]
+                names = list(dict.fromkeys([item["entity"] for item in group_facts]
+                    + [name for event in group_events for name in (event.get("participants") or {}).values()]))
+                sig_groups.append(([(name, [item for item in group_facts if item["entity"] == name])
+                                    for name in names], group_events))
+        elif story_ledger:
+            sig_groups = [(group, None) for group in _story_signal_groups(bysku, session_events)]
         else:
-            sig_groups = list(_chunk(list(bysku.items()), 2))   # 非剧情场景保持原两实体一组
+            sig_groups = [(group, None) for group in _chunk(list(bysku.items()), 2)]
         n_batches = filler_per_week
 
-        def _render_sig(grp):                             # ★信号块:渲全 + 渲对 —— 盲判别器据渲文能否唯一还原 (实体,字段) 才算渲到
+        def _render_sig(group):                           # ★信号块:渲全 + 渲对
+            grp, planned_events = group
             from pipeline.grounding import STOP_MARKERS    # ★只借停用标记(STOP_MARKERS);忠实检不再用 §G 的 attributed(死钉②不同尺)
             gf = [f for _e, fs in grp for f in fs]
-            group_entities = {f["entity"] for f in gf}
-            if story_ledger:
+            group_entities = {name for name, _facts in grp}
+            group_context = {**review_context, "source_assertions": (
+                authoritative_source_assertions(ws, s, {(f["entity"], f["field"]) for f in gf})
+                if quality_enabled else [])}
+            if planned_events is not None:
+                group_events = planned_events
+            elif story_ledger:
                 group_fact_keys = {(f.get("entity"), f.get("field")) for f in gf}
                 group_events = [
                     event for event in session_events
@@ -502,8 +687,12 @@ def render_corpus(wp, ws, target_tokens, tracer, corpus, done_weeks, save_cb, lo
             else:
                 group_events = [e for e in session_events
                                 if group_entities.intersection((e.get("participants") or {}).values())]
-            story_context = _story_context_for_group(
-                story_ledger, story_scenes, s, [e.get("id") for e in group_events], event_by_id)
+            # Private scene functions/history must not reintroduce unrevealed
+            # outcomes. Planned runs already carry public history in CANON.
+            story_context = ("" if projected else _story_context_for_group(
+                story_ledger, story_scenes, s, [e.get("id") for e in group_events], event_by_id))
+            requirements = (fidelity_requirements(ws, s, facts=gf, events=group_events)
+                            if quality_enabled else [])
             # 待渲事实:非停用 → 派盲判别器读 (实体,字段) 的值,代码量纲严格对账;停用 → 验 (实体,停用标记) 同篇
             want_val = [(f["entity"], f["field"], str(f["value"])) for f in gf if f.get("value") and not f.get("stopped")]
             want_stop = [(f["entity"], f["field"]) for f in gf if f.get("stopped")]
@@ -538,7 +727,9 @@ def render_corpus(wp, ws, target_tokens, tracer, corpus, done_weeks, save_cb, lo
             #   时,'逐字照抄'与'禁全局口径词'否则构成不可满足约束 → 4 轮必废 → 兜底吸收症状)。
             #   单一真源(由本组事实派生,非按域手维护);长串先遮,防短串是长串子串。
             exempt = sorted({f["field"] for f in gf} | {f["entity"] for f in gf}
-                            | {str(f["value"]) for f in gf if f.get("value")}, key=len, reverse=True)
+                            | {str(f["value"]) for f in gf if f.get("value")}
+                            | {item["source"] for item in group_context["source_assertions"]},
+                            key=len, reverse=True)
 
             def _leaks(text):
                 masked = text
@@ -551,19 +742,28 @@ def render_corpus(wp, ws, target_tokens, tracer, corpus, done_weeks, save_cb, lo
                 out = tracer.chat_json("render.signal",
                     [{"role": "system", "content": sys_sig},
                      {"role": "user", "content": render(
-                         "corpus.user", s=week_label(s), time_unit=time_unit, date=date,
+                         "corpus.quality_user" if quality_enabled else "corpus.user",
+                         s=week_label(s), time_unit=time_unit, date=date,
                          facts=json.dumps(gf, ensure_ascii=False),
                          events=json.dumps(group_events, ensure_ascii=False),
                          story_context=story_context, hint=hint)
                          + (("\n【生成与审阅共享的截至时点事实；不得把未知业务状态写成已发生】\n"
-                             + json.dumps(review_context, ensure_ascii=False)) if quality_enabled else "")}],
-                    temperature=0.6 if _att == 0 else 0.2, max_tokens=8192)
+                             + json.dumps(group_context, ensure_ascii=False)
+                             + ("\n" + SOURCE_ASSERTION_INSTRUCTIONS
+                                if group_context["source_assertions"] else "")) if quality_enabled else "")}],
+                    temperature=0.6 if _att == 0 else 0.2, max_tokens=SIGNAL_MAX_TOKENS,
+                    **({"response_format": {"type": "json_object"}} if quality_enabled else {}))
+                if quality_enabled and (not isinstance(out, dict) or "__error__" in out
+                        or not isinstance(out.get("docs"), list) or not out["docs"]
+                        or any(not isinstance(doc, dict) or not isinstance(doc.get("content"), str)
+                               or not doc["content"].strip() for doc in out["docs"])):
+                    review_guard.fail(RuntimeError("render.signal failed or returned invalid document shape"))
                 cand, leak_notes = [], []
                 for d in _dicts(out.get("docs") if isinstance(out, dict) else []):
                     if not d.get("content"):
                         continue
                     hits = _leaks(d["content"])
-                    if hits:                              # 犯禁不再静默丢:记下死因,进诚实反馈(它驮的事实会出现在 missing 里)
+                    if hits and not quality_enabled:       # legacy 字面拒绝；quality 仅把提示送语义审阅
                         leak_notes.append(f"《{(d.get('title') or d.get('type') or '无题')}》因使用全局口径词{hits}被废弃")
                     else:
                         # signal/filler 身份由代码决定，模型不能用额外元数据让已验收
@@ -573,12 +773,48 @@ def render_corpus(wp, ws, target_tokens, tracer, corpus, done_weeks, save_cb, lo
                         clean["is_filler"] = False
                         cand.append(clean)
                 contents = [d.get("content", "") for d in cand]
-                miss_val, miss_stop, miss_event = _discriminate(contents)
+                blind_reads, lexical_diagnostics = [], []
+                if quality_enabled:
+                    # Queries contain neither expected values nor stop/event targets.
+                    queries = [{"key": f"q{index}", **{key: fact[key] for key in (
+                                    "entity", "field", "fact_session", "fact_date", "disclosure_id", "target_ref")
+                                    if key in fact}}
+                               for index, fact in enumerate(gf)]
+                    try:
+                        answers = _discriminate_many(contents, queries, tracer, semantic=True)
+                    except Exception as exc:
+                        review_guard.fail(exc)
+                    blind_reads = [{**query, "answer": answers[query["key"]]} for query in queries]
+                    lexical_diagnostics = [
+                        {"doc_index": index, "global_scope_word_hits": _leaks(doc.get("content", ""))}
+                        for index, doc in enumerate(cand) if _leaks(doc.get("content", ""))]
+                    lexical_diagnostics += [
+                        {"kind": "literal_value_mismatch", "entity": fact["entity"], "field": fact["field"],
+                         "blind_answer": answers[f"q{index}"]}
+                        for index, fact in enumerate(gf) if not fact.get("stopped")
+                        and not _strict_eq(answers[f"q{index}"], str(fact["value"]))]
+                    lexical_diagnostics += [{"kind": "event_literal_hint", "hint": hint}
+                                            for hint in _missing_event_narratives(group_events, contents)]
+                    lexical_diagnostics += [
+                        {"kind": "stop_literal_hint", "entity": fact["entity"], "field": fact["field"]}
+                        for fact in gf if fact.get("stopped")
+                        and not any(fact["entity"] in content and any(word in content for word in STOP_MARKERS)
+                                    for content in contents)]
+                    miss_val, miss_stop, miss_event = [], [], []
+                else:
+                    miss_val, miss_stop, miss_event = _discriminate(contents)
                 missing = miss_val + miss_stop + miss_event
                 unsupported = []
                 quality_review = None
                 if not missing and quality_enabled:
-                    quality_review = review_documents(tracer, ws, s, cand, context=review_context)
+                    quality_review = review_documents(tracer, ws, s, cand, context=group_context,
+                        requirements=requirements, blind_reads=blind_reads,
+                        lexical_diagnostics=lexical_diagnostics)
+                    if quality_review["status"] == "error":
+                        # The real tracer has already preserved the attempted call/raw
+                        # output. Do not feed a timeout or malformed review to the
+                        # author as an unsupported business assertion.
+                        review_guard.fail(CorpusReviewExecutionError(quality_review, s))
                     if quality_review["status"] != "passed":
                         unsupported = [json.dumps(item, ensure_ascii=False) for item in quality_review["issues"]]
                 elif not missing and story_ledger:
@@ -591,7 +827,7 @@ def render_corpus(wp, ws, target_tokens, tracer, corpus, done_weeks, save_cb, lo
                                "allowed_past_context": story_context},
                         candidate=cand,
                         scope=f"game corpus session {s}")
-                left = missing + [f"无依据剧情断言:{item}" for item in unsupported]
+                left = missing + [f"语义审阅缺口:{item}" for item in unsupported]
                 grp_docs = cand
                 if not left:
                     break
@@ -610,24 +846,27 @@ def render_corpus(wp, ws, target_tokens, tracer, corpus, done_weeks, save_cb, lo
                     hint += ("\n★ 只修上述事件证据：同一篇中明确写动作，并逐字写出这些"
                              f" entity/field/set，禁止同义替换：{json.dumps(exact_effects, ensure_ascii=False)}。")
                 if unsupported:
-                    hint += (f"\n★ 上一版含 canonical 之外的断言:{unsupported}。"
-                             "删除这些断言，只用给定 facts/events 与已发生上下文重写。")
+                    hint += (f"\n★ 上一版语义审阅发现:{unsupported}。"
+                             "按给定 facts/events、当期来源声明与已发生上下文修正，"
+                             "补齐缺失的来源对应关系，删除无依据断言，不创造新事实。")
                 if leak_notes:
                     hint += (f"\n★ 另:上一版 {leak_notes}——重写时把其中事实写进正文,但【删掉这些全局口径词】"
                              f"(注意:字段名/实体名/事实值本身含这些字的照常写,不算犯禁)。")
-                hint += "逐条重写进正文(仍只写本期)。"
+                hint += ("按语义意见修订正文，准确区分本期、历史与未发生内容。" if quality_enabled
+                         else "逐条重写进正文(仍只写本期)。")
             else:
                 fallback_count.append(len(left))          # ★机械验收落点(语义改为"弃段计数"):汇总进末尾日志
                 ents = sorted({m.split("的「")[0] for m in left})
                 log(f"  ⚠fail-loud弃段[{time_unit}{week_label(s)}]:{len(left)} 个 atom 多轮重渲后盲读者仍不可还原,弃段不入库({ents})")
                 if quality_enabled or (story_ledger and group_events):
                     raise RuntimeError(
-                        f"game narrative 渲染失败:{time_unit}{week_label(s)} 仍有 {len(left)} 个未通过项")
+                        f"正文质量审阅未通过:{time_unit}{week_label(s)} 经 4 轮生成与审阅仍有 {len(left)} 个未通过项")
                 return []
-            if story_ledger:
-                _attach_story_provenance(grp_docs, group_events, story_scenes)
             if quality_enabled:
                 attach_receipts(grp_docs, quality_review, s)
+            if story_ledger:
+                _attach_story_provenance(grp_docs, group_events, story_scenes,
+                    **({"ws": ws, "session": s} if quality_enabled else {}))
             return grp_docs
 
         filler_failures: list[str] = []
@@ -647,6 +886,7 @@ def render_corpus(wp, ws, target_tokens, tracer, corpus, done_weeks, save_cb, lo
                 return []
 
         sig_lists = config.pmap(_render_sig, sig_groups, workers=8)              # 周内并发(全局信号量才是真上限)
+        review_guard.check()
         with lock:                                         # 周乱序完成 → 锁内更新+逐周存盘(断点续渲不丢)
             if delta_mode:                                 # ★delta:追加结构变化 signal,接着编号;不灌 filler/conflict
                 docs = list(by_id.get(s, {}).get("docs", []))
@@ -683,8 +923,20 @@ def render_corpus(wp, ws, target_tokens, tracer, corpus, done_weeks, save_cb, lo
         return s
 
     config.pmap(_render_week, weeks, workers=max(1, len(weeks)))   # ★周并行;在飞 API 由全局 LLM_CONCURRENCY 兜住
-    sanitized = _sanitize_corpus(corpus, ws, profile)
-    if story_ledger:
+    review_guard.check()
+    if _render_public_stage_material(wp, ws, tracer, corpus):
+        save_cb()
+    sanitized = _sanitize_corpus(corpus, ws, profile, semantic=quality_enabled)
+    from pipeline.corpus_contract import public_rule_coverage_issues
+    rule_issues = public_rule_coverage_issues(ws, corpus)
+    if rule_issues:
+        raise RuntimeError(f"Public stage material missing after corpus sanitization: {rule_issues}")
+    if quality_enabled:
+        source_issues = public_source_coverage_issues(ws, corpus) + fidelity_coverage_issues(ws, corpus)
+        if source_issues:
+            raise RuntimeError("Public source material needs a complete new group review: "
+                               + json.dumps(source_issues, ensure_ascii=False))
+    if story_ledger and not projected:
         covered = {
             event_ref
             for session in corpus.get("sessions", [])
@@ -724,15 +976,98 @@ def render_corpus(wp, ws, target_tokens, tracer, corpus, done_weeks, save_cb, lo
 PHRASE_SYS = render("phrase.system")
 
 
-def phrase_questions(orders, wp, tracer, log=print) -> list[dict]:
+def phrase_questions(orders, wp, tracer, log=print, *, audit=None) -> list[dict]:
+    from copy import deepcopy
     from pipeline.question_contract import attach_question_contract, validate_question
 
-    def _ph(o):                                           # 每条订单独立 → 并发出题
+    if audit is not None and not isinstance(audit, dict):
+        raise TypeError("Question wording audit must be a dictionary")
+    orders = list(orders)
+    report = audit if audit is not None else {}
+    report.clear()
+    report.update(version="original-question-wording-batch/v2", execution_status="running",
+                  original_count=len(orders), returned_qids=[], counts={},
+                  items=[{"input_index": index, "source_qid": order.get("qid"),
+                          "qid": order.get("qid"), "original_order": deepcopy(order),
+                          "status": "not_started", "calls_admitted": 0, "attempts": [],
+                          "candidate": None, "selected": False, "failure": None}
+                         for index, order in enumerate(orders)])
+    # Per-run admission state. Do not serialize provider calls; already-admitted
+    # calls can finish and keep their normal tracer records after a peer fails.
+    failure_lock, failures = threading.Lock(), []
+    semantic_mode = bool((wp.get("quality_contract") or {}).get("scoring_policy"))
+
+    def _phrase_one(o, row):                              # 每条订单独立 → 并发出题
+        def call_json(*args, **kwargs):
+            with failure_lock:
+                if semantic_mode and failures:
+                    raise RuntimeError("Previous question wording execution failed; no new calls")
+                row["calls_admitted"] += 1
+            try:
+                output = tracer.chat_json(*args, **kwargs)
+            except Exception as exc:
+                with failure_lock:
+                    if semantic_mode and not failures:
+                        failures.append(exc)
+                raise
+            if semantic_mode and isinstance(output, dict) and "__error__" in output:
+                with failure_lock:
+                    if not failures:
+                        failures.append(RuntimeError("Question wording provider returned an execution error"))
+            return output
+
         o = attach_question_contract(o, wp)
+        row["qid"] = o.get("qid")
         line = line_for(o.get("line", ""))                # 出题意图/须隐藏 = 各产线自己的 intent()
         if line is None:                                  # 兜底(订单都来自已建线,理论不触发)
             return {**o, "question": "", "_phrase_fallback": False}
         intent, hide = line.intent(o)
+        if o["question_contract"]["render_policy"] == "semantic_review":
+            from pipeline.question_wording import AUTHOR_SYSTEM, review_wording
+            if getattr(line, "deterministic_phrasing", False):
+                text = intent
+            else:
+                authored = call_json("phrase", [{"role": "system", "content": AUTHOR_SYSTEM},
+                    {"role": "user", "content": render("phrase.user", intent=intent, hide=hide)}],
+                    temperature=0.5, max_tokens=2048, retries=1, strict_json=True)
+                row["author_output"] = deepcopy(authored)
+                if (not isinstance(authored, dict) or "__error__" in authored
+                        or not isinstance(authored.get("question"), str) or not authored["question"].strip()):
+                    raise RuntimeError("Question author failed; no semantic fallback on execution failure")
+                text = authored["question"]
+            row["candidate"] = {**deepcopy(o), "question": text}
+            row["attempts"].append({"source": "canonical" if getattr(line, "deterministic_phrasing", False)
+                                    else "author", "question": text, "review": None})
+            first = review_wording(text, o["question_contract"], chat_json=call_json,
+                                   model=config.REVIEWER_MODEL)
+            row["attempts"][-1]["review"] = deepcopy(first)
+            reviews = [first]
+            if first["status"] != "passed" and not getattr(line, "deterministic_phrasing", False):
+                # Return semantic feedback to the same author once. Execution
+                # failures propagate without inventing a repaired candidate.
+                repair_request = {"original_intent": intent, "hidden_values": hide,
+                                  "candidate_question": text, "review_feedback": first["opinion"]}
+                row["repair_request"] = deepcopy(repair_request)
+                repaired = call_json("phrase", [{"role": "system", "content": AUTHOR_SYSTEM},
+                    {"role": "user", "content": json.dumps(repair_request, ensure_ascii=False)}],
+                    temperature=0.5, max_tokens=2048, retries=1, strict_json=True)
+                row["repair_author_output"] = deepcopy(repaired)
+                if (not isinstance(repaired, dict) or "__error__" in repaired
+                        or not isinstance(repaired.get("question"), str) or not repaired["question"].strip()):
+                    raise RuntimeError("Question repair author failed; no semantic fallback on execution failure")
+                text = repaired["question"]
+                row["candidate"] = {**deepcopy(o), "question": text}
+                row["attempts"].append({"source": "author_repair", "question": text, "review": None})
+                reviews.append(review_wording(text, o["question_contract"],
+                    chat_json=call_json, model=config.REVIEWER_MODEL))
+                row["attempts"][-1]["review"] = deepcopy(reviews[-1])
+            final = reviews[-1]
+            row["status"] = "passed" if final["status"] == "passed" else "unresolved"
+            return {**o, "question": text if final["status"] == "passed" else "",
+                    "_phrase_fallback": len(reviews) > 1,
+                    "question_validation": {"status": final["status"], "mode": "semantic_review",
+                        "source": "llm_meaning_review", "semantic_review": final,
+                        "review_history": reviews}}
         fallback_issues = validate_question(intent, o["question_contract"])
         if fallback_issues:
             return {**o, "question": "", "_phrase_fallback": False,
@@ -744,7 +1079,7 @@ def phrase_questions(orders, wp, tracer, log=print) -> list[dict]:
                     "question_validation": {"status": "passed", "mode": "canonical_template",
                         "source": "deterministic_template", "llm_calls": 0,
                         "issues": [], "rewrite_issues": []}}
-        out = tracer.chat_json("phrase",
+        out = call_json("phrase",
             [{"role": "system", "content": PHRASE_SYS},
              {"role": "user", "content": render("phrase.user", intent=intent, hide=hide)}],
             temperature=0.5, max_tokens=2048)
@@ -765,14 +1100,55 @@ def phrase_questions(orders, wp, tracer, log=print) -> list[dict]:
                     "mode": "template_fallback" if fell_back else o["question_contract"]["render_policy"],
                     "source": "contract_validator", "llm_calls": 1,
                     "issues": final_issues, "rewrite_issues": issues}}
-    raw = config.pmap(_ph, orders, workers=8)
+    def _ph(indexed):
+        index, order = indexed
+        row = report["items"][index]
+        try:
+            result = _phrase_one(order, row)
+        except Exception as exc:
+            with failure_lock:
+                previously_failed = bool(failures)
+                if semantic_mode and not failures:
+                    failures.append(exc)
+            row["status"] = ("not_run_after_execution_failure"
+                             if previously_failed and not row["calls_admitted"] else "execution_error")
+            row["failure"] = {"type": type(exc).__name__, "message": str(exc)}
+            if isinstance(getattr(exc, "report", None), dict):
+                row["failed_review"] = deepcopy(exc.report)
+                if row["attempts"] and row["attempts"][-1]["review"] is None:
+                    row["attempts"][-1]["review"] = deepcopy(exc.report)
+            raise
+        row["selected"] = bool(result.get("question", "").strip())
+        if row["status"] == "not_started":
+            row["status"] = "passed" if row["selected"] else "rejected"
+        # Keep the last actual candidate text even when the returned selection
+        # intentionally has an empty question to exclude unresolved wording.
+        actual_text = (row["candidate"] or {}).get("question", result.get("question", ""))
+        row["candidate"] = {**deepcopy(result), "question": actual_text}
+        row["candidate"].pop("_phrase_fallback", None)
+        return result
+
+    def update_counts():
+        from collections import Counter
+        report["counts"] = dict(Counter(row["status"] for row in report["items"]))
+
+    try:
+        raw = config.pmap(_ph, enumerate(orders), workers=8)
+    except Exception as exc:
+        report["execution_status"] = "failed"
+        report["execution_failure"] = {"type": type(exc).__name__, "message": str(exc)}
+        update_counts()
+        raise
     fallback_count = sum(bool(q.pop("_phrase_fallback", False)) for q in raw)
     qs = [q for q in raw if q.get("question", "").strip()]    # 丢并发下偶发的空题面
     dropped = len(raw) - len(qs)
+    report["execution_status"] = "completed"
+    report["returned_qids"] = [q.get("qid") for q in qs]
+    update_counts()
     by_line = {}
     for q in qs:
         by_line[q.get("line", "?")] = by_line.get(q.get("line", "?"), 0) + 1
-    log(f"  ④ 出题:{len(qs)} 题完成(原意图保真 {fallback_count};丢空 {dropped};桥实体/答案不进题面);by_line {by_line}")
+    log(f"  ④ 出题:{len(qs)} 题完成(返修或兜底 {fallback_count};丢空 {dropped};桥实体/答案不进题面);by_line {by_line}")
     return qs
 
 

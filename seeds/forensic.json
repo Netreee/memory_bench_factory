@@ -1,0 +1,841 @@
+{
+  "schema_version": 2,
+  "seed_id": "forensic_attachment_review_v2",
+  "family": "forensic_attachment_review",
+  "title": "法医档案复核：委托范围、材料补充与意见依据",
+  "description": "以坠落鉴定附件中的委托、检材、检验和专业意见关系，生成完全合成的鉴定档案维护场景。",
+  "sources": [
+    {
+      "id": "forensic_01",
+      "path": "data/real_seed/yanpan_2026-09-19/extracted/坠落法医鉴定/附件三：司法部《法医鉴定意见书编写规范》.pdf",
+      "sha256": "69506f5c05d8e9fd2de4d675563884972e85a4fa00c657bd72d9a13bc2d2a4b3",
+      "role": "corpus",
+      "source_kind": "normative",
+      "title": "司法鉴定文书规范及司法鉴定协议书示范文本通知",
+      "allowed_use": [
+        "ontology",
+        "mechanism",
+        "exemplar_style"
+      ],
+      "sensitivity": "public_reference",
+      "date_scope": {
+        "issued": "2007-11-01",
+        "web_published": "2008-10-08"
+      }
+    },
+    {
+      "id": "forensic_02",
+      "path": "data/real_seed/yanpan_2026-09-19/extracted/坠落法医鉴定/附件四：中国法律服务网“高处坠落损伤法医鉴定案例”.pdf",
+      "sha256": "065ffe00bc50849d07e8752558af511e543a2f2441fd584df3c5a58926e5b149",
+      "role": "corpus",
+      "source_kind": "example",
+      "title": "高坠损伤造成死亡及摔倒参与度鉴定案例",
+      "allowed_use": [
+        "ontology",
+        "mechanism",
+        "exemplar_style"
+      ],
+      "sensitivity": "case_record_use_synthetic_structure_only"
+    },
+    {
+      "id": "forensic_03",
+      "path": "data/real_seed/yanpan_2026-09-19/extracted/坠落法医鉴定/附件一：《法医临床检验规范》.pdf",
+      "sha256": "1967dcc89004c59ff0086d5f3bb4c198516aa46e585e6d85073bb6d91d3767a4",
+      "role": "builder_only",
+      "source_kind": "normative",
+      "title": "推荐适用法医临床检验规范等八项技术规范的通知",
+      "allowed_use": [
+        "source_boundary"
+      ],
+      "sensitivity": "public_reference"
+    },
+    {
+      "id": "forensic_04",
+      "path": "data/real_seed/yanpan_2026-09-19/extracted/坠落法医鉴定/附件六：刑事案件立案追诉标准的规定（二）.pdf",
+      "sha256": "0e994f482c8d491ac6760005007e11126801fd4284d95af0309a10cbac8a1f12",
+      "role": "builder_only",
+      "source_kind": "analytical",
+      "title": "经济犯罪立案追诉标准修订发布消息",
+      "allowed_use": [
+        "source_boundary"
+      ],
+      "sensitivity": "public_reference"
+    },
+    {
+      "id": "forensic_05",
+      "path": "data/real_seed/yanpan_2026-09-19/extracted/坠落法医鉴定/附件五：高处坠落伤残鉴定案例.docx",
+      "sha256": "05661312ed9ff4ace25f0453d9ef54aee0b59e08cac1c892adabb75de85a78f8",
+      "role": "corpus",
+      "source_kind": "example",
+      "title": "高坠伤伤残等级重新鉴定案例模板",
+      "allowed_use": [
+        "ontology",
+        "mechanism",
+        "exemplar_style"
+      ],
+      "sensitivity": "case_template_use_synthetic_structure_only"
+    },
+    {
+      "id": "forensic_06",
+      "path": "data/real_seed/yanpan_2026-09-19/extracted/坠落法医鉴定/附件二：司法部《法医病理检验规范》.pdf",
+      "sha256": "00271a1f248af749dbeabd7327a291c150c53de68d2c69160cb84ea246817a64",
+      "role": "corpus",
+      "source_kind": "normative",
+      "title": "法医类司法鉴定执业分类规定",
+      "allowed_use": [
+        "ontology",
+        "mechanism",
+        "exemplar_style"
+      ],
+      "sensitivity": "public_reference",
+      "date_scope": {
+        "issued": "2020-05-14",
+        "web_published": "2020-05-27"
+      }
+    }
+  ],
+  "task": {
+    "objective": "法医档案复核：委托范围、材料补充与意见依据",
+    "instructions": [
+      "合成连续工作档案，公开材料说明每条信息何时、经何种途径获知；计划、实际发生和事后回顾保持各自含义。",
+      "决定答案的业务条件、口径和关键理由必须出现在公开语料；审阅只依据受测者可见材料。",
+      "按批次分线题量规划足够的独立实体、时间跨度和事件；种子所列数量只设下限，并非每轮生产规模。",
+      "保持每份意见、关键材料与委托的身份一致；原件补正只影响确实引用它的意见。",
+      "专业判断作为合成专业意见书中的显式记录给出，题目围绕可追溯依据、范围和时间设计。"
+    ],
+    "forbidden_inferences": [
+      "不得从一个伤情词直接推导伤残级别、死亡方式或刑事责任。",
+      "不得把模板占位日期和编号填成真实事实；不得复制真实身份及病历细节。"
+    ]
+  },
+  "exemplars": [
+    {
+      "title": "补件登记",
+      "content": "青岚委托的影像说明于第二期补入，材料完整性更新为已补充；原件核对仍待进行。",
+      "doc_type": "业务复核记录",
+      "date": "2027-01-22",
+      "origin": "synthetic",
+      "source_refs": [],
+      "mechanism_refs": [
+        "evidence_to_opinion"
+      ]
+    },
+    {
+      "title": "核对与出具",
+      "content": "第三期核对青岚委托的材料原件，第四期据此复核该委托意见。文书只回答委托的功能状态问题，未记录责任归属判断。",
+      "doc_type": "业务复核记录",
+      "date": "2027-01-22",
+      "origin": "synthetic",
+      "source_refs": [],
+      "mechanism_refs": [
+        "evidence_to_opinion",
+        "scope_of_opinion"
+      ]
+    }
+  ],
+  "mechanisms": [
+    {
+      "id": "evidence_to_opinion",
+      "description": "同一委托下补充材料、核对原件，再复核引用这些材料的专业意见；允许保持待补证状态。",
+      "source_refs": [
+        {
+          "source_id": "forensic_01",
+          "locator": "page:1;section:第三条、第七条"
+        },
+        {
+          "source_id": "forensic_05",
+          "locator": "paragraph:13-26"
+        }
+      ],
+      "required_entity_types": [
+        "case",
+        "material",
+        "opinion"
+      ],
+      "required_relation_types": [
+        "material_for_case",
+        "opinion_for_case",
+        "opinion_uses_material"
+      ],
+      "required_event_types": [
+        "material_added",
+        "material_verified",
+        "opinion_reviewed"
+      ],
+      "required_causal_rules": [
+        "addition_to_check",
+        "check_to_opinion"
+      ],
+      "failure_modes": [
+        "拿其他委托的材料支持结论",
+        "把补充登记当成原件已核对"
+      ],
+      "capability_hooks": [
+        "L1_timeline",
+        "L2_relational",
+        "L3_process"
+      ]
+    },
+    {
+      "id": "scope_of_opinion",
+      "description": "保留检验发现、伤残等级、死亡原因和法律责任各自的结论范围；资料缺项时保留边界。",
+      "source_refs": [
+        {
+          "source_id": "forensic_01",
+          "locator": "page:1;section:第三条、第七条"
+        },
+        {
+          "source_id": "forensic_06",
+          "locator": "page:1;section:第二章、第三章"
+        }
+      ],
+      "required_entity_types": [
+        "case",
+        "opinion"
+      ],
+      "required_relation_types": [
+        "opinion_for_case"
+      ],
+      "required_event_types": [
+        "opinion_reviewed"
+      ],
+      "required_causal_rules": [],
+      "failure_modes": [
+        "用个案意见推定所有坠落案件",
+        "将技术意见扩大成司法裁判"
+      ],
+      "capability_hooks": [
+        "L5_conflict",
+        "L6_refusal"
+      ]
+    }
+  ],
+  "blueprint_requirements": {
+    "entity_types": [
+      {
+        "id": "case",
+        "noun": "合成鉴定委托",
+        "count": 2,
+        "fields": [
+          {
+            "name": "委托事项",
+            "kind": "category",
+            "source_refs": [
+              {
+                "source_id": "forensic_06",
+                "locator": "page:1;section:第二章、第三章"
+              }
+            ]
+          },
+          {
+            "name": "受理阶段",
+            "kind": "status",
+            "source_refs": [
+              {
+                "source_id": "forensic_01",
+                "locator": "page:1;section:第三条、第七条"
+              }
+            ]
+          }
+        ],
+        "source_refs": [
+          {
+            "source_id": "forensic_01",
+            "locator": "page:1;section:第三条、第七条"
+          }
+        ],
+        "primary": true
+      },
+      {
+        "id": "material",
+        "noun": "鉴定材料记录",
+        "count": 3,
+        "fields": [
+          {
+            "name": "所属委托",
+            "kind": "reference",
+            "source_refs": [
+              {
+                "source_id": "forensic_01",
+                "locator": "page:1;section:第三条、第七条"
+              }
+            ]
+          },
+          {
+            "name": "材料类别",
+            "kind": "category",
+            "source_refs": [
+              {
+                "source_id": "forensic_01",
+                "locator": "page:1;section:第三条、第七条"
+              }
+            ]
+          },
+          {
+            "name": "材料完整性",
+            "kind": "status",
+            "source_refs": [
+              {
+                "source_id": "forensic_05",
+                "locator": "paragraph:13-26"
+              }
+            ]
+          },
+          {
+            "name": "原件核对状态",
+            "kind": "status",
+            "source_refs": [
+              {
+                "source_id": "forensic_05",
+                "locator": "paragraph:13-26"
+              }
+            ]
+          }
+        ],
+        "source_refs": [
+          {
+            "source_id": "forensic_01",
+            "locator": "page:1;section:第三条、第七条"
+          }
+        ]
+      },
+      {
+        "id": "opinion",
+        "noun": "专业意见记录",
+        "count": 2,
+        "fields": [
+          {
+            "name": "所属委托",
+            "kind": "reference",
+            "source_refs": [
+              {
+                "source_id": "forensic_01",
+                "locator": "page:1;section:第三条、第七条"
+              }
+            ]
+          },
+          {
+            "name": "关键依据",
+            "kind": "reference",
+            "source_refs": [
+              {
+                "source_id": "forensic_01",
+                "locator": "page:1;section:第三条、第七条"
+              }
+            ]
+          },
+          {
+            "name": "出具阶段",
+            "kind": "status",
+            "source_refs": [
+              {
+                "source_id": "forensic_01",
+                "locator": "page:1;section:第三条、第七条"
+              }
+            ]
+          },
+          {
+            "name": "结论范围",
+            "kind": "category",
+            "source_refs": [
+              {
+                "source_id": "forensic_06",
+                "locator": "page:1;section:第二章、第三章"
+              }
+            ]
+          }
+        ],
+        "source_refs": [
+          {
+            "source_id": "forensic_01",
+            "locator": "page:1;section:第三条、第七条"
+          }
+        ]
+      }
+    ],
+    "relation_types": [
+      {
+        "id": "material_for_case",
+        "from_type": "material",
+        "to_type": "case",
+        "field": "所属委托",
+        "temporal": false,
+        "min_count": 1,
+        "source_refs": [
+          {
+            "source_id": "forensic_01",
+            "locator": "page:1;section:第三条、第七条"
+          }
+        ]
+      },
+      {
+        "id": "opinion_for_case",
+        "from_type": "opinion",
+        "to_type": "case",
+        "field": "所属委托",
+        "temporal": false,
+        "min_count": 1,
+        "source_refs": [
+          {
+            "source_id": "forensic_01",
+            "locator": "page:1;section:第三条、第七条"
+          }
+        ]
+      },
+      {
+        "id": "opinion_uses_material",
+        "from_type": "opinion",
+        "to_type": "material",
+        "field": "关键依据",
+        "temporal": true,
+        "min_count": 1,
+        "source_refs": [
+          {
+            "source_id": "forensic_01",
+            "locator": "page:1;section:第三条、第七条"
+          }
+        ]
+      }
+    ],
+    "event_types": [
+      {
+        "id": "material_added",
+        "label": "补充材料登记",
+        "roles": {
+          "material": "material",
+          "case": "case"
+        },
+        "effect_fields": [
+          {
+            "role": "material",
+            "field": "材料完整性"
+          }
+        ],
+        "min_count": 1,
+        "source_refs": [
+          {
+            "source_id": "forensic_01",
+            "locator": "page:1;section:第三条、第七条"
+          }
+        ],
+        "status": "synthetic_design",
+        "basis": "依据所引资料的工作关系安排合成事件；次数和具体间隔由本种子设计。",
+        "relation_bindings": [
+          {
+            "relation": "material_for_case",
+            "from_role": "material",
+            "to_role": "case"
+          }
+        ]
+      },
+      {
+        "id": "material_verified",
+        "label": "材料与原件核对",
+        "roles": {
+          "material": "material",
+          "opinion": "opinion"
+        },
+        "effect_fields": [
+          {
+            "role": "material",
+            "field": "原件核对状态"
+          }
+        ],
+        "min_count": 1,
+        "source_refs": [
+          {
+            "source_id": "forensic_05",
+            "locator": "paragraph:13-26"
+          }
+        ],
+        "status": "synthetic_design",
+        "basis": "依据所引资料的工作关系安排合成事件；次数和具体间隔由本种子设计。",
+        "relation_bindings": [
+          {
+            "relation": "opinion_uses_material",
+            "from_role": "opinion",
+            "to_role": "material"
+          }
+        ]
+      },
+      {
+        "id": "opinion_reviewed",
+        "label": "意见依据复核",
+        "roles": {
+          "material": "material",
+          "opinion": "opinion",
+          "case": "case"
+        },
+        "effect_fields": [
+          {
+            "role": "opinion",
+            "field": "出具阶段"
+          },
+          {
+            "role": "case",
+            "field": "受理阶段"
+          }
+        ],
+        "min_count": 1,
+        "source_refs": [
+          {
+            "source_id": "forensic_01",
+            "locator": "page:1;section:第三条、第七条"
+          }
+        ],
+        "status": "synthetic_design",
+        "basis": "依据所引资料的工作关系安排合成事件；次数和具体间隔由本种子设计。",
+        "relation_bindings": [
+          {
+            "relation": "opinion_uses_material",
+            "from_role": "opinion",
+            "to_role": "material"
+          },
+          {
+            "relation": "opinion_for_case",
+            "from_role": "opinion",
+            "to_role": "case"
+          },
+          {
+            "relation": "material_for_case",
+            "from_role": "material",
+            "to_role": "case"
+          }
+        ]
+      }
+    ],
+    "causal_rules": [
+      {
+        "id": "addition_to_check",
+        "trigger_event": "material_added",
+        "effect_event": "material_verified",
+        "delay_sessions": 1,
+        "shared_roles": [
+          "material"
+        ],
+        "source_refs": [
+          {
+            "source_id": "forensic_01",
+            "locator": "page:1;section:第三条、第七条"
+          },
+          {
+            "source_id": "forensic_05",
+            "locator": "paragraph:13-26"
+          }
+        ],
+        "status": "synthetic_design",
+        "basis": "原资料支持材料与后续工作之间的依赖；一期间隔为合成调度选择。"
+      },
+      {
+        "id": "check_to_opinion",
+        "trigger_event": "material_verified",
+        "effect_event": "opinion_reviewed",
+        "delay_sessions": 1,
+        "shared_roles": [
+          "material",
+          "opinion"
+        ],
+        "source_refs": [
+          {
+            "source_id": "forensic_01",
+            "locator": "page:1;section:第三条、第七条"
+          },
+          {
+            "source_id": "forensic_05",
+            "locator": "paragraph:13-26"
+          }
+        ],
+        "status": "synthetic_design",
+        "basis": "原资料支持材料与后续工作之间的依赖；一期间隔为合成调度选择。"
+      }
+    ],
+    "evidence_channels": [
+      "合成委托登记",
+      "材料交接记录",
+      "原件核对记录",
+      "合成专业意见书",
+      "复核单"
+    ],
+    "temporal_model": {
+      "min_sessions": 4,
+      "time_granularity": "期",
+      "allow_retrospective": true,
+      "description": "最少四期为合成设计；获取时间、发生时间、报告期间分别交代。"
+    }
+  },
+  "document_map": [
+    {
+      "source_id": "forensic_01",
+      "segments": [
+        {
+          "locator": "page:1;section:第三条、第七条、鉴定风险提示",
+          "topic": "检验结果、分析意见和材料出处",
+          "reading_method": "text"
+        }
+      ]
+    },
+    {
+      "source_id": "forensic_02",
+      "segments": [
+        {
+          "locator": "page:1;section:案情简介、鉴定过程",
+          "topic": "病历时间、检验时间和委托事项",
+          "reading_method": "text"
+        }
+      ]
+    },
+    {
+      "source_id": "forensic_03",
+      "segments": [
+        {
+          "locator": "page:1",
+          "topic": "发布通知及目录片段",
+          "reading_method": "text"
+        }
+      ]
+    },
+    {
+      "source_id": "forensic_04",
+      "segments": [
+        {
+          "locator": "page:1",
+          "topic": "经济犯罪标准的发布消息",
+          "reading_method": "text"
+        }
+      ]
+    },
+    {
+      "source_id": "forensic_05",
+      "segments": [
+        {
+          "locator": "paragraph:13-26",
+          "topic": "原件优先、检验、分析说明和鉴定意见",
+          "reading_method": "text"
+        }
+      ]
+    },
+    {
+      "source_id": "forensic_06",
+      "segments": [
+        {
+          "locator": "page:1;section:第二章、第三章",
+          "topic": "死亡原因与残疾等级等不同委托事项",
+          "reading_method": "text"
+        }
+      ]
+    }
+  ],
+  "generation_contract": {
+    "syntheticization": {
+      "names": "generate_fictional",
+      "case_numbers": "generate_fictional",
+      "numeric_values": "generate_with_explicit_units",
+      "dates": "generate_with_explicit_period_and_disclosure"
+    },
+    "must_include": [],
+    "must_distinguish": [
+      {
+        "text": "病历所记发生时间、检验时间、意见出具时间分别保留。",
+        "status": "accepted",
+        "source_refs": [
+          {
+            "source_id": "forensic_02",
+            "locator": "page:1;section:鉴定过程"
+          }
+        ]
+      },
+      {
+        "text": "伤残等级、损伤程度、死亡原因和司法责任具有不同结论范围。",
+        "status": "accepted",
+        "source_refs": [
+          {
+            "source_id": "forensic_06",
+            "locator": "page:1;section:第二章、第三章"
+          }
+        ]
+      }
+    ],
+    "must_not_infer": [
+      {
+        "text": "不得从一个伤情词直接推导伤残级别、死亡方式或刑事责任。",
+        "status": "accepted",
+        "source_refs": [
+          {
+            "source_id": "forensic_01",
+            "locator": "page:1;section:第三条、第七条"
+          },
+          {
+            "source_id": "forensic_06",
+            "locator": "page:1;section:第二章、第三章"
+          }
+        ]
+      },
+      {
+        "text": "不得把模板占位日期和编号填成真实事实；不得复制真实身份及病历细节。",
+        "status": "accepted",
+        "source_refs": [
+          {
+            "source_id": "forensic_01",
+            "locator": "page:1;section:第三条、第七条"
+          },
+          {
+            "source_id": "forensic_06",
+            "locator": "page:1;section:第二章、第三章"
+          }
+        ]
+      }
+    ],
+    "sensitive_fields": [
+      {
+        "text": "人名、病历号、案件号、精确地址、联系方式和个体病史仅使用合成内容。",
+        "status": "accepted",
+        "source_refs": [
+          {
+            "source_id": "forensic_05",
+            "locator": "paragraph:13-26"
+          }
+        ]
+      }
+    ],
+    "active_lines": [],
+    "traps": [],
+    "unresolved": [],
+    "synthetic_designs": [
+      {
+        "text": "实体数量、至少四期和每种事件至少一次为本次合成世界的覆盖选择；原资料未规定这些数目。",
+        "status": "synthetic_design",
+        "source_refs": []
+      },
+      {
+        "text": "事件之间的一期间隔只安排合成节奏，实际因果成立条件由作者和审阅者结合材料判断。",
+        "status": "synthetic_design",
+        "source_refs": []
+      },
+      {
+        "text": "附件未给出统一的原任务提示词；本种子的持续维护任务由编制者依据材料结构设计。",
+        "status": "synthetic_design",
+        "source_refs": []
+      },
+      {
+        "text": "示例文书日期2027-01-22为合成日期，示例中的期数用于表达先后；实际世界另行规划日期与对应关系。",
+        "status": "synthetic_design",
+        "source_refs": []
+      }
+    ]
+  },
+  "review": {
+    "quality_status": "curated_for_original_pipeline_trial",
+    "blocking_issues": [],
+    "reviewer": "Codex source reading and seed curation",
+    "independent_review_performed": false,
+    "coverage": {
+      "sources_inventoried": 6,
+      "source_records": [
+        {
+          "source_id": "forensic_01",
+          "file_pages": 1,
+          "file_rows": null,
+          "file_columns": null,
+          "reviewed_segments": [
+            [
+              "page:1;section:第三条、第七条、鉴定风险提示",
+              "检验结果、分析意见和材料出处",
+              "text"
+            ]
+          ],
+          "limitations": []
+        },
+        {
+          "source_id": "forensic_02",
+          "file_pages": 1,
+          "file_rows": null,
+          "file_columns": null,
+          "reviewed_segments": [
+            [
+              "page:1;section:案情简介、鉴定过程",
+              "病历时间、检验时间和委托事项",
+              "text"
+            ]
+          ],
+          "limitations": []
+        },
+        {
+          "source_id": "forensic_03",
+          "file_pages": 1,
+          "file_rows": null,
+          "file_columns": null,
+          "reviewed_segments": [
+            [
+              "page:1",
+              "发布通知及目录片段",
+              "text"
+            ]
+          ],
+          "limitations": [
+            "附件未提供临床检验规范完整条文；不据此编制技术阈值。"
+          ]
+        },
+        {
+          "source_id": "forensic_04",
+          "file_pages": 1,
+          "file_rows": null,
+          "file_columns": null,
+          "reviewed_segments": [
+            [
+              "page:1",
+              "经济犯罪标准的发布消息",
+              "text"
+            ]
+          ],
+          "limitations": [
+            "内容涉及经济犯罪，不能作为坠落伤残或死亡性质的判定依据。"
+          ]
+        },
+        {
+          "source_id": "forensic_05",
+          "file_pages": null,
+          "file_rows": null,
+          "file_columns": null,
+          "reviewed_segments": [
+            [
+              "paragraph:13-26",
+              "原件优先、检验、分析说明和鉴定意见",
+              "text"
+            ]
+          ],
+          "limitations": [
+            "日期和技术规范编号含占位符；损伤程度与伤残等级措辞混用。"
+          ]
+        },
+        {
+          "source_id": "forensic_06",
+          "file_pages": 1,
+          "file_rows": null,
+          "file_columns": null,
+          "reviewed_segments": [
+            [
+              "page:1;section:第二章、第三章",
+              "死亡原因与残疾等级等不同委托事项",
+              "text"
+            ]
+          ],
+          "limitations": [
+            "正文为执业分类规定，文件名写作法医病理检验规范。"
+          ]
+        }
+      ],
+      "full_document_semantic_reading_claimed": false
+    },
+    "scope": "所引关键段落和表格支持合成领域设计；未进行现行法规核验、真实案件判定或投资分析。",
+    "source_findings": [
+      "forensic_01、03、06 的正文性质与文件名概括存在差异，按正文登记。",
+      "forensic_04 仅作不适用来源登记。forensic_05 的占位日期、编号和术语混用未转成事实。"
+    ],
+    "synthetic_designs": [
+      "实体数量、至少四期和每种事件至少一次为本次合成世界的覆盖选择；原资料未规定这些数目。",
+      "事件之间的一期间隔只安排合成节奏，实际因果成立条件由作者和审阅者结合材料判断。",
+      "附件未给出统一的原任务提示词；本种子的持续维护任务由编制者依据材料结构设计。",
+      "示例文书日期2027-01-22为合成日期，示例中的期数用于表达先后；实际世界另行规划日期与对应关系。"
+    ]
+  }
+}

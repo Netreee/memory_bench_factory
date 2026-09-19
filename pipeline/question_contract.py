@@ -67,9 +67,24 @@ def bind_question_world(order: dict, ws) -> dict:
 
 def build_question_contract(order: dict, wp: dict | None = None) -> dict:
     from pipeline.lines import line_for
+    from eval.answer_task_review import POLICY_VERSION
+
+    scoring_policy = ((wp or {}).get("quality_contract") or {}).get("scoring_policy")
+    if scoring_policy not in (None, POLICY_VERSION):
+        raise ValueError("Unknown question scoring policy")
 
     line_id, cap = order.get("line", ""), order.get("capability", "")
     aux, gold = order.get("aux") or {}, order.get("gt")
+    process_trace = cap == "L3_process_trace"
+    if process_trace:
+        if scoring_policy != POLICY_VERSION:
+            raise ValueError("Process references require the task-support semantic policy")
+        reference = order.get("reference_proposal")
+        if not isinstance(reference, dict) or "answer" not in reference:
+            raise ValueError("Process question is missing its proposed natural reference")
+        # The executable witness proves only the selected world records. The
+        # natural answer remains an independent, publicly reviewed proposal.
+        gold = deepcopy(reference["answer"])
     line = line_for(line_id)
     intent, hide = line.intent(order) if line else ("", [])
     schema = {"name": order.get("field", ""), **_schema(order, wp)}
@@ -77,7 +92,9 @@ def build_question_contract(order: dict, wp: dict | None = None) -> dict:
         schema = {"name": order.get("field", ""), "kind": "duration", "unit": aux.get("time_unit") or "周"}
     value_kind = schema.get("kind") or "text"
     answer_kind, abstention_kind = "value", None
-    if cap == "L3_order":
+    if process_trace:
+        answer_kind = "structured"
+    elif cap == "L3_order":
         answer_kind = "order"
     elif cap == "FORGET":
         answer_kind, abstention_kind = "abstention", "forgotten"
@@ -100,7 +117,11 @@ def build_question_contract(order: dict, wp: dict | None = None) -> dict:
 
     unit = aux.get("time_unit") or "周"
     query_time = None
-    if line_id == "L6_refusal" and aux.get("refusal_type") == "T2_window":
+    if process_trace:
+        session = (aux.get("process") or {}).get("at_session")
+        query_time = {"kind": "period", "ordinal": session + 1 if type(session) is int else None,
+                      "unit": unit, "index_base": 1}
+    elif line_id == "L6_refusal" and aux.get("refusal_type") == "T2_window":
         period = (aux.get("probe") or {}).get("at_week")
         query_time = {"kind": "period", "ordinal": period, "unit": unit, "index_base": 1}
     elif line_id == "L5_conflict" or cap == "IE" or line_id == "L2_relational":
@@ -159,12 +180,25 @@ def build_question_contract(order: dict, wp: dict | None = None) -> dict:
                     "x_star", "trigger_field", "unit", "subject_noun", "candidates",
                     "duration_end_op", "duration_end_value",
                     "rule", "authoritative_source", "rumor_source", "authoritative_value", "rumor_value") if key in aux}}
+    if process_trace:
+        from pipeline.process_proposals import CAPABILITY_PURPOSE
+        semantic["capability_purpose"] = CAPABILITY_PURPOSE
+        semantic.update(reference_proposal=deepcopy(order["reference_proposal"]),
+                        canonical_witness=deepcopy(order["gt"]),
+                        reference_authority="proposed_not_mechanically_proven")
+        semantic["parameters"]["process"] = deepcopy(aux.get("process"))
     contract = {**semantic, "scoring_scope": "primary_answer",
                 "required_constraints": required,
                 "render_policy": "canonical_template" if line_id in _STRICT_LINES or getattr(line, "deterministic_phrasing", False) else "protected_slots",
                 "canonical_question": intent, "forbidden_answer_values": forbidden,
                 "hidden_values": [str(value) for value in hide if value is not None],
                 "contract_id": "qc_" + _digest(semantic)}
+    if scoring_policy:
+        contract.update(scoring_scope="task_with_supporting_reasons", scoring_policy=scoring_policy)
+        # Keep task metadata, while semantic equivalence is reviewed by an LLM.
+        # A fixed-choice renderer may still deliberately emit its exact options.
+        contract["render_policy"] = "semantic_review"
+        contract["contract_id"] = "qc_" + _digest({**semantic, "scoring_policy": scoring_policy})
     return contract
 
 
@@ -199,7 +233,10 @@ def validate_question(question, contract: dict | None = None) -> list[dict]:
         # The declaration is frozen because this API need not have the original
         # whitepaper. Publication must additionally bind it against that source.
         declaration = contract.get("value_schema") or {}
-        rebuilt = build_question_contract(order, {"domain_profile": {"field_schema": [declaration]}})
+        policy = contract.get("scoring_policy")
+        rebuilt = build_question_contract(order, {
+            "domain_profile": {"field_schema": [declaration]},
+            "quality_contract": {"scoring_policy": policy}})
         if contract != rebuilt:
             issue("contract_mismatch", "Question metadata no longer matches its frozen semantics")
         if contract.get("canonical_question") != rebuilt.get("canonical_question"):
@@ -210,6 +247,10 @@ def validate_question(question, contract: dict | None = None) -> list[dict]:
     canonical = contract.get("canonical_question")
     if not isinstance(canonical, str) or not canonical.strip():
         issue("invalid_template", "No deterministic question template")
+    if contract.get("render_policy") == "semantic_review":
+        # No substring/template test can decide whether a paraphrase preserves
+        # task meaning. Release separately checks the version-bound LLM review.
+        return issues
     if contract.get("render_policy") == "canonical_template" and normalized != _normal(canonical):
         issue("unverified_paraphrase", "Paraphrase is outside the verified template language")
     for constraint in contract.get("required_constraints", []):

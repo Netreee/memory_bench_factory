@@ -24,6 +24,7 @@ from pipeline.lines import implemented_ids, line_for, taxonomy_prose
 from pipeline.prompts import render          # ★议会 prompts 收编进注册表(council.*)
 from pipeline.seed_pack import (
     attach_seed_contract,
+    core_requirements,
     seed_context,
     validate_seed_blueprint,
     validate_seed_pack,
@@ -265,13 +266,14 @@ def _separate_observed_relation_fields(candidate: dict, observed: dict, *,
     return repairs
 
 
-def _remove_inferred_identity_fields(candidate: dict, observed: dict) -> list[str]:
+def _remove_inferred_identity_fields(candidate: dict, observed: dict, *,
+                                     seed_required_fields: set[tuple[str, str]] | None = None) -> list[str]:
     """删除模型臆造的重复身份字段，保留 few-shot 硬事实与结构引用。
 
     每个 typed entity 已有 canonical ``name``。若架构师又给 Boss、Equipment
     等类型增加“名称”，实体生成模型就必须把同一事实再写进 ``fields``，实测会
     造成大量合法实体因缺这个冗余键而被丢弃。只有 few-shot 字面观察到的身份字段，
-    或被关系/事件契约引用的字段，才不能在这里机械删除。
+    或被关系/事件契约引用、被种子明确要求的字段，不能在这里机械删除。
     """
     if not isinstance(candidate, dict):
         return []
@@ -299,7 +301,8 @@ def _remove_inferred_identity_fields(candidate: dict, observed: dict) -> list[st
         for field in entity_type["fields"]:
             name = field.get("name") if isinstance(field, dict) else None
             if (_looks_like_identity_field(name)
-                    and name not in observed_names and name not in referenced):
+                    and name not in observed_names and name not in referenced
+                    and (entity_type.get("id"), name) not in (seed_required_fields or set())):
                 repairs.append(f"{entity_type.get('id')}.{name} 删除(与 canonical name 重复)")
                 continue
             kept.append(field)
@@ -309,7 +312,8 @@ def _remove_inferred_identity_fields(candidate: dict, observed: dict) -> list[st
 
 def _repair_candidate_blueprint(candidate: dict, observed: dict,
                                 evidence_hints: list[str] | None = None, *,
-                                seed_reference_fields: set[str] | None = None) -> tuple[dict, list[str]]:
+                                seed_reference_fields: set[str] | None = None,
+                                seed_required_fields: set[tuple[str, str]] | None = None) -> tuple[dict, list[str]]:
     """机械归一模型候选，并在展示字段拆分后再确认一次引用闭包。
 
     evidence 生态由专门的 medium 视角所有；world 只在自己给出有效渠道时保留，
@@ -318,7 +322,8 @@ def _repair_candidate_blueprint(candidate: dict, observed: dict,
     repaired, repairs = repair_blueprint_candidate(candidate)
     repairs.extend(_separate_observed_relation_fields(
         repaired, observed, seed_reference_fields=seed_reference_fields))
-    repairs.extend(_remove_inferred_identity_fields(repaired, observed))
+    repairs.extend(_remove_inferred_identity_fields(
+        repaired, observed, seed_required_fields=seed_required_fields))
     blueprint = repaired.get("world_blueprint", repaired) if isinstance(repaired, dict) else {}
     if isinstance(blueprint, dict):
         current = [item.strip() for item in (blueprint.get("evidence_channels") or [])
@@ -347,7 +352,7 @@ def _seed_observation_contract(observed: dict, pack: dict) -> tuple[dict, list[d
     attributes = ("kind", "unit", "monotonic", "range")
     schemas: dict[str, dict] = {}
     reference_fields: set[str] = set()
-    for entity in pack["blueprint_requirements"]["entity_types"]:
+    for entity in core_requirements(pack)["entity_types"]:
         for field in entity["fields"]:
             schema = {key: deepcopy(field[key]) for key in attributes if key in field}
             name = field["name"]
@@ -556,6 +561,14 @@ def central_office(desc, few_shot, tracer, log=print, *, seed_pack=None) -> dict
                    "实体 count 与关系/事件 min_count 是下限。"
                    "mechanisms 的文字解释不得代替所引用的实体、字段、关系、事件或因果结构。\n"
                    + seed_context(pack)) if pack is not None else ""
+    if pack is not None and pack["schema_version"] == 2:
+        seed_prompt += (
+            "\n【v2 结构与业务解释】下面仅列可执行蓝图的必需结构；上文扩展字段中的指标定义、"
+            "允许状态变化、适用条件及禁止推断事项供你理解业务。保留其含义并据此设计世界，"
+            "不要把状态列表自动解释为任意跳转，也不要把合成调度选择写成来源强制规则。"
+            "未决内容保持未决；能力建议需结合实际结构选择。原始审计记录与评测材料未进入本次输入。"
+            "解题需要的业务规则应安排在后续公开文档或公开协议中表达。\n"
+            + json.dumps(core_requirements(pack), ensure_ascii=False))
     fs = json.dumps(few_shot, ensure_ascii=False)
     def _view(p):                                         # 7 视角彼此独立 → 并发
         key, sysp, ask = p
@@ -572,7 +585,11 @@ def central_office(desc, few_shot, tracer, log=print, *, seed_pack=None) -> dict
     foundations = [p for p in _PERSPECTIVES if p[0] not in ("map", "world")]
     views = dict(config.pmap(_view, foundations, workers=len(foundations)))
     seed_reference_fields = None
+    seed_required_fields = None
     if pack is not None:
+        seed_required_fields = {(entity["id"], field["name"])
+                                for entity in core_requirements(pack)["entity_types"]
+                                for field in entity["fields"]}
         original_observe = deepcopy(views.get("observe") or {})
         effective_observe, overrides, seed_reference_fields = _seed_observation_contract(original_observe, pack)
         views["observe_raw"] = original_observe
@@ -617,7 +634,8 @@ def central_office(desc, few_shot, tracer, log=print, *, seed_pack=None) -> dict
             world_out, mechanical_repairs = _repair_candidate_blueprint(*repair_args)
         else:
             world_out, mechanical_repairs = _repair_candidate_blueprint(
-                *repair_args, seed_reference_fields=seed_reference_fields)
+                *repair_args, seed_reference_fields=seed_reference_fields,
+                seed_required_fields=seed_required_fields)
         if mechanical_repairs:
             log(f"    议会·world 候选机械归一:{mechanical_repairs}")
         try:

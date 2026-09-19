@@ -124,6 +124,8 @@ class WorldState:
     events: list[dict] = field(default_factory=list)             # 已校验、effect 已编译成 Timeline 的领域事件
     world_blueprint: dict = field(default_factory=dict)          # 生成本世界所依据的可执行白皮书骨架
     narrative: dict = field(default_factory=dict)                # 可选 Story Ledger；只引用 events，不复制动态真值
+    generation_diagnostics: list[dict] = field(default_factory=list)  # 非阻塞供给/轨迹提示，不代表世界错误或题目难度
+    disclosure: dict = field(default_factory=dict)  # Optional public observations; canonical truth times stay unchanged.
 
     def timeline(self, entity: str, fld: str) -> Optional[Timeline]:
         return self.entities.get(entity, {}).get(fld)
@@ -167,9 +169,12 @@ class WorldState:
             "events": self.events,
             "world_blueprint": self.world_blueprint,
             "narrative": self.narrative,
+            **({"disclosure": deepcopy(self.disclosure)} if self.disclosure else {}),
             # ★imprint 已注趋势标记必须随世界落盘(刀1审计·高危):否则闭环 ②环 augment 从盘重载后
             #   done 集为空 → 旧实体被【复注且 shuffle 翻向】,而 delta 续渲不重渲旧 docs → 语料与 canonical 矛盾。
             "_trended_fields": [list(t) for t in getattr(self, "_trended_fields", [])],
+            **({"generation_diagnostics": deepcopy(self.generation_diagnostics)}
+               if self.generation_diagnostics else {}),
         }
 
     @classmethod
@@ -189,7 +194,9 @@ class WorldState:
                  relations=d.get("relations", []),
                  events=d.get("events", []),
                  world_blueprint=d.get("world_blueprint", {}),
-                 narrative=d.get("narrative", {}))
+                 narrative=d.get("narrative", {}),
+                 disclosure=deepcopy(d.get("disclosure", {})),
+                 generation_diagnostics=deepcopy(d.get("generation_diagnostics", [])))
         ws._trended_fields = [tuple(t) for t in d.get("_trended_fields", [])]
         return ws
 
@@ -558,7 +565,7 @@ def _shape_issues(ws: WorldState):
 def validate(ws: WorldState, table: dict = None, profile: dict = None) -> list[dict]:
     """★W.3 世界质量【结构化缺陷清单】(CRITIC 修复轮:算出的缺陷不丢、定向重生成坏字段)。
     每条 = {entity, field, type, detail}。type:
-      monotonic          —— 数值轨迹单调(极值落端点),MR 退化;
+      monotonic          —— typed 极值落端点，仅诊断，不是世界真假约束;
       fake_evolving      —— 声明 evolving 却全程只有 1 个值(且没停用)= 没演化起来;
       illegal_transition —— ★C1③:白皮书 state_machines 声明了【单向状态序】的字段,取值倒流/出界
                             (014559 实证:状态倒流写在世界 canonical 本身,4/34 实体)。
@@ -595,20 +602,29 @@ def validate(ws: WorldState, table: dict = None, profile: dict = None) -> list[d
     for ent, flds in ws.entities.items():
         for fname, tl in flds.items():
             sv = tl.set_values()
-            nums = [(s, _to_num(v)) for (s, _, v) in sv if _to_num(v) is not None]
             distinct = {_norm(v) for (_, _, v) in sv}
             has_stop = any(o.op in (DELETE, EXPIRE) for o in tl.ops)
             fshape = shape.get(fname) or {}
             mono_decl = fshape.get("mono")
-            # ★既有 monotonic(MR 退化)检查:豁免 sm 字段【及声明了单调形状的字段】——后者"必须单调"与"不许单调"相反,
-            #   不豁免会与 monotonic_violation 乒乓(刀1审计同款死锁)。
-            if len(nums) >= 3 and fname not in sm and not mono_decl:
-                sess = [s for s, _ in nums]
-                vals = [n for _, n in nums]
+            # Extrema position is a potential task-shape diagnostic, never a
+            # truth constraint. Use the same complete typed parsing as MR; a
+            # text such as a document identifier must not become its first digit.
+            from pipeline.value_types import ValueComparisonError, comparison_keys, field_schema
+            try:
+                kind, vals = comparison_keys([v for _, _, v in sv],
+                    field_schema(ws, ent, fname, {"domain_profile": profile or {}}))
+            except ValueComparisonError:
+                kind, vals = None, []
+            if len(vals) >= 3 and fname not in sm and not mono_decl:
+                sess = [s for s, _, _ in sv]
                 amax, amin = sess[vals.index(max(vals))], sess[vals.index(min(vals))]
                 if {amax, amin} <= {sess[0], sess[-1]}:
                     out.append({"entity": ent, "field": fname, "type": "monotonic",
-                                "detail": "数值轨迹单调(极值落首/尾)→ 需让峰或谷落在【非端点】的中间某周"})
+                                "severity": "diagnostic", "value_kind": kind,
+                                "samples": [{"session": s, "value": v} for s, _, v in sv],
+                                "extrema_sessions": {"max": amax, "min": amin},
+                                "detail": "可比较轨迹的极值落首/尾；仅供题目证据依赖诊断，"
+                                          "不构成世界错误，也未证明题目容易；不为此改写真值。"})
             # ★value_shape 单调:声明 up→只增不减、down→只减不增,违反即缺陷(交 CRITIC 修复)。
             #   用【绝对量级 _magnitude】比较(审计 HIGH 根治:按单位归一,'9000万'<'1.2亿' 才判对,不被混量纲假阳假阴)
             mags = [(s, _magnitude(v)) for (s, _, v) in sv if _magnitude(v) is not None]
@@ -745,13 +761,22 @@ def _traj_to_ops(traj: list[dict], date_of) -> list[Op]:
 
 
 def assemble_world(table: dict, base: str = "2025-01-06", step_days: int = 7,
-                   blueprint: dict | None = None, existing: WorldState | None = None) -> tuple[WorldState, list[str]]:
+                   blueprint: dict | None = None, existing: WorldState | None = None, *,
+                   require_complete: bool = True,
+                   include_shape_diagnostics: bool = True) -> tuple[WorldState, list[str]]:
     """把 LLM 世界表编译成真值状态机。
 
     传入 ``blueprint`` 时额外校验实体类型，并按 relation.field 在两个端点的唯一
     归属把关系编译成 owner 的软外键 Timeline，再把 domain event 的 effect 编译成
     普通 Op；同类型自关系约定由 source/from 持有字段。旧调用不传蓝图时行为保持不变。
+
+    ``require_complete=False`` 只延期全局实体/关系/事件数量及每条因果规则至少
+    一对见证的覆盖检查，供 Agent 逐次编译草稿；当前对象的引用、时序、值域与效果
+    仍须合法。``include_shape_diagnostics=False`` 省略 evolving 单值和数值趋势提示，不改变
+    任何类型、状态或业务结构校验。默认完整编译行为保持不变。
     """
+    if type(require_complete) is not bool or type(include_shape_diagnostics) is not bool:
+        raise ValueError("require_complete and include_shape_diagnostics must be booleans")
     if blueprint is not None:
         try:
             from pipeline.world_blueprint import normalize_world_blueprint, relation_owner_side
@@ -873,7 +898,7 @@ def assemble_world(table: dict, base: str = "2025-01-06", step_days: int = 7,
         for tid in entity_types.values():
             type_counts[tid] = type_counts.get(tid, 0) + 1
         for tid, decl in bp_types.items():
-            if type_counts.get(tid, 0) < decl.get("count", 1):
+            if require_complete and type_counts.get(tid, 0) < decl.get("count", 1):
                 issues.append(f"entity type {tid} 实例不足:{type_counts.get(tid, 0)}/{decl.get('count', 1)}")
 
     def _inject(entity: str, fld: str, session: int, value, source: str) -> bool:
@@ -967,7 +992,7 @@ def assemble_world(table: dict, base: str = "2025-01-06", step_days: int = 7,
             relation_edges.add(edge)
             rel_counts[rtype["id"]] = rel_counts.get(rtype["id"], 0) + 1
         for rid, decl in rel_types.items():
-            if rel_counts.get(rid, 0) < decl.get("min_count", 1):
+            if require_complete and rel_counts.get(rid, 0) < decl.get("min_count", 1):
                 issues.append(f"relation type {rid} 实例不足:{rel_counts.get(rid, 0)}/{decl.get('min_count', 1)}")
 
         event_types = {e["id"]: e for e in blueprint.get("event_types", [])}
@@ -1097,7 +1122,7 @@ def assemble_world(table: dict, base: str = "2025-01-06", step_days: int = 7,
             event_counts[decl["id"]] = event_counts.get(decl["id"], 0) + 1
             max_sess = max(max_sess, sess)
         for event_id, decl in event_types.items():
-            if event_counts.get(event_id, 0) < decl.get("min_count", 1):
+            if require_complete and event_counts.get(event_id, 0) < decl.get("min_count", 1):
                 issues.append(f"event type {event_id} 实例不足:{event_counts.get(event_id, 0)}/{decl.get('min_count', 1)}")
 
         # caused_by 只有匹配蓝图类型对与精确 delay 才能进入 canonical world。
@@ -1132,7 +1157,7 @@ def assemble_world(table: dict, base: str = "2025-01-06", step_days: int = 7,
                         and child.get("type") == rule.get("effect_event")
                         and child.get("session") - parent.get("session") == delay):
                     witnesses.append((parent, child))
-            if not witnesses:
+            if require_complete and not witnesses:
                 issues.append(f"causal rule {rule.get('id')} 没有 caused_by 事件见证")
             for parent, child in witnesses:
                 generated_cascades.append({
@@ -1230,12 +1255,13 @@ def assemble_world(table: dict, base: str = "2025-01-06", step_days: int = 7,
             spec = next((s for e in _dicts(table.get("entities", [])) if (e.get("name") or e.get("id")) == ename
                          for fn, s in _dict(e.get("fields")).items() if fn == fname), {})
             spec = _dict(spec)
-            if spec.get("type") == "evolving":
+            if include_shape_diagnostics and spec.get("type") == "evolving":
                 distinct = {_norm(v) for (_, _, v) in tl.set_values()}
                 if len(distinct) < 2 and not any(o.op in (DELETE, EXPIRE) for o in tl.ops):
                     issues.append(f"{ename}.{fname} 标 evolving 但只有 1 个值(演化不成立)")
     ws.absent_fields = absent
-    issues += _shape_issues(ws)                          # ★V11:数值单调告警
+    if include_shape_diagnostics:
+        issues += _shape_issues(ws)                      # ★V11:数值单调告警
     return ws, issues
 
 

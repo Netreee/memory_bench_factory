@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import Callable
 from contextlib import contextmanager
 from copy import deepcopy
+from llm_trace import trace_scope, redact, failure_record
 import errno, json, os, time, threading, sys
 
 if os.name == "nt":
@@ -58,6 +59,8 @@ def _env_snapshot() -> dict:
         return {"model": config.MODEL,
                 "discriminator_model": config.DISCRIMINATOR_MODEL,
                 "structure_model": config.STRUCTURE_MODEL,
+                "reviewer_model": config.REVIEWER_MODEL,
+                "judge_model": config.JUDGE_MODEL,
                 "llm_concurrency": config.LLM_CONCURRENCY,
                 "base_url": config.BASE_URL or ""}
     except Exception:
@@ -77,10 +80,12 @@ class Tracer:
         import config
         t0 = time.time()
         try:
-            out = config.chat_json(messages, **kw)        # 网络调用在锁外 → 真并发
+            with trace_scope(self.pfile.with_name("llm_attempts.jsonl"), step):
+                out = config.chat_json(messages, **kw)    # 网络调用在锁外 → 真并发
             ok = not (isinstance(out, dict) and "__error__" in out)
         except Exception as e:
-            out, ok = {"__error__": str(e)[:120]}, False
+            out, ok = failure_record(e, secrets=tuple(value for key, value in os.environ.items()
+                if key.endswith(("API_KEY", "API_TOKEN", "ACCESS_TOKEN", "PASSWORD")))), False
         latency_ms = int((time.time() - t0) * 1000)       # ★含 config 内部 3 次重试的总耗时(慢≈逼近超时)
         with self._lock:                                  # 计数 + 写文件串行化
             self.n += 1
@@ -92,10 +97,12 @@ class Tracer:
         import config
         t0 = time.time()
         try:
-            out = config.chat(messages, **kw)
+            with trace_scope(self.pfile.with_name("llm_attempts.jsonl"), step):
+                out = config.chat(messages, **kw)
             ok = isinstance(out, str) and bool(out.strip())
         except Exception as e:
-            out, ok = {"__error__": str(e)[:120]}, False
+            out, ok = failure_record(e, secrets=tuple(value for key, value in os.environ.items()
+                if key.endswith(("API_KEY", "API_TOKEN", "ACCESS_TOKEN", "PASSWORD")))), False
         latency_ms = int((time.time() - t0) * 1000)
         with self._lock:
             self.n += 1
@@ -104,13 +111,16 @@ class Tracer:
 
     def _log(self, i, step, messages, out, kw, ok=True, latency_ms=0):
         rec = {"i": i, "ts": time.time(), "latency_ms": latency_ms, "ok": ok, "step": step,
+               "trace_version": 2, "messages": messages, "output": out,
                "system": next((m["content"] for m in messages if m["role"] == "system"), ""),
                "user": next((m["content"] for m in messages if m["role"] == "user"), ""),
                "params": {k: v for k, v in kw.items()
                           if k in ("temperature", "max_tokens", "model", "retries", "strict_json")},
                "out_preview": json.dumps(out, ensure_ascii=False)[:600] if isinstance(out, (dict, list)) else str(out)[:600]}
+        secrets = tuple(value for key, value in os.environ.items()
+                        if key.endswith(("API_KEY", "API_TOKEN", "ACCESS_TOKEN", "PASSWORD")))
         with self.pfile.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            f.write(json.dumps(redact(rec, secrets), ensure_ascii=False) + "\n")
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -422,10 +432,28 @@ def drive(run: Run, stages: list, from_stage=None, to_stage=None, only=None, for
                     raise SystemExit(f"✗ stage『{nm}』依赖的前序『{need}』"
                                      f"状态为 {state.get('status', 'incomplete')}。"
                                      f"先从 --from {need} 补跑下游。")
+            # Check freshness through the dependency chain, including when this
+            # stage itself is done. A saved question/corpus flag must not hide
+            # an expired world opinion during a midstream restart.
+            ancestors = set(st.needs)
+            pending = list(st.needs)
+            while pending:
+                for need in by_name[pending.pop()].needs:
+                    if need not in ancestors:
+                        ancestors.add(need)
+                        pending.append(need)
+            for need in names:
+                if (need in ancestors and by_name[need].is_current is not None
+                        and not by_name[need].is_current(run)):
+                    raise SystemExit(f"✗ stage『{nm}』依赖的前序『{need}』验收已过期。"
+                                     f"先从 --from {need} 重新运行。")
             if run.is_done(nm) and not force and (st.is_current is None or st.is_current(run)):
                 run.log(f"⏭  跳过 {nm}(已完成;--force 重跑)")
                 continue
-            invalidated = _dependent_stage_names(nm, stages) if force else None
+            # A freshness-triggered rebuild changes upstream artifacts just as
+            # an explicit force does. Its old descendants must be regenerated.
+            invalidated = (_dependent_stage_names(nm, stages)
+                           if force or run.is_done(nm) else None)
             _run_stage_locked(run, nm, st.fn, st.artifact, invalidated)
     _finalize_run(run, names)
 

@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from contextlib import redirect_stderr, redirect_stdout
+from functools import partial
 import copy
 import importlib.util
 import io
@@ -14,14 +15,27 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
-from types import SimpleNamespace
+from types import SimpleNamespace, ModuleType
 import unittest
 from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
-from eval.question_filter import export_filtered_benchmark, filter_questions, load_results, question_key
+if "config" not in sys.modules:
+    offline_config = ModuleType("config")
+    offline_config.MODEL = offline_config.DISCRIMINATOR_MODEL = offline_config.STRUCTURE_MODEL = "offline-no-model"
+    offline_config.chat = offline_config.chat_json = Mock(side_effect=AssertionError("禁止模型调用"))
+    offline_config.pmap = lambda fn, items, **kwargs: [fn(item) for item in items]
+    sys.modules["config"] = offline_config
+from eval.question_filter import export_filtered_benchmark, filter_questions as raw_filter_questions, load_results, question_key
 from eval.grading import JUDGE_VERSION
+from eval.provenance import (make_evaluation_context, record_provenance, load_visible_corpus,
+                             load_public_protocol)
+
+TEST_CONTEXT = make_evaluation_context([], "")
+# Unit fixtures explicitly declare their public inputs; the production default
+# intentionally has no such identity and preserves all unknown results.
+filter_questions = partial(raw_filter_questions, expected_context=TEST_CONTEXT)
 
 
 def question(number=0):
@@ -32,11 +46,12 @@ def question(number=0):
             "strict_scoring": {"required": [f"答案{number}"]}}
 
 
-def record(q, correct=True, **changes):
+def record(q, correct=True, *, context=None, **changes):
     """模拟 harness 逐题判分，不执行模型调用。"""
     grade = {"version": JUDGE_VERSION, "verdict": "correct" if correct is True else "incorrect" if correct is False else "error",
              "correct": correct, "path": "offline_fixture", "reason": "test fixture"}
-    return {**copy.deepcopy(q), "pred": "回答", "judgeable": True, "correct": correct, "judgement": grade, **changes}
+    return {**copy.deepcopy(q), "pred": "回答", "judgeable": True, "correct": correct, "judgement": grade,
+            "evaluation_provenance": record_provenance(q, context if context is not None else TEST_CONTEXT), **changes}
 
 
 def set_correct(row, correct):
@@ -87,6 +102,22 @@ class QuestionFilterTest(unittest.TestCase):
                 self.assertEqual(kept, [q])
                 self.assertEqual(report["counts"]["kept_incomplete"], 1)
                 self.assertTrue(report["items"][0]["issues"])
+
+    def test_missing_context_or_result_provenance_cannot_remove_questions(self):
+        kept, report = raw_filter_questions(self.qs, self.results)
+        self.assertEqual(kept, self.qs)
+        self.assertEqual(report["counts"]["kept_incomplete"], len(self.qs))
+        self.results["A"][0].pop("evaluation_provenance")
+        kept, report = filter_questions(self.qs, self.results)
+        self.assertEqual(kept, [self.qs[0]])
+        self.assertEqual(report["items"][0]["issues"]["A"], "missing_or_invalid_evaluation_provenance")
+
+    def test_changed_corpus_or_public_protocol_preserves_all(self):
+        for context in (make_evaluation_context([(0, "2026-09-16", "new material")], ""),
+                        make_evaluation_context([], "new public rule")):
+            kept, report = filter_questions(self.qs, self.results, expected_context=context)
+            self.assertEqual(kept, self.qs)
+            self.assertEqual(report["counts"]["all_correct"], 0)
 
     def test_missing_system_row_is_retained_even_when_others_all_correct(self):
         self.results["C"] = []
@@ -173,18 +204,27 @@ class FileFixture(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.base = Path(self.temp.name)
         self.qs = [question(i) for i in range(5)]
-        self.results = {s: [record(q) for q in self.qs] for s in ("A", "B")}
         self.bench = self.base / "06_grounded_questions.json"
         self.bench.write_text(json.dumps({"questions": self.qs}), encoding="utf-8-sig")
-        self.aggregate = self.base / "results.json"
-        self.aggregate.write_text(json.dumps({"systems": ["A", "B"],
-            "results": {s: {"records": rows} for s, rows in self.results.items()}}), encoding="utf-8")
         (self.base / "05_corpus.json").write_bytes(b'{"sessions": []}\n')
         (self.base / "00_about.json").write_text('{"answer_protocol":{"rules":["original"]}}', encoding="utf-8")
+        self.context = make_evaluation_context(load_visible_corpus(self.base / "05_corpus.json"),
+                                               load_public_protocol(self.base / "00_about.json"))
+        self.results = {s: [record(q, context=self.context) for q in self.qs] for s in ("A", "B")}
+        self.aggregate = self.base / "results.json"
+        self.aggregate.write_text(json.dumps({"systems": ["A", "B"], "evaluation_context": self.context,
+            "results": {s: {"records": rows} for s, rows in self.results.items()}}), encoding="utf-8")
 
     def run_cli(self, *args):
         """用独立 Python 进程验证用户可直接执行的离线命令。"""
-        return subprocess.run([sys.executable, "-X", "utf8", "-m", "eval.question_filter",
+        bootstrap = ("import sys,types,runpy,socket; "
+                     "socket.socket=socket.create_connection=lambda *a,**k: (_ for _ in ()).throw(AssertionError('no network')); "
+                     "c=types.ModuleType('config'); "
+                     "c.MODEL=c.DISCRIMINATOR_MODEL=c.STRUCTURE_MODEL='offline-no-model'; "
+                     "c.chat=c.chat_json=lambda *a,**k: (_ for _ in ()).throw(AssertionError('no model')); "
+                     "c.pmap=lambda f,x,**k:[f(i) for i in x]; sys.modules['config']=c; "
+                     "runpy.run_module('eval.question_filter',run_name='__main__')")
+        return subprocess.run([sys.executable, "-X", "utf8", "-B", "-c", bootstrap,
             "--bench", str(self.bench), "--allow-unverified", *map(str, args)], cwd=ROOT, capture_output=True, text=True, encoding="utf-8")
 
 
@@ -227,11 +267,39 @@ class FileAndCliTest(FileFixture):
         self.assertEqual(set(load_results(aggregate=self.aggregate, systems=["B", "A"])), {"A", "B"})
         with self.assertRaises(ValueError):
             load_results(aggregate=self.aggregate, systems=["A", "missing"])
-        data = json.loads(self.aggregate.read_text())
+        data = json.loads(self.aggregate.read_text(encoding="utf-8"))
         data["systems"].append("missing")
-        self.aggregate.write_text(json.dumps(data))
+        self.aggregate.write_text(json.dumps(data), encoding="utf-8")
         with self.assertRaises(ValueError):
             load_results(aggregate=self.aggregate)
+
+    def test_aggregate_context_is_preserved_and_conflicts_cannot_be_ignored(self):
+        loaded = load_results(aggregate=self.aggregate)
+        self.assertEqual(loaded["A"][0]["_result_contexts"], [self.context])
+        data = json.loads(self.aggregate.read_text(encoding="utf-8"))
+        data["evaluation_context"] = make_evaluation_context([], "a different experiment")
+        self.aggregate.write_text(json.dumps(data), encoding="utf-8")
+        loaded = load_results(aggregate=self.aggregate)
+        kept, report = filter_questions(self.qs, loaded, expected_context=self.context)
+        self.assertEqual(kept, self.qs)
+        self.assertEqual(report["items"][0]["issues"]["A"], "result_envelope_context_mismatch")
+
+    def test_research_override_does_not_certify_legacy_or_wrong_material_scores(self):
+        for mode in ("legacy", "new-corpus", "new-protocol"):
+            results = copy.deepcopy(self.results)
+            if mode == "legacy":
+                for rows in results.values():
+                    for row in rows:
+                        row.pop("evaluation_provenance")
+            elif mode == "new-corpus":
+                (self.base / "05_corpus.json").write_text(json.dumps({"sessions": [
+                    {"session_id": 0, "date": "2026-09-16", "docs": [{"content": "changed"}]}]}), encoding="utf-8")
+            else:
+                (self.base / "05_corpus.json").write_text('{"sessions": []}', encoding="utf-8")
+                (self.base / "00_about.json").write_text('{"answer_protocol":{"rules":["changed"]}}', encoding="utf-8")
+            report = export_filtered_benchmark(self.bench, results, self.base / mode, allow_unverified=True)
+            self.assertEqual(report["counts"]["removed_easy"], 0)
+            self.assertEqual(report["counts"]["kept_incomplete"], 5)
 
     def test_existing_directory_cannot_overwrite_inputs(self):
         before = self.bench.read_bytes()
@@ -284,8 +352,8 @@ class MultiSystemIntegrationTest(FileFixture):
                 "--systems", "fake1,fake2", "--keep-easy-ratio", "0.5", "--allow-unverified"]
         with patch.dict(sys.modules, {"eval.memory_systems": systems}), \
              patch.object(module, "ROOT", self.base), \
-             patch.object(module, "load_corpus", return_value=[("s1", "2026-09-01", "context")]), \
-             patch.object(module, "run_system", side_effect=lambda *a, **k: [record(q) for q in scored]), \
+             patch.object(module, "load_corpus", return_value=load_visible_corpus(self.base / "05_corpus.json")), \
+             patch.object(module, "run_system", side_effect=lambda *a, **k: [record(q, context=self.context) for q in scored]), \
              patch.object(module.config, "chat", side_effect=AssertionError("禁止模型调用")), \
              patch.object(sys, "argv", argv), redirect_stdout(io.StringIO()):
             module.main()
@@ -318,10 +386,108 @@ class MultiSystemIntegrationTest(FileFixture):
             evaluate.assert_not_called()
             corpus.assert_not_called()
 
+    def test_actual_semantic_main_keeps_research_scope_through_export(self):
+        """Exercise real main/prepare/run/SemanticJudge/filter; only I/O models are fake."""
+        from eval import qa_cache
+        from eval.grading import is_scored, SEMANTIC_JUDGE_VERSION
+        from pipeline.semantic_review import review_questions
+        module = self.load_harness()
+        questions = [{"question": "客户属于哪个市场？", "reference_proposal": {"answer": "亚太"}}]
+        corpus = {"corpus": {"sessions": [{"session_id": 0, "date": "2026-09-16",
+                   "docs": [{"content": "客户市场为亚太", "doc_id": "source-doc"}]}]}}
+        self.bench.write_text(json.dumps(questions, ensure_ascii=False), encoding="utf-8")
+        (self.base / "05_corpus.json").write_text(json.dumps(corpus, ensure_ascii=False), encoding="utf-8")
+        protocol = load_public_protocol(self.base / "00_about.json")
+        response = {"item_validity": "valid", "reference_status": "supported", "answerability": "answerable",
+            "major_requirements": ["客户市场"], "reviewed_rationale": "正文明确给出客户市场",
+            "original_answer_review": [{"requirement": "客户市场", "assessment": "已完成", "explanation": "明确亚太"}],
+            "original_rationale_review": {"status": "not_provided", "claims": [], "limitations": []},
+            "review_findings": {"substantive_defects": [], "acceptable_brevity": [], "editorial_suggestions": []},
+            "requires_item_reassessment": False, "reassessment_reason": "不存在题目或参考争议",
+            "answer_review": {"primary_task": "客户市场", "answer_meaning": "客户市场为亚太",
+                "claims": [{"claim": "客户市场为亚太", "task_role": "primary", "assessment": "supported",
+                            "evidence_indices": [0], "explanation": "正文明确给出"}], "reference_comparison": "相符"},
+            "reviewed_answer": "亚太", "interpretation": "询问客户市场", "reasoning": "正文明确给出",
+            "coverage": {"status": "complete", "scope_conflict": False, "inspected_doc_ids": ["d000001"], "limitations": []},
+            "evidence": [{"doc_id": "d000001", "field": "content", "quote": "客户市场为亚太",
+                          "role": "support", "explanation": "明确客户市场"}], "concerns": [],
+            "answer_verdict": "correct", "format_compliance": "compliant",
+            "additional_facts": {"status": "not_assessed", "reason": "无附言"}}
+        def fake_review(step, messages, **kwargs):
+            payload = json.loads(messages[-1]["content"])
+            self.assertEqual(payload["question"], questions[0]["question"])
+            if step == "semantic_review.blind_read":
+                self.assertNotIn("reference_proposal", payload)
+                return {"answer": "亚太", **{k: copy.deepcopy(response[k]) for k in
+                    ("answerability", "interpretation", "reasoning", "coverage", "evidence", "major_requirements")}}
+            self.assertEqual(step, "semantic_review.adjudicate")
+            return {k: copy.deepcopy(v) for k, v in response.items()
+                    if k not in ("answer_verdict", "format_compliance", "additional_facts")}
+        review = review_questions(questions, corpus, protocol, reviewer_model="offline-review",
+                                  chat_json=fake_review)
+        self.assertEqual(review["calls_used"], 2)
+        self.assertEqual(review["items"][0]["review_state"], "completed")
+        review_path = self.base / "semantic-review.json"
+        review_path.write_text(json.dumps(review, ensure_ascii=False), encoding="utf-8")
+
+        class FakeMemory:
+            def ingest_session(self, session):
+                return {"status": "ok", "n_docs": len(session["docs"])}
+            def finalize_ingest(self, **kwargs):
+                pass
+            def retrieve(self, question, **kwargs):
+                return "客户市场为亚太"
+            def get_diagnostics(self):
+                return {}
+
+        package = ModuleType("eval.memory_systems")
+        package.__path__ = [str(ROOT / "eval/memory_systems")]
+        package.make_system = Mock(side_effect=lambda *a, **k: FakeMemory())
+        probe = module._EvalProbe()
+        probe.run_dir = self.base / "actual-semantic-run"
+        probe._progress = probe.run_dir / "_progress.json"
+        calls = []
+        def fake_judge(messages, **kwargs):
+            payload = json.loads(messages[-1]["content"])
+            self.assertEqual(payload["solver_answer"], "亚太")
+            self.assertEqual(payload["question"], questions[0]["question"])
+            calls.append(kwargs)
+            return copy.deepcopy(response)
+        argv = ["multi_system", "--bench", str(self.bench), "--corpus", str(self.base / "05_corpus.json"),
+                "--systems", "fake1,fake2", "--workers", "1", "--judge-mode", "semantic", "--semantic-review",
+                str(review_path), "--judge-model", "offline-judge", "--allow-unverified", "--keep-easy-ratio", "1"]
+        with patch.dict(sys.modules, {"eval.memory_systems": package}), \
+             patch.object(module, "_EvalProbe", return_value=probe), \
+             patch.object(module, "is_judgeable", side_effect=AssertionError("semantic must not use legacy gate")), \
+             patch.object(module, "judge_record", side_effect=AssertionError("semantic must not use legacy judge")), \
+             patch.object(module.config, "chat", return_value="亚太") as solver, \
+             patch.object(module.config, "chat_json", side_effect=fake_judge), \
+             patch.object(module.config, "_trace_secrets", return_value=[], create=True), \
+             patch.object(qa_cache, "CACHE_DIR", self.base / "cache"), \
+             patch.object(sys, "argv", argv), redirect_stdout(io.StringIO()):
+            module.main()
+        self.assertEqual(solver.call_count, 2)
+        self.assertEqual(len(calls), 2)
+        raw = json.loads((probe.run_dir / "results.json").read_text(encoding="utf-8"))
+        self.assertEqual(raw["judge_mode"], "semantic")
+        self.assertEqual(raw["judge_version"], SEMANTIC_JUDGE_VERSION)
+        self.assertEqual(raw["result_scope"], "research_only")
+        for result in raw["results"].values():
+            row = result["records"][0]
+            self.assertTrue(is_scored(row))
+            self.assertEqual(row["evaluation_scope"], "research_only")
+            self.assertEqual(row["mode"], "semantic")
+        filtered = json.loads((probe.run_dir / "filtered/filter_report.json").read_text(encoding="utf-8"))
+        self.assertEqual(filtered["result_scope"], "research_only")
+        self.assertFalse(filtered["release"]["eligible"])
+        self.assertEqual(filtered["counts"]["all_correct"], 1)
+        self.assertEqual(filtered["counts"]["kept_easy_sample"], 1)
+
 
 class DerivedReleaseTest(unittest.TestCase):
     def make_source(self, directory, *, floor=1):
-        from pipeline.corpus_contract import review_documents, attach_receipts
+        from pipeline.corpus_contract import (review_documents, attach_receipts,
+                                              canonical_context, fidelity_requirements)
         from pipeline.question_contract import attach_question_contract, bind_question_world
         from pipeline.quality import evaluate_release
         from pipeline.world_state import WorldState, Timeline, Op, SET, UPDATE
@@ -343,12 +509,35 @@ class DerivedReleaseTest(unittest.TestCase):
             source.append(q)
             ids = [f"doc{s}" for s in q["evidence_sessions"]]
             final.append({**q, "candidate_evidence_doc_ids": ids, "evidence_doc_ids": ids})
-        reviewer = SimpleNamespace(chat_json=Mock(return_value={"verdict": "pass", "unsupported_claims": []}))
         for session, value in enumerate(("待接收", "已登记")):
-            docs = [{"doc_id": f"doc{session}", "is_filler": False, "content": f"测试报告的状态为{value}。"}]
-            review = review_documents(reviewer, ws, session, docs)
+            date = canonical_context(ws, session)["document_date"]
+            body = f"{date}记录：测试报告的状态为{value}。"
+            docs = [{"doc_id": f"doc{session}", "is_filler": False, "content": body}]
+            requirements = fidelity_requirements(ws, session)
+            self.assertEqual(requirements, [{"requirement_id": "r1", "kind": "value", "target": {
+                "entity": "测试报告", "entity_type": "record", "field": "状态",
+                "value": value, "stopped": False}}])
+
+            def reviewed_fixture(step, messages, **kwargs):
+                # Deliberately limited to these two explicit fixture sentences;
+                # this fake opinion is not a semantic validator for arbitrary text.
+                self.assertEqual(step, "corpus.review")
+                payload = json.loads(messages[1]["content"])
+                self.assertEqual(payload["requirements"], requirements)
+                self.assertEqual(payload["documents"], [{"title": "", "content": body}])
+                return {"document_reviews": [{"doc_index": 0, "status": "supported",
+                    "reason": "Fixed fixture opinion about this explicit sentence."}],
+                    "verdict": "pass", "unsupported_claims": [], "coverage": [{
+                    "requirement_id": "r1", "status": "supported",
+                    "evidence": [{"doc_index": 0, "quote": body}],
+                    "reason": f"这条离线样本文字明确记载{date}测试报告的状态为{value}。"}]}
+
+            reviewer = SimpleNamespace(chat_json=Mock(side_effect=reviewed_fixture))
+            review = review_documents(reviewer, ws, session, docs, requirements=requirements)
+            self.assertEqual(review["status"], "passed", review.get("issues"))
+            reviewer.chat_json.assert_called_once()
             attach_receipts(docs, review, session)
-            sessions.append({"session_id": session, "docs": docs})
+            sessions.append({"session_id": session, "date": date, "docs": docs})
         target = {"min_questions": floor, "per_line_min": {"L1_timeline": floor}, "requested_questions": 2}
         artifacts = {"01_whitepaper.json": wp, "02_world.json": ws.to_dict(), "04_questions.json": source,
                      "06_grounded_questions.json": final, "05_corpus.json": {"corpus": {"sessions": sessions}},
@@ -358,7 +547,10 @@ class DerivedReleaseTest(unittest.TestCase):
         receipt = evaluate_release(directory)
         self.assertTrue(receipt["eligible"], receipt["issues"])
         (directory / "07_release.json").write_text(json.dumps(receipt, ensure_ascii=False), encoding="utf-8")
-        results = {system: [record(final[0]), record(final[1], correct=False)] for system in ("A", "B")}
+        context = make_evaluation_context(load_visible_corpus(directory / "05_corpus.json"),
+                                          load_public_protocol(directory / "00_about.json"))
+        results = {system: [record(final[0], context=context), record(final[1], correct=False, context=context)]
+                   for system in ("A", "B")}
         return directory / "06_grounded_questions.json", results, target
 
     def test_valid_subset_has_own_release_and_preserves_bound_inputs(self):
@@ -381,6 +573,63 @@ class DerivedReleaseTest(unittest.TestCase):
             expected_hash = hashlib.sha256(old_receipt).hexdigest()
             self.assertIn({"path": str((source / "07_release.json").resolve()), "sha256": expected_hash},
                           manifest["derived_from"]["input_files"])
+
+    def test_research_results_cannot_upgrade_even_with_released_source(self):
+        """A passing source receipt cannot wash away a result's research scope."""
+        from pipeline.quality import require_release, evaluate_release
+        for mode in ("row", "aggregate", "system-envelope", "system-file", "empty-research-system"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
+                source = Path(tmp)
+                bench, results, _ = self.make_source(source)
+                self.assertTrue(require_release(bench)["eligible"])
+                context = results["A"][0]["evaluation_provenance"]
+                result_paths = []
+                if mode == "row":
+                    # Only the row that will be removed is research-only; the
+                    # retained question cannot make that derivation formal.
+                    results["A"][0]["evaluation_scope"] = "research_only"
+                elif mode == "system-file":
+                    paths = {}
+                    for name, rows in results.items():
+                        path = source / f"results-{name}.json"
+                        path.write_text(json.dumps({"evaluation_context": context, "records": rows,
+                            "result_scope": "research_only" if name == "A" else "release_eligible"}), encoding="utf-8")
+                        paths[name] = path
+                    results = load_results(system_files=paths)
+                    result_paths = list(paths.values())
+                else:
+                    envelope = {"systems": ["A", "B"], "evaluation_context": context,
+                        "result_scope": "research_only" if mode == "aggregate" else "release_eligible",
+                        "results": {name: {"records": rows, "result_scope": "release_eligible"}
+                                    for name, rows in results.items()}}
+                    if mode in ("system-envelope", "empty-research-system"):
+                        envelope["results"]["A"]["result_scope"] = "research_only"
+                    if mode == "empty-research-system":
+                        envelope["results"]["A"]["records"] = []
+                    path = source / "research-results.json"
+                    path.write_text(json.dumps(envelope), encoding="utf-8")
+                    results = load_results(aggregate=path)
+                    result_paths = [path]
+                expected = make_evaluation_context(load_visible_corpus(source / "05_corpus.json"), "")
+                questions = json.loads(bench.read_text(encoding="utf-8"))
+                _, preliminary = filter_questions(questions, results, expected_context=expected)
+                self.assertEqual(preliminary["result_scope"], "research_only")
+                if mode == "empty-research-system":
+                    self.assertEqual(preliminary["counts"]["kept_incomplete"], 2)
+                else:
+                    self.assertEqual(preliminary["counts"]["removed_easy"], 1)
+                output = source / "filtered"
+                report = export_filtered_benchmark(bench, results, output, result_paths=result_paths)
+                self.assertTrue(report["source_release"]["eligible"])
+                self.assertFalse(report["source_release"].get("override", False))
+                self.assertEqual(report["result_scope"], "research_only")
+                self.assertFalse(report["release"]["eligible"])
+                manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
+                self.assertTrue(manifest["release_policy"]["inherited_research_only"])
+                self.assertTrue(manifest["derived_from"]["source_release_eligible"])
+                self.assertEqual(manifest["derived_from"]["source_result_scope"], "research_only")
+                # Re-running the ordinary release checker cannot upgrade it.
+                self.assertFalse(evaluate_release(output)["eligible"])
 
     def test_floor_violation_and_empty_subset_fail_release(self):
         from pipeline.quality import require_release, ReleaseError

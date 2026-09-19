@@ -5,7 +5,13 @@ if (-not (Test-Path -LiteralPath $taskPython)) {
 }
 Push-Location $PSScriptRoot
 try {
-    & $taskPython -X utf8 -m pipeline.factory @args
+    if ($args.Count -gt 0 -and $args[0] -eq 'agent') {
+        $taskAgentArgs = @($args | Select-Object -Skip 1)
+        & $taskPython -X utf8 -m tools.agent_pipeline @taskAgentArgs
+    }
+    else {
+        & $taskPython -X utf8 -m pipeline.factory @args
+    }
     $taskExitCode = $LASTEXITCODE
 }
 finally {

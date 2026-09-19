@@ -99,6 +99,9 @@ class ProcessLine(ProductionLine):
     def gt(self, ws, o: dict):
         """护城河:用 gt_event_order 重新从世界算出真值时序,再过滤到本题选中的卡片,
         保持时序 = enumerate 烘焙的有序 list(见自检校验闸)。不信 aux 里的日期,真从世界重算。"""
+        if o.get("capability") == "L3_process_trace":
+            from pipeline.process_proposals import validate_process_order
+            return validate_process_order(o, ws)
         ent = o["entity"]
         cards = (o.get("aux") or {}).get("events") or o.get("gt") or []
         keys = {(c["field"], str(c.get("value")), c.get("session")) for c in cards}
@@ -106,6 +109,8 @@ class ProcessLine(ProductionLine):
                 if (e["field"], str(e.get("value")), e["session"]) in keys]
 
     def intent(self, o: dict) -> tuple[str, list]:
+        if o.get("capability") == "L3_process_trace":
+            return o["aux"]["process"]["intent"], []
         ent, gt = o.get("entity", ""), (o.get("gt") or [])
         # ★按【字段名】排序呈现(非时序!)防把正确顺序直接喂给模型;问的就是真时序
         shown = sorted(gt, key=lambda e: str(e.get("field", "")))
@@ -124,6 +129,13 @@ class ProcessLine(ProductionLine):
         现线唯一真高发病 = I2(同(字段,值)复现 → 指代不唯一);源头 _locatable_events 已挡,
         I2 现为防回归。I1/I3/I4/I5 实测 0 触发(纯兜底)。I2 按 (field,value) 判、不按 field 去重
         (同字段不同唯一值各自可定位,必放行 —— 反误杀守则 WP3)。"""
+        if order.get("capability") == "L3_process_trace":
+            from pipeline.process_proposals import validate_process_order
+            try:
+                validate_process_order(order, ws)
+            except (ValueError, TypeError, KeyError) as exc:
+                return ("drop", f"Typed process witness invalid: {exc}")
+            return ("well_posed", "Structural witness only; natural task/reference await semantic review")
         ent = order.get("entity", "")
         E = order.get("gt") or []                          # 已是“有序事件 list”(呈现序 = gold 序)
 
@@ -202,6 +214,8 @@ class ProcessLine(ProductionLine):
     def ground(self, order, evidence_docs, all_signal_text=""):
         """接地(§G.5):gt 里【每个事件】的值都须就近实体、在各自 session 文档内;一个不接地 → 整题弃。
         停用(value 为空)事件 v0 不验值(留 v1)。"""
+        if order.get("capability") == "L3_process_trace":
+            return ("drop", "Typed process natural reference requires public semantic grounding")
         from pipeline.grounding import attributed
         ent = order.get("entity", "")
         by_sess = {}

@@ -37,11 +37,10 @@ def r1_answer(question: str, snippets: list, max_tokens: int = 2048,
             f"请只给最终答案(极简):"
         )},
     ]
-    try:
-        ans = config.chat(msgs, temperature=0.0, max_tokens=max_tokens)
-    except Exception as e:
-        return f"[R1_ERROR:{type(e).__name__}]"
-    return (ans or "").strip()
+    ans = config.chat(msgs, temperature=0.0, max_tokens=max_tokens)
+    if not isinstance(ans, str) or not ans.strip():
+        raise ValueError("Answer model returned no text")
+    return ans.strip()
 
 
 def unified_answer(question: str, context: str, protocol: str = "",
@@ -59,12 +58,14 @@ def unified_answer(question: str, context: str, protocol: str = "",
     import time as _time
     for attempt in range(3):
         try:
-            ans = (config.chat(msgs, temperature=0.0, max_tokens=max_tokens) or "").strip()
-            if ans:
-                return ans
-        except Exception as e:
+            ans = config.chat(msgs, temperature=0.0, max_tokens=max_tokens)
+            if not isinstance(ans, str) or not ans.strip():
+                raise ValueError("Answer model returned no text")
+            return ans.strip()
+        except Exception:
             if attempt < 2:
                 _time.sleep(2 ** attempt)
                 continue
-            return f"[ANSWER_ERROR:{type(e).__name__}]"
-    return ans
+            # The harness must record an execution error, never grade an error
+            # marker as a model answer (including on abstention questions).
+            raise

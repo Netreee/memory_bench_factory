@@ -31,6 +31,8 @@ class TargetSpec:
     difficulty_dist: dict = field(default_factory=dict)     # v1:{easy,med,hard};v0 不用
     haystack_ratio: float = 4.0                             # corpus_chars ≈ needle·(1+ratio)
     time_span_weeks: int | None = None                      # None = 用默认/反推
+    total_only: bool = False                               # weighted line targets remain soft; explicit floors still apply
+    max_world_entities: int = 80                           # resource bound for each independent world
 
     @classmethod
     def from_dict(cls, d: dict) -> "TargetSpec":
@@ -40,7 +42,9 @@ class TargetSpec:
                    per_line_max=dict(d.get("per_line_max", {})),
                    difficulty_dist=dict(d.get("difficulty_dist", {})),
                    haystack_ratio=float(d.get("haystack_ratio", 4.0)),
-                   time_span_weeks=d.get("time_span_weeks"))
+                   time_span_weeks=d.get("time_span_weeks"),
+                   total_only=bool(d.get("total_only", False)),
+                   max_world_entities=int(d.get("max_world_entities", 80)))
 
     def derive_per_line_min(self, active_lines: list[dict]) -> dict:
         """缺省:由白皮书 active_lines.weight × min_questions 派生每线 floor(盲审:weight 终于被读)。
@@ -84,7 +88,9 @@ def invert_rate(spec: TargetSpec, survival: dict | None = None,
 
     n_person = math.ceil(target_orders.get("L2_relational", 0) / RATE_L2_PER_PERSON) if target_orders.get("L2_relational") else 0
     n_ent_L3 = math.ceil(target_orders.get("L3_process", 0) / RATE_L3_PER_ENTITY) if target_orders.get("L3_process") else 0
-    n_entities = _clamp(max(base_min_entities, n_person, n_ent_L3), *N_ENT_CLAMP)
+    if not N_ENT_CLAMP[0] <= spec.max_world_entities <= N_ENT_CLAMP[1]:
+        raise ValueError("max_world_entities must be between 8 and 80")
+    n_entities = _clamp(max(base_min_entities, n_person, n_ent_L3), N_ENT_CLAMP[0], spec.max_world_entities)
     n_sessions = _clamp(spec.time_span_weeks or 10, *N_SESS_CLAMP)
     quota_L1 = int(target_orders.get("L1_timeline", 0))
     max_n_conflicts = int(target_orders.get("L5_conflict", 0))

@@ -69,6 +69,16 @@ def audit(run_dir: Path) -> dict:
         return json.loads((run_dir / name).read_text(encoding="utf-8"))
 
     manifest, pack = read("manifest.json"), validate_seed_pack(read("00_seed_pack.json"))
+    if pack["schema_version"] == 2:
+        from types import SimpleNamespace
+        from pipeline.seed_run import validate_seed_identity
+        from pipeline.seed_lineage import seed_lineage_report
+        result["seed_lineage"] = seed_lineage_report(run_dir)
+        try:
+            validate_seed_identity(SimpleNamespace(manifest=manifest,
+                has=lambda name: (run_dir / name).is_file(), read=read), read("01_whitepaper.json"))
+        except ValueError as exc:
+            result["issues"].append(str(exc))
     wp, world = read("01_whitepaper.json"), read("02_world.json")
     corpus, questions = read("05_corpus.json"), read("04_questions.json")
     final = read("06_grounded_questions.json")
