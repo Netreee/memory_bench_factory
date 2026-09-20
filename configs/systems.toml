@@ -1,0 +1,132 @@
+schema_version = 2
+note = "Stable harness/memory registry. Models, endpoints, budgets, and smoke limits belong to experiments."
+
+[[systems]]
+schema_version = 2
+id = "diagnostic.builtin"
+track = "native"
+display_name = "Built-in offline control-plane diagnostic"
+status = "diagnostic"
+role = "diagnostic"
+implementation = { runner = "builtin_diagnostic", executable = true }
+spec = { harness = { id = "builtin-diagnostic", version = "repository" }, native_tool_policy = { mode = "none", tools = [], network_mode = "none", filesystem_roots = ["benchmark_files"], subagents_enabled = false } }
+
+[[systems]]
+schema_version = 2
+id = "native.claude-code"
+track = "native"
+display_name = "Claude Code"
+status = "candidate"
+role = "benchmark"
+implementation = { runner = "native_cli", adapter = "claude", executable = true }
+spec = { harness = { id = "claude-code", package_pin = "2.1.260", version_source = "runtime_preflight" }, native_tool_policy = { mode = "native", network_mode = "closed", filesystem_roots = ["benchmark_workspace"], server_side_tools = [], subagents_enabled = false } }
+
+[[systems]]
+schema_version = 2
+id = "native.codex"
+track = "native"
+display_name = "Codex"
+status = "candidate"
+role = "benchmark"
+implementation = { runner = "native_cli", adapter = "codex", executable = true }
+spec = { harness = { id = "codex", package_pin = "0.153.2", version_source = "runtime_preflight" }, native_tool_policy = { mode = "native", network_mode = "closed", filesystem_roots = ["benchmark_workspace"], server_side_tools = [], subagents_enabled = false } }
+
+[[systems]]
+schema_version = 2
+id = "native.dsh"
+track = "native"
+display_name = "DeepSeek Harness"
+status = "candidate"
+role = "benchmark"
+implementation = { runner = "native_cli", adapter = "dsh", executable = true }
+spec = { harness = { id = "dsh", package_pin = "0.1.2-rc.1", version_source = "runtime_preflight" }, native_tool_policy = { mode = "native", network_mode = "closed", filesystem_roots = ["benchmark_workspace"], server_side_tools = [], subagents_enabled = false } }
+
+[[systems]]
+schema_version = 2
+id = "native.gemini-cli"
+track = "native"
+display_name = "Gemini CLI"
+status = "candidate"
+role = "benchmark"
+implementation = { runner = "planned", adapter = "gemini", executable = false }
+spec = { harness = { id = "gemini-cli", version = "TBD" }, native_tool_policy = { mode = "native", network_mode = "TBD", filesystem_roots = ["benchmark_workspace"], server_side_tools = "TBD", subagents_enabled = "TBD" } }
+
+[[systems]]
+schema_version = 2
+id = "native.qwen-code"
+track = "native"
+display_name = "Qwen Code"
+status = "candidate"
+role = "benchmark"
+implementation = { runner = "planned", adapter = "qwen", executable = false }
+spec = { harness = { id = "qwen-code", version = "TBD" }, native_tool_policy = { mode = "native", network_mode = "TBD", filesystem_roots = ["benchmark_workspace"], server_side_tools = "TBD", subagents_enabled = "TBD" } }
+
+[[systems]]
+schema_version = 2
+id = "native.kimi-code"
+track = "native"
+display_name = "Kimi Code CLI"
+status = "candidate"
+role = "benchmark"
+implementation = { runner = "planned", adapter = "kimi", executable = false }
+spec = { harness = { id = "kimi-code", version = "TBD" }, native_tool_policy = { mode = "native", network_mode = "TBD", filesystem_roots = ["benchmark_workspace"], server_side_tools = "TBD", subagents_enabled = "TBD" } }
+
+[[systems]]
+schema_version = 2
+id = "memory.simplemem"
+track = "memory"
+display_name = "SimpleMem dense retrieval"
+status = "candidate"
+role = "benchmark"
+implementation = { runner = "planned", executable = false }
+spec = { memory_system = { id = "simplemem", version = "repository" }, ingestion = { mode = "session_ordered", reset_scope = "run" }, retrieval = { mode = "dense", context_token_budget = "TBD", witness_required = true } }
+
+[[systems]]
+schema_version = 2
+id = "memory.iterative"
+track = "memory"
+display_name = "Iterative two-hop retrieval"
+status = "candidate"
+role = "benchmark"
+implementation = { runner = "planned", executable = false }
+spec = { memory_system = { id = "iterative", version = "repository" }, ingestion = { mode = "session_ordered", reset_scope = "run" }, retrieval = { mode = "iterative", context_token_budget = "TBD", witness_required = true } }
+
+[[systems]]
+schema_version = 2
+id = "memory.fullcontext"
+track = "memory"
+display_name = "FullContext reference"
+status = "candidate"
+role = "reference"
+implementation = { runner = "planned", executable = false }
+spec = { memory_system = { id = "fullcontext", version = "repository" }, ingestion = { mode = "session_ordered", reset_scope = "run" }, retrieval = { mode = "full_context", context_token_budget = "TBD", witness_required = true } }
+
+[[systems]]
+schema_version = 2
+id = "memory.mem0-oss"
+track = "memory"
+display_name = "Mem0 OSS"
+status = "candidate"
+role = "benchmark"
+implementation = { runner = "planned", executable = false }
+spec = { memory_system = { id = "mem0_oss", version = "TBD", internal_models = "TBD" }, ingestion = { mode = "session_ordered", reset_scope = "run" }, retrieval = { mode = "native", context_token_budget = "TBD", witness_required = true } }
+
+[[systems]]
+schema_version = 2
+id = "memory.graphiti-oss"
+track = "memory"
+display_name = "Graphiti OSS"
+status = "candidate"
+role = "benchmark"
+implementation = { runner = "planned", executable = false }
+spec = { memory_system = { id = "graphiti_oss", version = "TBD", graph_backend = "TBD", internal_models = "TBD" }, ingestion = { mode = "session_ordered_with_reference_time", reset_scope = "run" }, retrieval = { mode = "native", context_token_budget = "TBD", witness_required = true } }
+
+[[systems]]
+schema_version = 2
+id = "memory.memos"
+track = "memory"
+display_name = "MemOS"
+status = "candidate"
+role = "benchmark"
+implementation = { runner = "planned", executable = false }
+spec = { memory_system = { id = "memos", version = "TBD", deployment = "TBD", internal_models = "TBD" }, ingestion = { mode = "session_ordered", reset_scope = "run" }, retrieval = { mode = "native", context_token_budget = "TBD", witness_required = true } }

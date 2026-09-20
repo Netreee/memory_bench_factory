@@ -14,7 +14,20 @@ venv*/
 # ── 密钥 · 本地配置(命脉,绝不提交)──
 .env
 
+# ── 评测端(agent_harnesses)的本地配置与密钥 ──
+# endpoint 密钥只提交模板;真实 experiment TOML 记录本地路径/模型,默认不进 git。
+configs/env/*.env
+configs/env/*.local
+configs/experiments/*.toml
+!configs/experiments/templates/
+!configs/experiments/templates/*.toml
+.venv/
+.npm-cache/
+.npm-global/
+**/memory_files/
+
 # ── 运行产物(每次 run 的 manifest / run.log / prompts.jsonl / 中间产物,可重生)──
+# output/runs/ = 工厂生成产物;output/eval/ = 评测端(含 agent_harnesses)输出。
 output/
 
 # ── 运行日志(embed_server / vllm 等服务日志,运行时产物,可重生)──
