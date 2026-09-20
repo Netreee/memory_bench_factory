@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT))
 
 from eval.memory_systems.base import MemorySystem, execution_stage, ingest_receipt
-from eval.multi_system import header, build_full_context
+from eval.public_context import build_full_context
 
 
 class FullContext(MemorySystem):

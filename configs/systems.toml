@@ -78,8 +78,8 @@ track = "memory"
 display_name = "SimpleMem dense retrieval"
 status = "candidate"
 role = "benchmark"
-implementation = { runner = "planned", executable = false }
-spec = { memory_system = { id = "simplemem", version = "repository" }, ingestion = { mode = "session_ordered", reset_scope = "run" }, retrieval = { mode = "dense", context_token_budget = "TBD", witness_required = true } }
+implementation = { runner = "memory", executable = true }
+spec = { memory_system = { id = "simplemem", version = "repository" }, ingestion = { mode = "session_ordered", reset_scope = "run" }, retrieval = { mode = "dense", top_k = 3, context_token_budget = 0, budget_enforced = false, witness_required = false } }
 
 [[systems]]
 schema_version = 2
@@ -88,8 +88,8 @@ track = "memory"
 display_name = "Iterative two-hop retrieval"
 status = "candidate"
 role = "benchmark"
-implementation = { runner = "planned", executable = false }
-spec = { memory_system = { id = "iterative", version = "repository" }, ingestion = { mode = "session_ordered", reset_scope = "run" }, retrieval = { mode = "iterative", context_token_budget = "TBD", witness_required = true } }
+implementation = { runner = "memory", executable = true }
+spec = { memory_system = { id = "iterative", version = "repository" }, ingestion = { mode = "session_ordered", reset_scope = "run" }, retrieval = { mode = "iterative", top_k = 3, hop_max_tokens = 2048, context_token_budget = 0, budget_enforced = false, witness_required = false } }
 
 [[systems]]
 schema_version = 2
@@ -98,8 +98,8 @@ track = "memory"
 display_name = "FullContext reference"
 status = "candidate"
 role = "reference"
-implementation = { runner = "planned", executable = false }
-spec = { memory_system = { id = "fullcontext", version = "repository" }, ingestion = { mode = "session_ordered", reset_scope = "run" }, retrieval = { mode = "full_context", context_token_budget = "TBD", witness_required = true } }
+implementation = { runner = "memory", executable = true }
+spec = { memory_system = { id = "fullcontext", version = "repository", full_context_char_budget = 120000 }, ingestion = { mode = "session_ordered", reset_scope = "run" }, retrieval = { mode = "full_context", top_k = 0, context_token_budget = 0, budget_enforced = false, witness_required = false } }
 
 [[systems]]
 schema_version = 2

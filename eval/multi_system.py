@@ -37,7 +37,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 import config
-from eval.memory_interface import EmbedMemory, _chunk
+from eval.memory_interface import EmbedMemory, _chunk, build_embed_memory  # noqa: F401  re-export: 定义已移到 memory_interface,避免内置系统 import legacy driver
 from eval.embed_cache import cached_embed, cache_size
 from eval import qa_cache
 from eval.question_filter import export_filtered_benchmark, validate_options as validate_filter_options
@@ -216,79 +216,6 @@ def load_protocol(about_path: Path) -> str:
     这是随题库交付的作答契约；v5 区分未记录、已停统与范围外，旧协议保持兼容。
     三系统同等注入 → 公平;给规则不等于给答案。读不到则返回空串(不注入)。"""
     return load_public_protocol(about_path)
-
-
-def build_embed_memory(docs: list, workers: int = 3,
-                       on_progress=None) -> EmbedMemory:
-    """并行 embed 所有 doc(带周期/日期表头),再按序装进 EmbedMemory。
-    对 DMXAPI embedding 抖动有韧性:低并发首轮(降并发连接 → 减少 drop)+ 失败篇【串行补漏】
-    (避开并发风暴重试)+ 补到底仍失败才抛(残缺索引污染检索,不静默跳过)。
-    检索 order-independent,装入顺序不影响正确性。
-    on_progress(done, total): 可选回调,每完成一篇 embed 调一次。"""
-    mem = EmbedMemory(chunk=True)
-    mem.reset()
-    _cnt_lk = threading.Lock()
-    _cnt = [0]
-    total = len(docs)
-
-    def _prep(item):
-        sid, date, content = item
-        return [header(sid, date) + p
-                for p in (_chunk(content, mem.chunk_chars) if mem.chunk else [content]) if p]
-
-    def _try(item):
-        pieces = _prep(item)
-        if not pieces:
-            with _cnt_lk:
-                _cnt[0] += 1
-                if on_progress:
-                    on_progress(_cnt[0], total)
-            return [item, [], []]            # 空文档:无 piece
-        try:
-            r = [item, pieces, cached_embed(pieces, mem.model)]   # 命中走盘缓存,未命中嵌+落盘
-            if len(r[2]) != len(pieces):
-                raise ValueError("embedding response count differs from requested chunks")
-        except Exception:
-            return [item, pieces, None]      # 失败标记,稍后串行补
-        with _cnt_lk:
-            _cnt[0] += 1
-            if on_progress:
-                on_progress(_cnt[0], total)
-        return r
-
-    results = config.pmap(_try, docs, workers=workers)
-
-    # 串行补漏(并发失败的,降速逐篇重试;最多 2 轮)
-    for rnd in range(2):
-        failed = [r for r in results if r[2] is None]
-        if not failed:
-            break
-        print(f"[embed] 第{rnd+1}轮串行补漏 {len(failed)} 篇 ...")
-        for r in failed:
-            try:
-                r[2] = cached_embed(r[1], mem.model)
-                if len(r[2]) != len(r[1]):
-                    r[2] = None
-                    raise ValueError("embedding response count differs from requested chunks")
-            except Exception:
-                pass
-            else:
-                with _cnt_lk:
-                    _cnt[0] += 1
-                    if on_progress:
-                        on_progress(_cnt[0], total)
-    still = [r[0][0] for r in results if r[2] is None]
-    if still:
-        raise RuntimeError(
-            f"embed ingest:{len(still)} 篇补漏后仍失败(DMXAPI embedding 不稳),建议稍后重试。失败周期={still[:10]}")
-
-    for item, pieces, vecs in results:
-        sid = item[0]
-        for piece, v in zip(pieces, vecs):
-            mem._docs.append(piece)
-            mem._meta.append({"period_idx": sid, "doc_id": f"s{sid}"})
-            mem._vecs.append(v)
-    return mem
 
 
 # ─────────────────────────────────────────────────────────────────────────────
