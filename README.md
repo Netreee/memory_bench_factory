@@ -60,6 +60,7 @@ python3 -m agent_harnesses score --out output/eval/<experiment>/<scenario>/<targ
 - `simplemem` / `iterative` 需要本地 bge：`pip install numpy sentence-transformers`（模型 `BAAI/bge-small-zh-v1.5` 首次使用时下载）；`fullcontext` 无额外依赖。`preflight` 会 fail-closed 地报出缺失依赖。
 - 结果 schema 与 native 相同（`agent-harnesses.result/v1`），native 专属字段置空；判分仍用 `agent_harnesses score`。
 - 已知边界：`--resume` 暂不支持 memory run；`qa_cache`/`reassessment`/语义判分门未接入，结果按 exploratory 看待；token/成本记账待补。
+- **`iterative` 的覆盖率缺口（已知观测，非待修缺陷）**：抽桥那次 `chat_json` 会在推理模型上 `output_truncated` 而失败（`hop_max_tokens=4096`，540 字符输入也会截断；截断不重试）。因此**报 `iterative` 的准确率时必须同时报 `n_infra_failed` 与 `accuracy_over_judged`**，不得用 `accuracy` 单值与其他系统并列比较。详见 `DECISIONS.md` D-20260920-03 / D-20260920-04。
 
 
 ## World-first 白皮书
