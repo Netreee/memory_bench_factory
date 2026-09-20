@@ -11,11 +11,14 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Optional
 import sys
+import threading
 
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import config
+from eval.public_context import header
+from eval.embed_cache import cached_embed
 
 
 # ── 统一本地 embedder(bge-small-zh-v1.5, 512维)─────────────────────────────
@@ -28,6 +31,8 @@ _LOCAL_HF_ID = "BAAI/bge-small-zh-v1.5"
 _local_embedder = None
 import threading as _threading
 _embedder_lock = _threading.Lock()
+# 见 embed_texts 的注释：torch CPU encode 并发会 segfault，必须串行。
+_encode_lock = _threading.Lock()
 
 
 def _get_embedder():
@@ -41,12 +46,19 @@ def _get_embedder():
 
 
 def embed_texts(texts: list, model: str = EMBED_MODEL) -> list:
-    """本地 bge-small-zh-v1.5 编码(512维, L2归一化),返回 list[np.ndarray(float32)]。"""
+    """本地 bge-small-zh-v1.5 编码(512维, L2归一化),返回 list[np.ndarray(float32)]。
+
+    encode 必须串行：本机 torch 2.14 + macOS arm64 下，多线程并发调用
+    `SentenceTransformer.encode` 会 SIGSEGV（实测 221 docs / workers=3 必崩）。
+    embedding 是纯 CPU 计算，串行化只牺牲吞吐、不影响结果，且让并发的收益留给
+    网络型阶段（LLM 调用）。
+    """
     if not texts:
         return []
-    emb = _get_embedder()
-    arr = emb.encode(list(texts), normalize_embeddings=True,
-                     show_progress_bar=False, batch_size=64)
+    with _encode_lock:
+        emb = _get_embedder()
+        arr = emb.encode(list(texts), normalize_embeddings=True,
+                         show_progress_bar=False, batch_size=64)
     return [np.asarray(v, dtype=np.float32) for v in arr]
 
 
@@ -133,3 +145,82 @@ class EmbedMemory:
         if idx is None:
             return []
         return [(self._docs[i], self._meta[i], float(sims[i])) for i in idx]
+
+
+def build_embed_memory(docs: list, workers: int = 3,
+                       on_progress=None) -> EmbedMemory:
+    """并行 embed 所有 doc(带周期/日期表头),再按序装进 EmbedMemory。
+
+    对 embedding 端点抖动有韧性:低并发首轮 + 失败篇【串行补漏】+ 补到底仍失败才抛
+    (残缺索引污染检索,不静默跳过)。检索 order-independent,装入顺序不影响正确性。
+    on_progress(done, total): 可选回调,每完成一篇 embed 调一次。
+
+    原先定义在 eval.multi_system(legacy driver)里;移到本模块是为了让
+    eval.memory_systems.* 不再为它 import 整个 legacy 评测编排。multi_system
+    仍然 re-export 同名函数,外部调用方不受影响。
+    """
+    mem = EmbedMemory(chunk=True)
+    mem.reset()
+    _cnt_lk = threading.Lock()
+    _cnt = [0]
+    total = len(docs)
+
+    def _prep(item):
+        sid, date, content = item
+        return [header(sid, date) + p
+                for p in (_chunk(content, mem.chunk_chars) if mem.chunk else [content]) if p]
+
+    def _try(item):
+        pieces = _prep(item)
+        if not pieces:
+            with _cnt_lk:
+                _cnt[0] += 1
+                if on_progress:
+                    on_progress(_cnt[0], total)
+            return [item, [], []]            # 空文档:无 piece
+        try:
+            r = [item, pieces, cached_embed(pieces, mem.model)]   # 命中走盘缓存,未命中嵌+落盘
+            if len(r[2]) != len(pieces):
+                raise ValueError("embedding response count differs from requested chunks")
+        except Exception:
+            return [item, pieces, None]      # 失败标记,稍后串行补
+        with _cnt_lk:
+            _cnt[0] += 1
+            if on_progress:
+                on_progress(_cnt[0], total)
+        return r
+
+    results = config.pmap(_try, docs, workers=workers)
+
+    # 串行补漏(并发失败的,降速逐篇重试;最多 2 轮)
+    for rnd in range(2):
+        failed = [r for r in results if r[2] is None]
+        if not failed:
+            break
+        print(f"[embed] 第{rnd+1}轮串行补漏 {len(failed)} 篇 ...")
+        for r in failed:
+            try:
+                r[2] = cached_embed(r[1], mem.model)
+                if len(r[2]) != len(r[1]):
+                    r[2] = None
+                    raise ValueError("embedding response count differs from requested chunks")
+            except Exception:
+                pass
+            else:
+                with _cnt_lk:
+                    _cnt[0] += 1
+                    if on_progress:
+                        on_progress(_cnt[0], total)
+    still = [r[0][0] for r in results if r[2] is None]
+    if still:
+        raise RuntimeError(
+            f"embed ingest:{len(still)} 篇补漏后仍失败(embedding 端点不稳),建议稍后重试。失败周期={still[:10]}")
+
+    for item, pieces, vecs in results:
+        sid = item[0]
+        for piece, v in zip(pieces, vecs):
+            mem._docs.append(piece)
+            mem._meta.append({"period_idx": sid, "doc_id": f"s{sid}"})
+            mem._vecs.append(v)
+    return mem
+

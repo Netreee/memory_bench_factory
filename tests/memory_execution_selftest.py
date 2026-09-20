@@ -10,6 +10,7 @@ from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+from eval.public_context import build_full_context  # noqa: E402 - FullContext 的真实格式化依赖
 config = types.ModuleType('config')
 config.chat_json = Mock(side_effect=AssertionError('unexpected external model call'))
 config.MODEL = 'offline'
@@ -23,7 +24,7 @@ httpx_stub = types.ModuleType('httpx')
 httpx_stub.Timeout = lambda *args, **kwargs: ('offline-timeout',)
 with patch.dict(sys.modules, {
     'config': config, 'eval.multi_system': runner_stub,
-    'eval.memory_interface': types.SimpleNamespace(EmbedMemory=object, _chunk=Mock()),
+    'eval.memory_interface': types.SimpleNamespace(EmbedMemory=object, _chunk=Mock(), build_embed_memory=Mock()),
     'eval.embed_cache': types.SimpleNamespace(cached_embed=Mock()),
     'requests': requests_stub, 'httpx': httpx_stub,
 }):
@@ -501,7 +502,13 @@ class ExecutionTest(unittest.TestCase):
             self.failure('finalize', obj.finalize_ingest)
         full = fullcontext.FullContext()
         full.ingest_session(SESSION); full.finalize_ingest()
-        self.assertEqual(full.retrieve('question'), 'alpha\nbeta')
+        # FullContext 现在直接使用 eval.public_context.build_full_context（不再经 legacy
+        # driver 转发），因此对真实格式化结果断言，而不是 driver stub 的裸拼接。
+        expected, _, _ = build_full_context(
+            [(SESSION['session_id'], SESSION['date'], doc) for doc in SESSION['docs']],
+            budget=full.budget,
+        )
+        self.assertEqual(full.retrieve('question'), expected)
 
     def test_local_embedding_partial_batch_is_atomic(self):
         with patch.dict(sys.modules, {'config': config, 'numpy': types.ModuleType('numpy')}):
