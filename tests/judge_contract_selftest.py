@@ -45,7 +45,7 @@ def load_runner():
     spec = importlib.util.spec_from_file_location("offline_real_multi", ROOT / "eval/multi_system.py")
     module = importlib.util.module_from_spec(spec)
     with patch.dict(sys.modules, {"config": config, "eval.judge": judge,
-        "eval.memory_interface": types.SimpleNamespace(EmbedMemory=object, _chunk=Mock()),
+        "eval.memory_interface": types.SimpleNamespace(EmbedMemory=object, _chunk=Mock(), build_embed_memory=Mock()),
         "eval.embed_cache": types.SimpleNamespace(cached_embed=Mock(), cache_size=Mock())}):
         spec.loader.exec_module(module)
     return module

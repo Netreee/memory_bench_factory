@@ -17,6 +17,10 @@ from .judging import Judge
 RESULT_SCHEMA_V2 = "agent-harnesses.result/v2"
 SUMMARY_SCHEMA = "agent-harnesses.score-summary/v1"
 
+# 可判分的 runner。两条赛道共用同一套判分/聚合，只是 usage 来源不同：
+# native_cli 从 CLI 输出提取，memory 由 runner 直接记录答题模型用量。
+SCORABLE_RUNNERS = ("native_cli", "memory")
+
 
 def _read_json(path: Path) -> Any:
     if not path.is_file():
@@ -86,6 +90,11 @@ def _score_record(
 
 
 def _attach_usage(record: dict, out_dir: Path, adapter: str) -> None:
+    """把 usage 归一到统一形状。
+
+    native_cli 从 raw stdout/stderr 提取；memory run 没有 CLI 输出，usage 由 runner
+    直接记录在结果行里（答题模型的 token 计数），此时保留原值、不做覆盖。
+    """
     stdout = stderr = ""
     raw_stdout = record.get("raw_stdout")
     raw_stderr = record.get("raw_stderr")
@@ -93,6 +102,10 @@ def _attach_usage(record: dict, out_dir: Path, adapter: str) -> None:
         stdout = (out_dir / raw_stdout).read_text(encoding="utf-8", errors="replace")
     if raw_stderr and (out_dir / raw_stderr).is_file():
         stderr = (out_dir / raw_stderr).read_text(encoding="utf-8", errors="replace")
+    if not stdout and not stderr:
+        # memory runner 已经写好 usage；没有 raw 证据时保留它，同时也保证字段存在。
+        record.setdefault("usage", None)
+        return
     record["usage"] = extract_usage(adapter, stdout, stderr)
 
 
@@ -172,13 +185,20 @@ def score_run(
     if judged_path.exists() and not force:
         raise ConfigurationError(f"{judged_path} 已存在；重判请加 --force")
     plan = _read_json(out_dir / "run_plan.json")
-    if plan.get("runner") != "native_cli":
+    runner = plan.get("runner")
+    if runner not in SCORABLE_RUNNERS:
         raise ConfigurationError(
-            f"score 仅支持 native_cli run，当前 runner={plan.get('runner')!r}"
+            f"score 仅支持 {' / '.join(SCORABLE_RUNNERS)} run，当前 runner={runner!r}"
         )
     runtime = plan.get("runtime") or {}
-    adapter = str(runtime.get("adapter") or plan["system"]["implementation"].get("adapter") or "")
-    model = str(runtime.get("model") or "")
+    # memory run 没有 CLI adapter：模型身份取 experiment 固定的 answering_model。
+    answering = plan.get("answering_model") or {}
+    adapter = str(
+        runtime.get("adapter")
+        or plan["system"]["implementation"].get("adapter")
+        or ("memory" if runner == "memory" else "")
+    )
+    model = str(runtime.get("model") or answering.get("model_id") or "")
     run_dir = Path(plan["benchmark"]["path"])
     questions = load_questions(run_dir)
     records = read_results(out_dir)

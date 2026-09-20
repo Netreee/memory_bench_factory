@@ -28,7 +28,7 @@ class ExecutionPipelineTest(unittest.TestCase):
         self.addCleanup(network.stop)
         self.runner = load_runner()
         self.modules = patch.dict(sys.modules, {"config": config, "eval.multi_system": self.runner,
-            "eval.memory_interface": SimpleNamespace(EmbedMemory=object, _chunk=Mock()),
+            "eval.memory_interface": SimpleNamespace(EmbedMemory=object, _chunk=Mock(), build_embed_memory=Mock()),
             "eval.embed_cache": SimpleNamespace(cached_embed=Mock(), cache_size=Mock()),
             "requests": SimpleNamespace(Session=lambda: SimpleNamespace(headers={}))})
         self.modules.start()

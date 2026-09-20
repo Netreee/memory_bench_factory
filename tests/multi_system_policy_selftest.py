@@ -58,7 +58,7 @@ class OriginalPolicyCLI(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.base = Path(self.temp.name)
-        optional = {"eval.memory_interface": SimpleNamespace(EmbedMemory=object, _chunk=Mock()),
+        optional = {"eval.memory_interface": SimpleNamespace(EmbedMemory=object, _chunk=Mock(), build_embed_memory=Mock()),
                     "eval.embed_cache": SimpleNamespace(cached_embed=Mock(), cache_size=Mock())}
         with patch.dict(sys.modules, optional):
             self.module = load("_original_policy_cli", ROOT / "eval/multi_system.py")

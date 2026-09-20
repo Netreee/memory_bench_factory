@@ -335,7 +335,7 @@ class FileAndCliTest(FileFixture):
 class MultiSystemIntegrationTest(FileFixture):
     def load_harness(self):
         """仅替换不可用的向量后端，评测主流程和导出运行真实代码。"""
-        optional = {"eval.memory_interface": SimpleNamespace(EmbedMemory=object, _chunk=Mock()),
+        optional = {"eval.memory_interface": SimpleNamespace(EmbedMemory=object, _chunk=Mock(), build_embed_memory=Mock()),
                     "eval.embed_cache": SimpleNamespace(cached_embed=Mock(), cache_size=Mock())}
         spec = importlib.util.spec_from_file_location("filter_test_multi_system", ROOT / "eval/multi_system.py")
         module = importlib.util.module_from_spec(spec)

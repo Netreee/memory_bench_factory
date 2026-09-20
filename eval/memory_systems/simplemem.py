@@ -12,9 +12,8 @@ ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(ROOT))
 
 from eval.memory_systems.base import MemorySystem, execution_stage, ingest_receipt
-from eval.memory_interface import EmbedMemory, _chunk
+from eval.memory_interface import EmbedMemory, _chunk, build_embed_memory
 from eval.embed_cache import cached_embed
-from eval.multi_system import header, build_embed_memory
 
 
 class SimpleMem(MemorySystem):

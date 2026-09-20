@@ -50,7 +50,17 @@ python3 -m agent_harnesses score --out output/eval/<experiment>/<scenario>/<targ
 - 评测产物写在 `output/eval/`（与工厂生成产物 `output/runs/` 并列，均不进 git）；模板已按此设置 `output_root`。
 - `questions_in_parallel` / `parallel_plans` 默认均为 `1`（完全串行），并发度不进 fingerprint，可随 `--resume` 调整。
 - 回归测试：`python3 -m unittest discover -s tests/harness`；唯一随仓库分发的 benchmark 夹具在 `tests/harness/fixtures/`，用途与边界见该目录 README。
-- **Memory System Track 仍是占位**：`agent_harnesses/tracks/memory.py` 主动拒绝执行，需先冻结 answering model、context budget 与 retrieval witness 才接入 `eval/memory_systems/`。
+
+### Memory System Track（三个内置对照）
+
+`track = "memory"` 的 experiment 走同一套配置校验 / run plan / 产物目录 / 判分入口，只是 runner 换成 `agent_harnesses/runners/memory.py`：**ingest 一次（串行）→ 逐题 retrieve → 统一答题 prompt 合成答案**，逐题写 `results.jsonl`。
+
+- 固定回答模型写在 experiment 顶层的 `[answering_model]`（`model_id` + `endpoint_profile`），它是本 run 的唯一模型，`iterative` 的两跳抽桥也用它；`[[targets]]` **不得**再写模型字段。
+- 被测实现来自 factory 的 `eval/memory_systems/`（`simplemem` / `iterative` / `fullcontext`），检索与答题 prompt 原样复用，harness 不改其语义。协议默认值（`top_k=3`、`fullcontext` 120k 字符、witness 暂不强制）冻结在 `configs/systems.toml`。
+- `simplemem` / `iterative` 需要本地 bge：`pip install numpy sentence-transformers`（模型 `BAAI/bge-small-zh-v1.5` 首次使用时下载）；`fullcontext` 无额外依赖。`preflight` 会 fail-closed 地报出缺失依赖。
+- 结果 schema 与 native 相同（`agent-harnesses.result/v1`），native 专属字段置空；判分仍用 `agent_harnesses score`。
+- 已知边界：`--resume` 暂不支持 memory run；`qa_cache`/`reassessment`/语义判分门未接入，结果按 exploratory 看待；token/成本记账待补。
+
 
 ## World-first 白皮书
 
