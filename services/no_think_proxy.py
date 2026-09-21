@@ -31,6 +31,11 @@ json 守卫 fail-closed，整个 ingest 中止。长语料下必然发生，且�
 
 安全：**不要把 API key 写在命令行参数上** —— `ps`/`pgrep -fl` 会把 argv 暴露给同机
 其它进程。key 只从环境变量读（`--api-key-env`，默认 `OPENAI_API_KEY`）。
+
+网络：上游调用固定 `trust_env=False`，**不走 `HTTP(S)_PROXY`**。与
+`services/run_eval.sh`「unset 全部代理、绝不走代理」的约定一致 —— 经代理会间歇性
+`httpx.ProxyError: 502`，直连实测还快约 6×。传输层异常（Timeout / Connect / Read /
+Proxy）统一重试 3 次并退避，不会穿出循环崩掉 handler。
 """
 from __future__ import annotations
 
@@ -113,8 +118,16 @@ class Handler(BaseHTTPRequestHandler):
         last_err = None
         for attempt in range(3):
             try:
+                # trust_env=False：上游调用不走 HTTP(S)_PROXY。
+                # 仓库约定就是 ingest 链直连上游（services/run_eval.sh 明确
+                # unset http_proxy/https_proxy，注释写着「绝不走代理」）；
+                # 而且经沙箱代理会间歇性抛 httpx.ProxyError: 502，直连实测还快约 6×。
                 response = httpx.post(
-                    f"{UPSTREAM}/chat/completions", json=data, headers=headers, timeout=120
+                    f"{UPSTREAM}/chat/completions",
+                    json=data,
+                    headers=headers,
+                    timeout=120,
+                    trust_env=False,
                 )
                 body = response.json()
                 self._log(
@@ -133,7 +146,11 @@ class Handler(BaseHTTPRequestHandler):
                                 "", _THINK_RE.sub("", content)
                             )
                 return self._send(response.status_code, body)
-            except (httpx.TimeoutException, httpx.ConnectError) as exc:
+            except httpx.TransportError as exc:
+                # 捕获整个传输层异常族（Timeout / Connect / Read / Proxy / …）。
+                # 只 catch TimeoutException + ConnectError 的话，ProxyError 会穿出循环
+                # 直接崩掉 handler —— 客户端拿到的是断连，而不是可重试的错误，
+                # 上游侧表现为 mem0 的 operation_failed（看起来像模型/解析问题，实为传输层）。
                 last_err = exc
                 if attempt < 2:
                     time.sleep(2 ** attempt)
