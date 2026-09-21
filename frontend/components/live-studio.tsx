@@ -47,7 +47,7 @@ const PIPELINE = [
   ['04', 'QUESTIONS', '题面生成'],
   ['05', 'CORPUS', '渲染剧情与证据'],
   ['06', 'GROUNDING', '证据接地验收'],
-  ['07', 'QUALITY', '发布资格检查'],
+  ['07', 'QUALITY', '逐题结果汇总'],
 ] as const;
 
 const DEFAULT_SCENARIO =
@@ -160,7 +160,7 @@ const STAGE_LABELS: Record<StageKey, { index: string; name: StageName; cn: strin
   questions: { index: '04', name: 'QUESTIONS', cn: '题面生成' },
   corpus: { index: '05', name: 'CORPUS', cn: '证据渲染' },
   grounding: { index: '06', name: 'GROUNDING', cn: '接地验收' },
-  quality: { index: '07', name: 'QUALITY', cn: '发布资格' },
+  quality: { index: '07', name: 'QUALITY', cn: '结果汇总' },
 };
 
 const WHITEPAPER_STEPS = [
@@ -910,7 +910,7 @@ function CouncilView({ snapshot }: { snapshot: RunSnapshot }) {
         ? `${snapshot.metrics.well_posed.kept}/${snapshot.metrics.well_posed.n} 良定义 · ${snapshot.metrics.grounding.grounded}/${snapshot.metrics.grounding.n} 接地`
         : `目标：${questionCount} 道题全部通过双重机械闸`,
       note: gatesReady
-        ? `接地检查已有结果；发布资格：${qualityLabel(snapshot.quality)}。`
+        ? `逐题检查已有结果；${qualityLabel(snapshot.quality)}。`
         : '白皮书已写入连续性、真伪物件、知识边界与证据闭包的验收标准。',
       tags: [qualityLabel(snapshot.quality), ...snapshot.quality.scope],
     },
@@ -1081,7 +1081,7 @@ function GroundingBuildView({ snapshot }: { snapshot: RunSnapshot }) {
         <div><span>CANDIDATES</span><strong>{formatCount(result.n)}</strong></div>
         <div><span>GROUNDED</span><strong>{formatCount(result.grounded)}</strong></div>
         <div><span>REJECTED</span><strong>{result.n == null || result.grounded == null ? "未测" : Math.max(0, result.n - result.grounded)}</strong></div>
-        <p>{snapshot.stages[7]?.ready ? '接地检查已有结果；发布资格由 07 验收记录决定。' : '纯代码接地闸执行中；不会调用额外 LLM。'}</p>
+        <p>{snapshot.stages[7]?.ready ? '逐题检查已有结果；07 只汇总状态和绑定产物。' : '逐题语义审查与证据接地执行中。'}</p>
       </div>
       <ArtifactChip name="06_grounded_questions.json" ready={snapshot.stages[7]?.ready} />
     </div>
@@ -1111,9 +1111,9 @@ function DeliveryView({ snapshot, onReplay }: { snapshot: RunSnapshot; onReplay:
 function QualityView({ snapshot }: { snapshot: RunSnapshot }) {
   const quality = snapshot.quality ?? unverifiedQuality();
   return <div className="live-message" aria-live="polite">
-    <strong>发布资格：{qualityLabel(quality)}</strong>
-    <p>{quality.eligible ? '已通过本批声明范围的检查。' : '当前产物保留供检查，不能按合格题库发布。'}</p>
-    <p>{quality.scope.length ? `检查范围：${quality.scope.join('、')}` : '检查范围尚未记录。'}</p>
+    <strong>逐题结果：{qualityLabel(quality)}</strong>
+    <p>{quality.eligible ? '通过逐题审查的子集可以直接用于评测。' : '当前没有完成绑定的可用题子集。'}</p>
+    <p>{quality.scope.length ? `汇总范围：${quality.scope.join('、')}` : '汇总范围尚未记录。'}</p>
     {quality.issues.length > 0 && <p>{quality.issues.length} 项问题待处理。</p>}
   </div>;
 }

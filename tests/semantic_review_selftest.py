@@ -824,30 +824,6 @@ class IsolatedReferenceTests(unittest.TestCase):
                 self.assertEqual(report["items"][0]["review_state"], "completed")
                 validate_isolated_completed(report["items"][0], report["documents"])
 
-    def test_real_workflow_rejects_missing_rationale_review_and_tampered_cache(self):
-        from pipeline.quality_workflow import snapshot, fresh_review, validate_review, make_receipt
-        frozen = snapshot([ISOLATED_QUESTION], CORPUS, ISOLATED_PROTOCOL)
-        missing = {"status": "not_provided", "claims": [], "limitations": []}
-        def run(final):
-            final["review_findings"] = {"substantive_defects": [], "acceptable_brevity": [],
-                                        "editorial_suggestions": []}
-            return fresh_review(frozen, reader_model="blind-model", reviewer_model="final-model",
-                reference_auditor_model="audit-model", max_calls=3, max_input_chars=200000,
-                max_tokens=4096, chat_json=Scripted(blind(), reference_audit_response(), final))
-        report = run(isolated_adjudication(reference_status="supported", original_rationale_review=missing))
-        validate_review(frozen, report)
-        self.assertEqual(make_receipt(frozen, frozen, report)["counts"]["model_review_eligible"], 0)
-        self.assertEqual(report["items"][0]["review_state"], "pending")
-        cached = run(isolated_adjudication(reference_status="supported"))
-        self.assertEqual(make_receipt(frozen, frozen, cached)["counts"]["model_review_eligible"], 1)
-        item = cached["items"][0]
-        item["original_rationale_review"] = deepcopy(missing)
-        item["adjudication"]["original_rationale_review"] = deepcopy(missing)
-        item["reference_target_locations"] = [location for location in item["reference_target_locations"]
-                                                if location["reference_part"] != "rationale"]
-        with self.assertRaisesRegex(ValueError, "rationale is present"):
-            validate_review(frozen, cached)
-
     def test_audit_sink_failure_stops_calls_and_retains_complete_raw(self):
         for failure_event, expected_calls in (("started", 1), ("finished", 2)):
             script = Scripted(blind(), reference_audit_response(), isolated_adjudication())

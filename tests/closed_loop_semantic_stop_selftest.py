@@ -177,11 +177,11 @@ class ClosedLoopSemanticStopTests(unittest.TestCase):
         self.assertEqual(result[1], "MET")
         self.assertEqual(calls.count("world"), 2)
 
-    def test_review_execution_failure_becomes_release_warning(self):
+    def test_review_execution_failure_keeps_completed_subset(self):
         calls, manifest, artifacts, reports, reviews, exc, result = self.exercise(execution_error=True)
         self.assertIsNone(exc)
-        self.assertEqual(result[1], "COMPLETED_UNMET")
-        self.assertEqual(calls.count("world"), 3)
+        self.assertEqual(result[1], "MET")
+        self.assertEqual(calls.count("world"), 2)
         self.assertEqual(manifest["stages"]["grounding"]["status"], "succeeded")
         self.assertIn(factory.ART["grounding"], artifacts)
         self.assertEqual(artifacts["06_semantic_review.json"], reviews[-1])

@@ -112,24 +112,6 @@ class OriginalGroundingTests(unittest.TestCase):
         self.assertEqual(r["n_dropped"], 1)
         self.assertEqual(q, before)
 
-    def test_original_release_requires_current_public_review_and_policy(self):
-        wp, ws, q, c, p = fixture()
-        kept, _, review = review_grounding([q], c, p, chat_json=opinions(), model="test")
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td)
-            artifacts = {"01_whitepaper.json": wp, "02_world.json": ws.to_dict(),
-                "04_questions.json": [q], "05_corpus.json": c, "06_grounded_questions.json": kept,
-                "00_about.json": {"answer_protocol": ANSWER_PROTOCOL}, "06_semantic_review.json": review}
-            for name, value in artifacts.items():
-                (root / name).write_text(json.dumps(value, ensure_ascii=False), encoding="utf-8")
-            report = evaluate_release(root)
-            self.assertTrue(report["eligible"], report["issues"])
-            (root / "07_release.json").write_text(json.dumps(report), encoding="utf-8")
-            self.assertTrue(quality_snapshot(root)["eligible"])
-            review["items"][0]["adjudication"]["reference_status"] = "contradicted"
-            (root / "06_semantic_review.json").write_text(json.dumps(review), encoding="utf-8")
-            self.assertEqual(quality_snapshot(root)["status"], "stale")
-            self.assertFalse(evaluate_release(root)["eligible"])
 
 
 if __name__ == "__main__":

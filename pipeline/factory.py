@@ -413,13 +413,11 @@ def _stage_world_once(run: Run):
             disclosure_repair = disclosure_enabled and targets.get("disclosure") is True
             if (attempt or review.get("status") not in ("failed", "unresolved")
                     or not (truth_repair or disclosure_repair)):
-                # Review execution and fallible semantic opinions belong to
-                # release certification, not production liveness. Preserve the
-                # exact candidate and opinion, continue all downstream stages,
-                # and let 07_quality keep the result ineligible.
+                # Preserve the exact candidate and opinion so recovery can
+                # refresh this bounded review without rebuilding the world.
                 review_warning = world_semantics.generation_warning(
                     review, wp, ws, task_input=task_input)
-                run.log("  ⚠ 世界审阅未认证当前候选；候选带待补审警告继续生产，正式发布资格保持关闭")
+                run.log("  ⚠ 世界审阅未认证当前候选；候选带待补审警告继续生产")
                 break
             if not truth_repair:
                 run.log("  ↻ 公开信息安排需要返修；保留世界真值，返回原作者重拟安排并复核")
@@ -438,10 +436,9 @@ def _stage_world_once(run: Run):
                                   "max_calls": repair_call_limit}, **agent_options)
             except Exception as exc:
                 # The review already left us a complete candidate and a
-                # release-blocking opinion.  A failed optional repair must not
+                # review opinion. A failed optional repair must not
                 # discard those artifacts or terminate the remaining factory.
-                # Preserve the exact pre-repair candidate; 07_quality will keep
-                # it ineligible through the bound generation warning.
+                # Preserve the exact pre-repair candidate for bounded recovery.
                 repair_failure = {
                     "version": "world-repair-failure/v1", "status": "error",
                     "release_eligible": False,
@@ -455,7 +452,7 @@ def _stage_world_once(run: Run):
                 review_warning = world_semantics.generation_warning(
                     review, wp, ws, task_input=task_input)
                 run.log(f"  ⚠ 世界有限返修未完成:{type(exc).__name__}: {str(exc)[:160]}；"
-                        "保留返修前候选和审阅意见，继续后续生产并关闭发布资格")
+                        "保留返修前候选和审阅意见，继续后续生产")
                 break
             finally:
                 if repaired_draft:
@@ -515,12 +512,7 @@ def _business_work_plan_context(run: Run):
 
 
 def _release_current_world_review(run: Run, wp, ws, task) -> bool:
-    """A recoverable execution warning permits progress, never certification.
-
-    Disclosure recovery must refresh an errored/warned opinion before grounding.
-    Exact warning bindings remain useful evidence for recovery, but accepting one
-    here would guarantee that the later release gate rejects the run.
-    """
+    """Require a current successful world review before per-question review."""
     from pipeline import world_semantics
     if (run.has(world_semantics.WARNING_ARTIFACT)
             or not run.has(world_semantics.REVIEW_ARTIFACT)):
@@ -1233,27 +1225,15 @@ def stage_grounding(run: Run):
         run.write(REVIEW_ARTIFACT, semantic)
         run.write("06_grounding_report.json", report)
         if not report["delivery_safe"]:
-            # Keep the full review trace and continue to the release stage.
-            # An unavailable reviewer can withhold candidates; it cannot erase
-            # the completed questions/corpus or abort the production run.
+            # Keep the full trace and the questions that already have complete
+            # per-item certification. Unfinished candidates stay pending; an
+            # execution fault in a later item must not erase earlier decisions.
             report["provisional_before_delivery_validation"] = {
                 "overall": deepcopy(report.get("overall", {})),
                 "by_line": deepcopy(report.get("by_line", {})),
                 "by_capability": deepcopy(report.get("by_capability", {})),
                 "candidate_count": len(kept)}
-            kept = []
-            for group in ("overall",):
-                if isinstance(report.get(group), dict):
-                    report[group]["grounded"] = 0
-                    report[group]["survival"] = 0.0
-            for group in ("by_line", "by_capability"):
-                for row in (report.get(group) or {}).values():
-                    if isinstance(row, dict):
-                        row["grounded"] = 0
-                        row["survival"] = 0.0
-            report["n_pending"] = max(int(report.get("n_pending", 0) or 0),
-                                      int((report.get("overall") or {}).get("n", 0) or 0))
-            run.log("  ⚠ 公开题目审阅执行未形成安全交付集；保留候选与完整记录，继续生成最终质量报告")
+            run.log("  ⚠ 逐题审阅发生执行故障；保留已完成认证的题，其余题保持待审")
     else:
         kept, report = run_grounding(questions, corpus_obj)
     from pipeline import order_warning
@@ -1301,7 +1281,7 @@ def stage_grounding(run: Run):
 
 
 def stage_quality(run: Run):
-    """Release is separate from generation completion and mechanical grounding."""
+    """Summarize and bind the per-question decisions produced by grounding."""
     from pipeline.quality import evaluate_release
     if (run.read(ART["whitepaper"]).get("seed_contract") or {}).get("schema_version") == 2:
         from pipeline.seed_lineage import ARTIFACT as lineage_artifact, seed_lineage_report
@@ -1311,11 +1291,17 @@ def stage_quality(run: Run):
     run.set_algo(quality={"version": report["version"], "status": report["status"],
                           "eligible": report["eligible"], "scope": report["scope"],
                           "issue_count": len(report["issues"])})
+    counts = ((report.get("checks") or {}).get("partition") or {}).get("counts") or {}
     if not report["eligible"]:
         codes = list(dict.fromkeys(issue["code"] for issue in report["issues"]))
-        run.log(f"  ⚠ 端到端生产已完成，发布资格暂未通过:{codes}；候选、审阅记录和质量报告均已落盘")
+        if codes:
+            run.log(f"  ⚠ 逐题结果汇总失败:{codes}；全部候选和审阅记录仍已落盘")
+        else:
+            run.log("  ⓘ 逐题结果已收口，可用题为 0；淘汰和待审记录均已保留")
         return
-    run.log(f"  ✓ 发布资格通过:{report['checks']['coverage']['final_count']} 题；输入与检查版本已绑定")
+    run.log("  ✓ 逐题结果已收口:"
+            f"可用 {counts.get('released', 0)}，淘汰 {counts.get('rejected', 0)}，"
+            f"待审 {counts.get('pending_review', 0)}，范围排除 {counts.get('scoped_excluded', 0)}")
 
 
 def _quality_is_current(run: Run) -> bool:

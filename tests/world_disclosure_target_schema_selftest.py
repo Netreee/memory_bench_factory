@@ -3,9 +3,14 @@ from copy import deepcopy
 import json
 import socket
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path[:0] = [str(ROOT), str(ROOT / "tests")]
+
 from pipeline import world_semantics as review
 from world_disclosure_record_review_selftest import planned, opinion
 from world_semantics_selftest import fixture, positive, FakeTracer

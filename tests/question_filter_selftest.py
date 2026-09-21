@@ -541,6 +541,7 @@ class DerivedReleaseTest(unittest.TestCase):
         target = {"min_questions": floor, "per_line_min": {"L1_timeline": floor}, "requested_questions": 2}
         artifacts = {"01_whitepaper.json": wp, "02_world.json": ws.to_dict(), "04_questions.json": source,
                      "06_grounded_questions.json": final, "05_corpus.json": {"corpus": {"sessions": sessions}},
+                     "06_grounding_report.json": {"drops": [], "pending": []},
                      "00_about.json": {}, "manifest.json": {"status": "done", "algo": {"targetspec": target}}}
         for name, content in artifacts.items():
             (directory / name).write_text(json.dumps(content, ensure_ascii=False), encoding="utf-8")
@@ -567,15 +568,16 @@ class DerivedReleaseTest(unittest.TestCase):
             manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
             self.assertEqual(manifest["algo"]["targetspec"], target)
             for name in INPUTS:
-                if name != "06_grounded_questions.json":
+                if name not in ("06_grounded_questions.json", "06_grounding_report.json"):
                     self.assertEqual((out / name).read_bytes(), (source / name).read_bytes())
+            routing = json.loads((out / "06_grounding_report.json").read_text(encoding="utf-8"))
+            self.assertEqual(len(routing["scoped_excluded"]), 1)
             self.assertNotEqual((out / "07_release.json").read_bytes(), old_receipt)
             expected_hash = hashlib.sha256(old_receipt).hexdigest()
             self.assertIn({"path": str((source / "07_release.json").resolve()), "sha256": expected_hash},
                           manifest["derived_from"]["input_files"])
 
-    def test_research_results_cannot_upgrade_even_with_released_source(self):
-        """A passing source receipt cannot wash away a result's research scope."""
+    def test_research_scope_stays_in_export_receipt_without_changing_question_partition(self):
         from pipeline.quality import require_release, evaluate_release
         for mode in ("row", "aggregate", "system-envelope", "system-file", "empty-research-system"):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as tmp:
@@ -628,8 +630,9 @@ class DerivedReleaseTest(unittest.TestCase):
                 self.assertTrue(manifest["release_policy"]["inherited_research_only"])
                 self.assertTrue(manifest["derived_from"]["source_release_eligible"])
                 self.assertEqual(manifest["derived_from"]["source_result_scope"], "research_only")
-                # Re-running the ordinary release checker cannot upgrade it.
-                self.assertFalse(evaluate_release(output)["eligible"])
+                # Recomputing stage 07 reads question statuses only. The
+                # research-use warning remains in the export receipt/report.
+                self.assertTrue(evaluate_release(output)["eligible"])
 
     def test_floor_violation_warns_and_empty_subset_fails_release(self):
         from pipeline.quality import require_release, ReleaseError
@@ -661,7 +664,7 @@ class DerivedReleaseTest(unittest.TestCase):
                 else:
                     self.assertTrue(require_release(out / "06_grounded_questions.json")["eligible"])
 
-    def test_research_source_cannot_upgrade_on_export_or_recheck(self):
+    def test_research_source_warning_is_separate_from_question_usability(self):
         from pipeline.quality import require_release, evaluate_release, ReleaseError
         with tempfile.TemporaryDirectory() as tmp:
             source = Path(tmp)
@@ -675,12 +678,10 @@ class DerivedReleaseTest(unittest.TestCase):
             self.assertTrue(manifest["release_policy"]["inherited_research_only"])
             self.assertNotIn(manifest["status"], ("rejected", "manual_failed"))
             repeated = evaluate_release(out)
-            self.assertFalse(repeated["eligible"])
-            self.assertIn("unverified_source_derivation", {issue["code"] for issue in repeated["issues"]})
-            self.assertNotIn("explicit_semantic_rejection", {issue["code"] for issue in repeated["issues"]})
+            self.assertTrue(repeated["eligible"])
+            self.assertEqual(repeated["issues"], [])
             (out / "07_release.json").write_text(json.dumps(repeated), encoding="utf-8")
-            with self.assertRaises(ReleaseError):
-                require_release(out / "06_grounded_questions.json")
+            self.assertTrue(require_release(out / "06_grounded_questions.json")["eligible"])
 
 
 if __name__ == "__main__":

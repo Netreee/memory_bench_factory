@@ -8,13 +8,13 @@ export type QualitySnapshot = {
 };
 
 export function unverifiedQuality(): QualitySnapshot {
-  return { version: 1, status: 'not_run', eligible: false, scope: [], checks: {}, issues: [] };
+  return { version: 2, status: 'not_run', eligible: false, scope: [], checks: {}, issues: [] };
 }
 
 export function qualityLabel(quality: QualitySnapshot | undefined): string {
-  if (!quality) return '未验收';
-  if (quality.status === 'passed' && quality.eligible === true) return '合格';
-  return { not_run: '未验收', passed: '未取得发布资格', failed: '未通过', stale: '验收已失效' }[quality.status] ?? '未验收';
+  if (!quality) return '未汇总';
+  if (quality.status === 'passed' && quality.eligible === true) return '已有可用题';
+  return { not_run: '未汇总', passed: '无可用题', failed: '汇总失败', stale: '汇总已失效' }[quality.status] ?? '未汇总';
 }
 
 export function formatCount(value: number | null | undefined): string {

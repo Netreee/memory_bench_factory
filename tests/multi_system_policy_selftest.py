@@ -289,16 +289,20 @@ class GroundingExecutionBoundary(unittest.TestCase):
 
     def release(self, kept, review):
         with tempfile.TemporaryDirectory() as directory:
+            from pipeline.grounding_review import candidates_with_evidence, selection
+            candidates = candidates_with_evidence(self.questions, self.corpus)
+            _, routing = selection(candidates, review)
             artifacts = {"01_whitepaper.json": self.wp, "02_world.json": self.world.to_dict(),
                 "04_questions.json": self.questions, "05_corpus.json": self.corpus,
                 "06_grounded_questions.json": kept,
+                "06_grounding_report.json": routing,
                 "00_about.json": {"answer_protocol": self.fx.ANSWER_PROTOCOL},
                 "06_semantic_review.json": review}
             for name, value in artifacts.items():
                 (Path(directory) / name).write_text(json.dumps(value, ensure_ascii=False), encoding="utf-8")
             return self.fx.evaluate_release(directory)
 
-    def test_partial_call_budget_cannot_receive_complete_release(self):
+    def test_partial_call_budget_releases_only_completed_question(self):
         from pipeline.grounding_review import execution_complete
         kept, routing, review = self.fx.review_grounding(self.questions, self.corpus, self.protocol,
             chat_json=self.fx.opinions(), model="test", max_calls=2)
@@ -307,10 +311,10 @@ class GroundingExecutionBoundary(unittest.TestCase):
         self.assertFalse(routing["execution_stopped"])
         self.assertEqual(routing["caller_invocations"], 2)
         result = self.release(kept, review)
-        self.assertFalse(result["eligible"], result)
-        self.assertTrue(any("execution" in issue["code"] for issue in result["issues"]), result["issues"])
+        self.assertTrue(result["eligible"], result)
+        self.assertEqual(result["checks"]["partition"]["counts"]["pending_review"], 1)
 
-    def test_provider_failure_cannot_resurrect_matching_old_final_file(self):
+    def test_provider_failure_keeps_matching_completed_subset(self):
         old_final, _, _ = self.fx.review_grounding(self.questions[:1], self.corpus, self.protocol,
             chat_json=self.fx.opinions(), model="test")
         script = self.fx.opinions()
@@ -321,8 +325,8 @@ class GroundingExecutionBoundary(unittest.TestCase):
         self.assertTrue(routing["execution_stopped"])
         self.assertEqual(routing["caller_invocations"], 3)
         result = self.release(old_final, review)
-        self.assertFalse(result["eligible"], result)
-        self.assertTrue(any("execution" in issue["code"] for issue in result["issues"]), result["issues"])
+        self.assertTrue(result["eligible"], result)
+        self.assertEqual(result["checks"]["partition"]["counts"]["pending_review"], 1)
 
     def test_complete_semantic_unknown_is_not_an_execution_failure(self):
         from pipeline.grounding_review import execution_complete
@@ -412,6 +416,7 @@ class GroundingExecutionBoundary(unittest.TestCase):
             artifacts = {"01_whitepaper.json": self.wp, "02_world.json": self.world.to_dict(),
                 "04_questions.json": self.questions, "05_corpus.json": self.corpus,
                 "06_grounded_questions.json": final, "06_semantic_review.json": review,
+                "06_grounding_report.json": {"drops": [], "pending": []},
                 "00_about.json": {"answer_protocol": self.fx.ANSWER_PROTOCOL}}
             for name, value in artifacts.items():
                 (source / name).write_text(json.dumps(value, ensure_ascii=False), encoding="utf-8")
@@ -437,7 +442,7 @@ class GroundingExecutionBoundary(unittest.TestCase):
             manifest["derived_from"]["semantic_review"]["sha256"] = "0" * 64
             (exported / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
             altered = self.fx.evaluate_release(exported)
-            self.assertTrue(any(i["code"] == "semantic_filter_derivation_mismatch" for i in altered["issues"]), altered)
+            self.assertTrue(altered["eligible"], altered)
 
 
 if __name__ == "__main__":

@@ -15,7 +15,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT), str(ROOT / 'tests')]
 from original_grounding_selftest import fixture, opinions, ANSWER_PROTOCOL
-from isolated_workflow_selftest import audit_output, attach_targets
+from semantic_review_fixture_helpers import audit_output, attach_targets
 from pipeline import grounding_review as gr, quality, factory
 
 
@@ -89,16 +89,19 @@ class IsolationTests(unittest.TestCase):
 
     def release(self, kept, review, target=None, *, derived=False):
         with tempfile.TemporaryDirectory() as td:
+            candidates = gr.candidates_with_evidence(self.questions, self.corpus, isolated_reference=True)
+            source_final, routing = gr.selection(candidates, review)
+            selected = {q['qid'] for q in kept}
+            routing['scoped_excluded'] = [q['qid'] for q in source_final if q['qid'] not in selected]
             artifacts = {'01_whitepaper.json': self.wp, '02_world.json': self.ws.to_dict(),
                 '04_questions.json': self.questions, '05_corpus.json': self.corpus,
                 '06_grounded_questions.json': kept, '06_semantic_review.json': review,
+                '06_grounding_report.json': routing,
                 '00_about.json': {'answer_protocol': ANSWER_PROTOCOL},
                 'manifest.json': {'algo': {'targetspec': target or {}}}}
             for name, value in artifacts.items():
                 (Path(td) / name).write_text(json.dumps(value, ensure_ascii=False), encoding='utf-8')
             if derived:
-                candidates = gr.candidates_with_evidence(self.questions, self.corpus, isolated_reference=True)
-                source_final, _ = gr.selection(candidates, review)
                 artifacts['manifest.json']['derived_from'] = {'operation': 'filter_all_selected_systems_correct',
                     'semantic_review': {'artifact': gr.REVIEW_ARTIFACT,
                         'sha256': hashlib.sha256((Path(td) / gr.REVIEW_ARTIFACT).read_bytes()).hexdigest(),
@@ -116,8 +119,9 @@ class IsolationTests(unittest.TestCase):
         gr.validate_current_review(kept, self.corpus, self.protocol, review)
         result = self.release(kept, review)
         self.assertTrue(result['eligible'], result['issues'])
-        self.assertEqual(result['checks']['public_semantics']['overall']['n'], 5)
-        self.assertEqual(result['checks']['semantic_review_delivery']['selected_count'], 3)
+        self.assertEqual(result['checks']['partition']['source_count'], 5)
+        self.assertEqual(result['checks']['partition']['counts'], {
+            'released': 3, 'rejected': 0, 'pending_review': 2, 'scoped_excluded': 0})
         self.assertEqual(review, original)
         self.assertEqual(len(review['items']), 5); self.assertEqual(len(script.calls), 15)
 
@@ -208,11 +212,11 @@ class IsolationTests(unittest.TestCase):
         self.assertEqual(manifest['algo']['grounding']['n_pending'], 2)
         self.assertEqual(manifest['algo']['met_status'], 'MET')
 
-    def test_provider_failure_stops_calls_and_rejects_even_prior_certified_subset(self):
+    def test_provider_failure_stops_calls_and_keeps_prior_certified_subset(self):
         kept, report, review, script = self.run_review({1: 'provider'})
         self.assertEqual(len(kept), 1); self.assertTrue(report['execution_stopped'])
         self.assertEqual(len(script.calls), 4)
-        self.assertFalse(report['delivery_safe']); self.assertFalse(self.release(kept, review)['eligible'])
+        self.assertFalse(report['delivery_safe']); self.assertTrue(self.release(kept, review)['eligible'])
 
     def test_global_audit_failure_cannot_deliver(self):
         _, _, review, _ = self.run_review({1: 'audit_format'})
@@ -280,7 +284,8 @@ class IsolationTests(unittest.TestCase):
         report = self.release(kept[:2], review, derived=True)
         self.assertTrue(report['eligible'], report['issues'])
         self.assertEqual(review, original)
-        self.assertEqual(report['checks']['public_semantics']['overall']['n'], 5)
+        self.assertEqual(report['checks']['partition']['source_count'], 5)
+        self.assertEqual(report['checks']['partition']['counts']['scoped_excluded'], 1)
         self.assertEqual(report['checks']['coverage']['final_count'], 2)
 
     def test_budget_or_unknown_stage_is_not_a_format_failure(self):

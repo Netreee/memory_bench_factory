@@ -204,18 +204,6 @@ class BatchTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             batch.concurrency_limit(directory, plan)
 
-    def test_automatic_pass_with_independent_rejection_has_no_eligible_yield(self):
-        directory, _ = self.prepare("--seeds", "insurance")
-        def reject(run):
-            batch.write(run / "08_semantic_review.json", {"review_status": "failed"})
-        report = batch.execute(directory, launcher=self.fake(eligible=True, after=reject))
-        self.assertEqual("completed", report["status"])
-        self.assertEqual(1, report["recorded_quality_eligible"])
-        self.assertEqual(0, report["current_quality_eligible"])
-        self.assertEqual(0, report["quality_eligible_question_count"])
-        quality = report["runs"][0]["artifacts"]["quality"]
-        self.assertFalse(quality["eligible"])
-        self.assertEqual("explicit_semantic_rejection", quality["issues"][0]["code"])
 
     def test_incomplete_automatic_receipt_does_not_certify_questions(self):
         directory, _ = self.prepare("--seeds", "insurance")
@@ -340,65 +328,7 @@ class PublicPoolTests(unittest.TestCase):
         pool = gather_evidence(q, {s["session_id"]: s for s in corpus["sessions"]})
         self.assertEqual(["early"], [d["doc_id"] for d in pool])
 
-    def test_original_release_accepts_delayed_pool_and_rejects_trimmed_pool(self):
-        sys.path.insert(0, str(ROOT / "tests"))
-        from original_grounding_selftest import fixture, Scripted, blind, adjudication, ANSWER_PROTOCOL
-        from pipeline.corpus_contract import review_documents, attach_receipts, fidelity_requirements
-        from corpus_fixture_helpers import fixed_positive_review
-        from pipeline.grounding_review import review_grounding
-        from pipeline.quality import evaluate_release
-        with patch.object(socket, "socket", side_effect=AssertionError("network forbidden")):
-            wp, ws, q, corpus, protocol = fixture()
-            ws.n_sessions = 2
-            later = [{"doc_id": "later_retrospective", "content": "本期回顾：第1期测试报告的客户就是北溟保险。",
-                      "is_filler": False}]
-            class Reviewer:
-                def chat_json(self, *a, **kw):
-                    return fixed_positive_review(a[1])
-            attach_receipts(later, review_documents(Reviewer(), ws, 1, later,
-                            requirements=fidelity_requirements(ws, 1)), 1)
-            corpus["corpus"]["sessions"].append({"session_id": 1, "date": "2025-01-13", "docs": later})
-            b, a = blind(), adjudication(reference_status="supported", concerns=[],
-                review_findings={"substantive_defects": [], "acceptable_brevity": [], "editorial_suggestions": []})
-            for opinion in (b, a):
-                opinion["coverage"]["inspected_doc_ids"] = ["d000001", "d000002"]
-            kept, _, review = review_grounding([q], corpus, protocol, chat_json=Scripted(b, a), model="test")
-            self.assertEqual(["doc0", "later_retrospective"], kept[0]["candidate_evidence_doc_ids"])
-            self.assertEqual([0], q["evidence_sessions"])
-            with tempfile.TemporaryDirectory(prefix="grounding_release_offline_") as temporary:
-                directory = Path(temporary)
-                artifacts = {"01_whitepaper.json": wp, "02_world.json": ws.to_dict(), "04_questions.json": [q],
-                    "05_corpus.json": corpus, "06_grounded_questions.json": kept,
-                    "00_about.json": {"answer_protocol": ANSWER_PROTOCOL}, "06_semantic_review.json": review}
-                for name, value in artifacts.items():
-                    batch.write(directory / name, value)
-                result = evaluate_release(directory)
-                self.assertTrue(result["eligible"], result["issues"])
-                kept[0]["candidate_evidence_doc_ids"] = ["doc0"]
-                batch.write(directory / "06_grounded_questions.json", kept)
-                result = evaluate_release(directory)
-                self.assertFalse(result["eligible"])
-                self.assertIn("stale_candidate_evidence_pool", [issue["code"] for issue in result["issues"]])
 
-    def test_release_cannot_disable_required_disclosure_review(self):
-        sys.path.insert(0, str(ROOT / "tests"))
-        from original_grounding_selftest import fixture, opinions, ANSWER_PROTOCOL
-        from pipeline.grounding_review import review_grounding
-        from pipeline.quality import evaluate_release
-        with patch.object(socket, "socket", side_effect=AssertionError("network forbidden")):
-            wp, ws, q, corpus, protocol = fixture()
-            kept, _, review = review_grounding([q], corpus, protocol, chat_json=opinions(), model="test")
-            wp["quality_contract"].update(public_disclosure=True, world_semantic_review=False)
-            with tempfile.TemporaryDirectory(prefix="disclosure_release_offline_") as temporary:
-                directory = Path(temporary)
-                artifacts = {"01_whitepaper.json": wp, "02_world.json": ws.to_dict(), "04_questions.json": [q],
-                    "05_corpus.json": corpus, "06_grounded_questions.json": kept,
-                    "00_about.json": {"answer_protocol": ANSWER_PROTOCOL}, "06_semantic_review.json": review}
-                for name, value in artifacts.items():
-                    batch.write(directory / name, value)
-                result = evaluate_release(directory)
-                self.assertFalse(result["eligible"])
-                self.assertIn("disclosure_requires_world_semantic_review", [issue["code"] for issue in result["issues"]])
 
 
 class RealDryCliTests(unittest.TestCase):

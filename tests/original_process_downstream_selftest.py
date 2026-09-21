@@ -18,10 +18,10 @@ sys.path[:0] = [str(ROOT), str(ROOT / 'tests')]
 from eval import judge, grading, multi_system, semantic_judge
 from eval.answer_task_review import POLICY_VERSION, append_scoring_policy
 from eval.provenance import reference_hash
-from pipeline import grounding_review, quality
+from pipeline import grounding_review
 from pipeline.semantic_review import review_questions, prepare_review
 from semantic_judge_selftest import grade_output
-from structured_reference_workflow_selftest import StructuredScript
+from structured_review_fixture_helpers import StructuredScript
 
 PROTOCOL = append_scoring_policy('仅依据这些公开材料。')
 CORPUS = {'world': 'PRIVATE_CORPUS_WORLD', 'sessions': [{'session_id': 0, 'date': '2025-01-01',
@@ -74,28 +74,7 @@ class Tests(unittest.TestCase):
         self.assertEqual(judge.judge_spec(q)[0], 'order')
         self.assertTrue(judge.is_judgeable(q))
 
-    def test_quality_route_requires_three_declared_gates_and_exact_policy(self):
-        q = question()
-        self.assertTrue(quality._scoring_contract_supported(q, WP, PROTOCOL))
-        for key in WP['quality_contract']:
-            wp = deepcopy(WP); del wp['quality_contract'][key]
-            with self.subTest(key=key):
-                self.assertFalse(quality._scoring_contract_supported(q, wp, PROTOCOL))
-        self.assertFalse(quality._scoring_contract_supported(q, WP, '未声明 A 政策'))
 
-    def test_quality_route_rejects_swapped_reference_witness_and_wrong_scorer(self):
-        for part, key, value in [
-            ('aux', 'scorer', 'kendall_tau'),
-            ('aux', 'gt_scope', 'natural_answer'),
-            ('question_contract', 'gold', question()['gt']),
-            ('question_contract', 'canonical_witness', {'different': 1}),
-            ('question_contract', 'reference_proposal', {'answer': 'changed', 'rationale': ''}),
-            ('question_contract', 'reference_authority', 'proven'),
-            ('question_contract', 'answer_kind', 'order'),
-        ]:
-            q = question(); q[part][key] = value
-            with self.subTest(part=part, key=key):
-                self.assertFalse(quality._scoring_contract_supported(q, WP, PROTOCOL))
 
     def test_grounding_never_fills_missing_reference_from_private_witness(self):
         q = question(); del q['reference_proposal']
@@ -169,14 +148,6 @@ class Tests(unittest.TestCase):
         self.assertEqual(after['verdict'], 'uncertain')
         self.assertEqual(len(calls), 1)
 
-    def test_route_admission_alone_is_not_a_semantic_release(self):
-        q = question()
-        self.assertTrue(quality._scoring_contract_supported(q, WP, PROTOCOL))
-        pending = prepare_review([q], CORPUS, PROTOCOL, reviewer_model='offline', reference_auditor_model='offline')
-        self.assertFalse(grounding_review.execution_complete(pending))
-        kept, report = grounding_review.selection([q], pending)
-        self.assertEqual(kept, [])
-        self.assertEqual(report['n_pending'], 1)
 
 
 if __name__ == '__main__':

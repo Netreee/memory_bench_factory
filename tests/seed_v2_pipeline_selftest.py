@@ -99,41 +99,8 @@ class SeedV2PipelineTests(unittest.TestCase):
             self.assertEqual((self.source / name).read_bytes(), (target / name).read_bytes())
             self.assertIn(name, result["derived_from"]["input_files"])
 
-    def test_release_binds_snapshots_and_rejects_tamper_before_world(self):
-        self.assertTrue({SEED_ARTIFACT, AUDIT_ARTIFACT, GENERATION_ARTIFACT, "00_input.json"}
-                        <= set(_release_inputs(self.source)))
-        for name in INPUTS:
-            if not self.run.has(name):
-                self.write(name, {})
-        self.write(AUDIT_ARTIFACT, {})
-        with patch("pipeline.world_state.WorldState.from_dict", side_effect=AssertionError("world must not run")):
-            result = evaluate_release(self.source)
-        self.assertFalse(result["eligible"])
-        self.assertIn("snapshot changed", result["issues"][0]["message"])
 
-    def test_release_missing_snapshot_has_clear_issue(self):
-        (self.source / GENERATION_ARTIFACT).unlink()
-        result = evaluate_release(self.source)
-        self.assertIn({"code": "missing_release_input", "artifact": GENERATION_ARTIFACT}, result["issues"])
 
-    def test_release_cache_rechecks_manifest_seed_identity(self):
-        from pipeline.quality import (VERSION, _delivery_contract, file_hash,
-                                      implementation_fingerprint, quality_snapshot)
-        for name in INPUTS:
-            if not self.run.has(name):
-                self.write(name, {})
-        receipt = {"version": VERSION, "status": "passed", "eligible": True, "scope": ["fixture"],
-            "checks": {key: {} for key in ("seed_structure", "question_contracts", "world_answers", "corpus",
-                "grounding", "coverage", "seed_input_identity")}, "issues": [],
-            "inputs": {name: file_hash(self.source / name) for name in _release_inputs(self.source)},
-            "delivery_contract": _delivery_contract(self.source),
-            "implementation_fingerprint": implementation_fingerprint()}
-        self.write("07_release.json", receipt)
-        self.assertTrue(quality_snapshot(self.source)["eligible"])
-        self.manifest["config"]["seed_id"] = "different_seed"
-        self.write("manifest.json", self.manifest)
-        self.assertEqual(quality_snapshot(self.source)["status"], "stale")
-        self.assertFalse(quality_snapshot(self.source)["eligible"])
 
     def test_filtered_bundle_retains_private_seed_identity(self):
         from eval.question_filter import export_filtered_benchmark

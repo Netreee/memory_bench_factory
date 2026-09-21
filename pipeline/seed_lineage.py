@@ -1,7 +1,7 @@
 """Offline seed uptake diagnostics from the original pipeline's saved records.
 
 This report has no model calls and cannot certify causal reasoning or quality.
-The original release gate remains the authority for publishing a benchmark.
+Per-question stage-06 decisions remain authoritative for the usable subset.
 """
 from __future__ import annotations
 

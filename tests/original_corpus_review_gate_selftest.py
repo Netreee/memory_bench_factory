@@ -70,7 +70,8 @@ class CorpusReviewGateTests(unittest.TestCase):
                 self.calls.append(name)
                 run.write(artifact, {"fixture_current": True, "written_by": name})
             stages.append(replace(stage, fn=work,
-                                  is_current=(lambda _: True) if stage.name == "quality" else stage.is_current))
+                                  is_current=(lambda _: True)
+                                  if stage.name in ("disclosure", "quality") else stage.is_current))
             if not self.run.has(stage.artifact):
                 self.run.write(stage.artifact, {})
             self.run.mark(stage.name, stage.artifact, 0)

@@ -17,7 +17,6 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT), str(ROOT / "tests")]
 from pipeline import disclosure as d, disclosure_batches as batch, factory, world_semantics
 from pipeline.world_state import WorldState, Timeline, Op, SET
-from pipeline.world_blueprint import WorldBlueprintError
 from disclosure_selftest import data
 from world_agent_factory_selftest import LocalRun
 from world_scoped_agents_selftest import ScopedAgentFixture
@@ -325,7 +324,7 @@ class Tests(unittest.TestCase):
         for key in ("records", "catalogue", "undisclosed", "raw_output"):
             self.assertEqual(projected["disclosure"][key], original["disclosure"][key])
 
-    def test_final_negative_original_semantic_review_still_blocks_publication(self):
+    def test_negative_review_is_preserved_as_recoverable_world_warning(self):
         from world_semantics_selftest import fixture
         self.wp["seed_contract"] = fixture()[0]["seed_contract"]
         with tempfile.TemporaryDirectory() as directory:
@@ -337,9 +336,9 @@ class Tests(unittest.TestCase):
             run.tracer = Combined()
             with patch.object(factory, "validate_seed_identity"), patch.object(factory, "validate_seed_world", return_value={"passed": True}), \
                  patch.object(factory, "build_world", return_value=self.ws), patch.object(factory, "_prepare_lines"):
-                with self.assertRaises(WorldBlueprintError):
-                    factory.stage_world(run)
-            self.assertFalse(run.has("02_world.json"))
+                factory.stage_world(run)
+            self.assertTrue(run.has("02_world.json"))
+            self.assertTrue(run.has(world_semantics.WARNING_ARTIFACT))
             result = run.read("02_world_review_attempts.json")["attempts"][-1]
             self.assertEqual(result["status"], "unresolved", result.get("error"))
             self.assertTrue(list(run.dir.glob("02_disclosure_checkpoint_*.json")))

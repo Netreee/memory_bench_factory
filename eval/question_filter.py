@@ -263,7 +263,7 @@ def export_filtered_benchmark(bench: Path, results: dict[str, list[dict]], out_d
     from pipeline.grounding_review import REVIEW_ARTIFACT
     for name, supplied in (("01_whitepaper.json", None), ("02_world.json", None),
                            ("04_questions.json", None), ("05_corpus.json", corpus), ("00_about.json", about),
-                           (REVIEW_ARTIFACT, None)):
+                           ("06_grounding_report.json", None), (REVIEW_ARTIFACT, None)):
         path = Path(supplied) if supplied is not None else bench.parent / name
         if supplied is not None or path.exists():
             if not path.is_file():
@@ -388,6 +388,30 @@ def export_filtered_benchmark(bench: Path, results: dict[str, list[dict]], out_d
     def write_json(name, value):
         (out_dir / name).write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
+    source_candidates = (_read_json(copies["04_questions.json"])
+                         if "04_questions.json" in copies else deepcopy(questions))
+    if "04_questions.json" not in copies:
+        write_json("04_questions.json", source_candidates)
+    source_routing = (_read_json(copies["06_grounding_report.json"])
+                      if "06_grounding_report.json" in copies else {
+                          "drops": [],
+                          "pending": [{"qid": row.get("qid"), "reason": "legacy_source_status_unknown"}
+                                      for row in source_candidates
+                                      if row.get("qid") not in {q.get("qid") for q in questions}],
+                      })
+    if not isinstance(source_routing, dict):
+        raise ValueError("源 06_grounding_report.json 必须为对象")
+    source_released = {q.get("qid") for q in questions}
+    filtered_qids = {q.get("qid") for q in filtered}
+    existing_excluded = source_routing.get("scoped_excluded") or []
+    if not isinstance(existing_excluded, list):
+        raise ValueError("源 scoped_excluded 必须为数组")
+    source_routing["scoped_excluded"] = list(dict.fromkeys([
+        *existing_excluded,
+        *(q.get("qid") for q in questions
+          if q.get("qid") in source_released - filtered_qids),
+    ]))
+    write_json("06_grounding_report.json", source_routing)
     write_json("manifest.json", manifest)
     receipt = evaluate_release(out_dir)
     receipt["derived_from"] = provenance

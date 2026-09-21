@@ -46,19 +46,6 @@ class DisclosureGateTests(unittest.TestCase):
         self.assertEqual(self.run.read('02_world.json')['disclosure']['test_marker'], 'planned')
         self.assertEqual(len(self.run.read('02_disclosure_plan_attempts.json')['attempts']), 1)
 
-    def test_plan_execution_failure_cannot_publish_or_enter_business_repair(self):
-        previous = candidate('published').to_dict()
-        self.run.write('02_world.json', previous)
-        with patch.object(factory, 'build_world', side_effect=self.builder) as build, \
-             patch.object(factory, '_prepare_lines'), \
-             patch.object(disclosure, 'author_plan', return_value={'status': 'error', 'error': 'offline'}), \
-             patch.object(world_semantics, 'review_world') as review:
-            with self.assertRaises(WorldBlueprintError):
-                factory.stage_world(self.run)
-        self.assertEqual(build.call_count, 1)
-        review.assert_not_called()
-        self.assertEqual(previous, self.run.read('02_world.json'))
-        self.assertEqual(self.run.read('02_disclosure_plan_attempts.json')['attempts'][0]['status'], 'error')
 
     def test_original_repair_replans_the_changed_world_and_reviews_it_again(self):
         values = []

@@ -233,7 +233,7 @@ class Tests(unittest.TestCase):
         self.assertEqual(len(prepared["documents"]), 4)
 
     def test_long_corpus_paging_replays_all_three_original_roles_and_cache(self):
-        from isolated_workflow_selftest import audit_output, attach_targets
+        from semantic_review_fixture_helpers import audit_output, attach_targets
         _, _, q, corpus, protocol = fixture()
         corpus["corpus"]["sessions"][0]["docs"][0]["content"] += "无关公开材料。" * 20000
         calls = []

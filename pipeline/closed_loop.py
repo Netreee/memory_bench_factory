@@ -606,7 +606,7 @@ def build_to_target(run: Run, spec: TargetSpec, max_rounds: int = 2, order_subro
     except Exception as exc:
         # A later supply/review round may fail after a complete earlier set
         # already exists.  Stop scheduling provider work, retain those exact
-        # artifacts, and still execute the read-only release gate.
+        # artifacts, and still execute the read-only result summary.
         required = (ART["world"], ART["questions"], ART["corpus"], ART["grounding"])
         if not all(run.has(name) for name in required):
             raise
@@ -631,7 +631,7 @@ def build_to_target(run: Run, spec: TargetSpec, max_rounds: int = 2, order_subro
             },
         })
         run.log(f"║  ⚠ 后续生产轮执行失败:{type(exc).__name__}: {str(exc)[:160]}；"
-                "停止新增调用，保留现有候选并继续生成失败的最终质量报告")
+                "停止新增调用，保留现有候选并继续生成最终结果汇总")
 
 
     if not met:
@@ -641,7 +641,7 @@ def build_to_target(run: Run, spec: TargetSpec, max_rounds: int = 2, order_subro
                                                         else f"UNMET: {unmet}")})
         _update_run_metadata(
             run, config_remove=("augment", "render_only", "render_only_pairs"))
-        run.log(f"╚═ ⚠ 生产轮次已走完，合格题目标仍有缺口:{unmet}；继续生成最终质量报告并关闭发布资格。")
+        run.log(f"╚═ ⚠ 生产轮次已走完，合格题目标仍有缺口:{unmet}；继续生成最终结果汇总。")
     _update_run_metadata(
         run, config_remove=("augment", "render_only", "render_only_pairs"))       # ★清增量信号,免泄漏到后续 --only 重跑
     if production_failure is None:

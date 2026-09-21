@@ -1,72 +1,99 @@
 # memory_bench_factory
 
-记忆 benchmark 生成器:给定一个场景描述 + 少量示例文档,端到端生成一套用于评测「带记忆的 LLM / Agent」的题库(语料 + 带标准答案的问题)。标准答案由代码从一个状态机世界机械算出,不依赖 LLM 判分。
+从结构化 seed 生成长期记忆 benchmark。一个 run 依次产生领域白皮书、可执行世界、公开信息安排、问题、跨期语料和逐题质量结论。世界与语料提供可追溯事实；LLM Agent 负责生成、阅读和语义审查；程序负责阶段边界、身份绑定、断点恢复和结果汇总。
 
-## 环境
+## 最终流水线
 
-Python 3.10+,依赖很少:
+1. `seed → input`：校验并冻结 `seeds/*.json`。
+2. `whitepaper`：生成世界蓝图、证据渠道和产线能力映射，并检查业务可执行性。
+3. `world`：分步建立实体、关系、事件和时间线；每个小批次落盘，可从检查点继续。
+4. `disclosure`：确定信息何时、通过什么途径公开，并完成世界级语义审阅。
+5. `orders / well_posed`：为可支持的能力线产生候选任务，先剔除定义不清的任务。
+6. `questions`：生成题目和标准答案，对题面语义逐题检查。
+7. `corpus`：按期渲染信号文档与干扰文档，并检查正文能否支撑声明。
+8. `grounding`：逐题阅读相关语料，给出 `released`、`rejected` 或 `pending_review`；单题失败不终止其他题。
+9. `quality`：只核对逐题状态分区和产物散列，生成 `07_release.json`。它不重新判断题目语义，也不会因为题量不足或其他题被淘汰而否决已经通过的题。
 
-```bash
-python3 -m venv venv
-./venv/bin/pip install --upgrade pip
-./venv/bin/pip install openai python-dotenv httpx
-cp .env.example .env    # 填 OPENAI_API_KEY / OPENAI_BASE_URL / MODEL / LLM_CONCURRENCY
-```
+当前 seed 流程主要覆盖 L1–L8；L9、L10 需要补充相应的材料构造后再批量启用。
 
-## 运行
+## 安装
 
-```bash
-# 离线自检(不打 API)
-./venv/bin/python -m pipeline.lines
-./venv/bin/python pipeline/world_state.py
-./venv/bin/python tests/world_blueprint_selftest.py
-
-# 出一套题(打 API,先配好 .env)
-./venv/bin/python -m pipeline.factory --scenario office --min-questions 24 --target-mtokens 0.1
-```
-
-`--help` 看全部参数,`--list-runs` 看历史。产物落在 `output/runs/<run_id>/`(逐 stage 落盘,`output/` 不进 git)。
-
-## 真实任务种子 → 白皮书
-
-现有 `input → whitepaper` 支持策展种子 JSON。种子的实体、字段、关系、事件、业务对象绑定和因果要求先通过机械审查，再冻结世界蓝图和映射能力；后续世界实例化、扩量、续跑继续校验同一合同。
+Python 3.10 以上：
 
 ```bash
-# 离线检查三个种子；不读取 .env、不调用模型
-python tools/validate_seed_packs.py
-# 本地持有原件时可同时验证来源散列
-python tools/validate_seed_packs.py --verify-sources
-
-# 调用已配置的模型，先审阅白皮书
-python -m pipeline.factory --seed-pack seeds/insurance.json --to whitepaper
-# 也可替换成 seeds/legal.json 或 seeds/finance.json
-# 继续同一 run，无需再次提供原种子路径
-python -m pipeline.factory --run <run_id> --from world
+python -m venv venv
+./venv/Scripts/python -m pip install -r requirements-minimal.txt
+copy .env.example .env
 ```
 
-`--seed-pack` 与 `--scenario` 二选一。每个 run 将种子冻结为 `00_seed_pack.json`，记录来源身份并输出 `01_seed_audit.json`、`02_seed_audit.json`；已有 run 不允许换种子版本，更新包后应启动新 run。白皮书的 `seed_contract` 排除评分侧来源，结构丢失或世界实例不符合合同会明确失败。
+Linux/macOS 将解释器路径改为 `./venv/bin/python`，复制命令改为 `cp`。在 `.env` 中配置模型接口；密钥、运行输出和虚拟环境均不会进入 Git。
 
-当前实现保证种子的**可执行结构承接**；新增公式执行器、资料发布/获知的多时间语义和知识状态评分尚未实现。原任务与合成示例的边界、合同格式和三包来源见 [seeds/README.md](seeds/README.md)。
+## Seed 校验与运行
 
-种子融合程度的分层指标、保险场景实测结果，以及后续对照实验方案见 [真实任务 Seed 的融合程度与评估方法](SEED_INTEGRATION_EVALUATION.md)。本轮结构与流程检查通过，业务机制题覆盖和数据质量尚未通过验收。
+离线校验仓库内 seed：
 
 ```bash
-python tests/seed_contract_selftest.py
-python tests/seed_world_selftest.py
-python tests/seed_run_selftest.py
+./venv/Scripts/python tools/validate_seed_packs.py
 ```
 
-## World-first 白皮书
+运行单个世界：
 
-新场景先由领域架构师定义并经反方换皮评审冻结 `world_blueprint`：实体类型与字段归属、关系拓扑、领域事件及效果、因果链、时间制度、证据渠道。之后才把 L1–L10 映射到世界自然存在的结构；能力线在 typed world 中只读，不得补字段或改写时间线。显式蓝图不合法会在白皮书阶段直接失败，历史无蓝图产物才使用 legacy 适配。
+```bash
+./venv/Scripts/python -m pipeline.factory \
+  --seed-pack seeds/insurance.json \
+  --min-questions 200 \
+  --target-mtokens 0.1
+```
 
-`01_whitepaper.json` 同时保留 `world_review` 审议记录和最终可执行 `world_blueprint`，因此可以先人工判断“这个世界是不是换皮”，再批准进入 world/corpus 生成。
+查看参数和已有运行：
+
+```bash
+./venv/Scripts/python -m pipeline.factory --help
+./venv/Scripts/python -m pipeline.factory --list-runs
+```
+
+中断后使用同一个 run 继续，已完成阶段和逐题检查点会被复用：
+
+```bash
+./venv/Scripts/python -m pipeline.factory --run <run_id>
+```
+
+批量运行入口为 `tools/run_original_bc_batch.py`，小规模端到端检查入口为 `tools/run_original_bc_smoke.py`。两个入口都调用同一条生产流水线。
+
+## 主要产物
+
+运行目录位于 `output/runs/<run_id>/`：
+
+| 文件 | 内容 |
+| --- | --- |
+| `00_seed_pack.json` | 冻结后的 seed |
+| `01_whitepaper.json` | 世界蓝图、质量约定和产线映射 |
+| `02_world.json` | 实例化世界与时间线 |
+| `02_disclosure.json` | 信息公开安排 |
+| `04_questions.json` | 全部候选题与答案 |
+| `05_corpus.json` | 分期语料 |
+| `06_semantic_review.json` | 逐题 Agent 审阅证据 |
+| `06_grounding_report.json` | 通过、淘汰、待审和范围排除的分区 |
+| `06_grounded_questions.json` | 当前可直接用于评测的题目子集 |
+| `07_release.json` | 上述分区与文件身份的轻量汇总 |
+
+题量目标属于生产计划。审查会正常减少最终题量；只要逐题分区完整且至少有一道 `released` 题，通过的子集就可使用。
 
 ## 目录
 
-- `pipeline/` —— 主代码:8 段流水线(input → whitepaper → world → orders → well_posed → questions → corpus → grounding)+ `lines/`(10 条能力产线)+ `world_blueprint.py`(场景骨架契约)+ `world_state.py`(真值状态机,gt 在此机械算)。
-- `eval/` —— 用生成的题库评测记忆系统的脚手架。
-- `tests/` —— 离线自检。
-- `survey/` —— 调研报告(只跟踪 `.md`,PDF 不进 git)。
-- `docs/anchors/` —— 调研 / 文献报告(related_work、novelty_lit_review 等)。
-- `tools/`、`vis/` —— 辅助工具与可视化。
+- `pipeline/`：唯一生产流水线及 L1–L10 能力线。
+- `eval/`：用发布子集评测记忆系统。
+- `seeds/`：结构化 seed。
+- `tools/`：校验、批量运行、恢复、监控和导出工具。
+- `tests/`：离线回归与故障注入。
+- `skills/realfiles-to-seedjson/`：把真实资料转换成 seed JSON 的操作规范。
+- `frontend/`：运行状态展示界面。
+
+## 最小验证
+
+```bash
+./venv/Scripts/python -m compileall -q pipeline eval tools tests
+./venv/Scripts/python -B -X utf8 tests/world_agent_json_recovery_selftest.py
+./venv/Scripts/python -B -X utf8 tests/grounding_candidate_isolation_selftest.py
+./venv/Scripts/python -B -X utf8 tests/release_summary_selftest.py
+```

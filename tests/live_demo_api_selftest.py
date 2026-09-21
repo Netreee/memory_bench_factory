@@ -76,14 +76,14 @@ class LiveDemoTests(unittest.TestCase):
         self.assertIsNone(payload["metrics"]["continuity_conflicts"])
         self.assertIsNone(payload["metrics"]["questions"])
 
-    def test_historical_manual_rejection_cannot_become_passed(self):
+    def test_historical_manual_review_does_not_replace_question_summary(self):
         directory = self.run_fixture()
         self.write(directory, "08_semantic_review.json", {"review_status": "manual_failed"})
         payload = self.client.get("/api/runs/live__current-1234").json()
         self.assertEqual(payload["status"], "succeeded")
-        self.assertEqual(payload["quality"]["status"], "failed")
+        self.assertEqual(payload["quality"]["status"], "not_run")
         self.assertFalse(payload["eligible"])
-        self.assertEqual(self.client.get("/api/runs").json()["runs"][0]["quality"]["status"], "failed")
+        self.assertEqual(self.client.get("/api/runs").json()["runs"][0]["quality"]["status"], "not_run")
 
     def test_quality_failure_preserves_generation_completion(self):
         directory = self.run_fixture(status="failed")
@@ -91,7 +91,7 @@ class LiveDemoTests(unittest.TestCase):
             name: {"done": name != "quality", "started_ts": 10 + index, "elapsed_s": 1}
             for index, name in enumerate(api.STAGE_ORDER)
         }})
-        self.write(directory, "08_semantic_review.json", {"review_status": "manual_failed"})
+        self.write(directory, "07_release.json", {"version": 2})
         payload = api._run_snapshot(directory.name)
         self.assertEqual(payload["execution_status"], "failed")
         self.assertEqual(payload["generation_status"], "succeeded")
@@ -104,7 +104,7 @@ class LiveDemoTests(unittest.TestCase):
                                                    "scope": [], "checks": {}, "issues": [],
                                                    "inputs": {}, "implementation_fingerprint": "old-code"})
         payload = self.client.get("/api/runs/live__current-1234").json()
-        self.assertEqual(payload["quality"]["status"], "stale")
+        self.assertEqual(payload["quality"]["status"], "failed")
         self.assertFalse(payload["eligible"])
 
     def test_api_passes_through_valid_release_state(self):
@@ -134,7 +134,7 @@ class LiveDemoTests(unittest.TestCase):
     def test_replay_keeps_requested_run_and_quality(self):
         self.run_fixture("office__20260717-064826")
         current = self.run_fixture()
-        self.write(current, "08_semantic_review.json", {"review_status": "manual_failed"})
+        self.write(current, "07_release.json", {"version": 2})
         payload = self.client.get("/api/replay/live__current-1234").json()
         self.assertEqual(payload["run_id"], "live__current-1234")
         self.assertEqual(payload["final_snapshot"]["run_id"], "live__current-1234")
