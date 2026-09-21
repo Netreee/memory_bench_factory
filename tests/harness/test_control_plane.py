@@ -149,6 +149,24 @@ class PlanTests(unittest.TestCase):
         )
         self.assertRegex(first.run_stamp, r"^\d{8}-\d{6}$")
 
+    def test_memory_config_enters_plan_and_fingerprint(self):
+        registry = load_registry()
+        experiment = load_experiment(
+            CONFIG_ROOT / "experiments" / "templates" / "mem0-smoke.toml"
+        )
+        systems = resolve_systems(experiment, registry)
+        benchmark = inspect_benchmark(experiment.benchmark)
+        first = make_plans(experiment, systems, benchmark)[0]
+        changed_target = replace(
+            experiment.targets[0],
+            memory_config={**experiment.targets[0].memory_config, "top_k": 4},
+        )
+        changed = make_plans(
+            replace(experiment, targets=(changed_target,)), systems, benchmark
+        )[0]
+        self.assertEqual(first.memory_config["top_k"], 3)
+        self.assertNotEqual(first.config_fingerprint, changed.config_fingerprint)
+
     def test_run_dir_naming_disambiguates_same_second(self):
         fp = "a" * 64
         with tempfile.TemporaryDirectory() as tmp:

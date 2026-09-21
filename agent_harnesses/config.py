@@ -21,6 +21,7 @@ TRACKS = {"native", "memory"}
 STATUSES = {"active", "candidate", "diagnostic", "disabled"}
 ROLES = {"benchmark", "reference", "diagnostic"}
 CORPUS_VARIANTS = {"full", "filtered", "as_provided"}
+SECRET_FIELD_PARTS = ("api_key", "password", "secret", "token", "credential")
 
 
 class ConfigurationError(ValueError):
@@ -65,6 +66,35 @@ def _contains_tbd(value: Any) -> bool:
     if isinstance(value, (list, tuple)):
         return any(_contains_tbd(item) for item in value)
     return False
+
+
+def _public_memory_config(value: Any, field: str) -> Mapping[str, Any] | None:
+    """Parse target-scoped memory settings while keeping credentials out of TOML.
+
+    Memory-system internal models and storage backends are part of the evaluated
+    system identity, so their public settings belong in the experiment and enter
+    the RunPlan fingerprint. Credentials remain in ``secrets.env`` and are
+    referenced only through ``endpoint_profile``.
+    """
+    if value is None:
+        return None
+    config = dict(_mapping(value, field))
+
+    def reject_secrets(item: Any, path: str) -> None:
+        if isinstance(item, Mapping):
+            for key, nested in item.items():
+                name = str(key).lower()
+                if any(part in name for part in SECRET_FIELD_PARTS):
+                    raise ConfigurationError(
+                        f"{path}.{key} 不得保存凭证；请改用 endpoint_profile 引用 secrets.env"
+                    )
+                reject_secrets(nested, f"{path}.{key}")
+        elif isinstance(item, (list, tuple)):
+            for index, nested in enumerate(item):
+                reject_secrets(nested, f"{path}[{index}]")
+
+    reject_secrets(config, field)
+    return config
 
 
 @dataclass(frozen=True)
@@ -175,6 +205,7 @@ class ExperimentTarget:
     model_id: str | None
     endpoint_profile: str | None
     protocol_style: str | None
+    memory_config: Mapping[str, Any] | None
 
     def model_dict(self) -> dict[str, Any] | None:
         if self.model_id is None:
@@ -262,6 +293,9 @@ def _targets_for(raw: Any) -> tuple[ExperimentTarget, ...]:
                 model_id=_optional_text(entry.get("model_id"), f"{location}.model_id"),
                 endpoint_profile=endpoint_profile,
                 protocol_style=_optional_text(entry.get("protocol_style"), f"{location}.protocol_style"),
+                memory_config=_public_memory_config(
+                    entry.get("memory_config"), f"{location}.memory_config"
+                ),
             )
         )
     return tuple(targets)
@@ -359,6 +393,18 @@ def resolve_systems(
         elif target.model_id or target.endpoint_profile:
             raise ConfigurationError(
                 f"target={target.target_id}: runner={system.runner} 不接受 target 级模型配置"
+            )
+        if system.runner != "memory" and target.memory_config is not None:
+            raise ConfigurationError(
+                f"target={target.target_id}: runner={system.runner} 不接受 memory_config"
+            )
+        if (
+            system.runner == "memory"
+            and bool(system.implementation.get("requires_memory_config"))
+            and not target.memory_config
+        ):
+            raise ConfigurationError(
+                f"target={target.target_id}: {system.system_id} 必须声明 memory_config"
             )
         resolved.append(system)
     if experiment.track == "memory" and experiment.answering_model is None:

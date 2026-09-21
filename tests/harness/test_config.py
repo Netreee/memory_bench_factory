@@ -44,6 +44,24 @@ class RegistryTests(unittest.TestCase):
         self.assertTrue(all(system.track == "memory" for system in systems))
         self.assertEqual(experiment.answering_model["model_id"], "deepseek-v4-flash")
         self.assertTrue(all("answering_model" not in system.spec for system in systems))
+        mem0_target = next(target for target in experiment.targets if target.system_id == "memory.mem0-oss")
+        self.assertEqual(mem0_target.memory_config["top_k"], 3)
+        self.assertEqual(
+            mem0_target.memory_config["internal_model"]["endpoint_profile"], "DEEPSEEK"
+        )
+        self.assertTrue(registry["memory.mem0-oss"].executable)
+
+    def test_memory_config_rejects_inline_credentials(self):
+        template = (TEMPLATES / "mem0-smoke.toml").read_text(encoding="utf-8")
+        template = template.replace(
+            '[targets.memory_config.internal_model]\nmodel_id = "deepseek-v4-flash"',
+            '[targets.memory_config.internal_model]\nmodel_id = "deepseek-v4-flash"\napi_key = "must-not-live-here"',
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "bad.toml"
+            path.write_text(template, encoding="utf-8")
+            with self.assertRaisesRegex(ConfigurationError, "不得保存凭证"):
+                load_experiment(path)
 
     def test_duplicate_system_ids_are_rejected(self):
         row = """

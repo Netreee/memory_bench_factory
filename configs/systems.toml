@@ -108,8 +108,8 @@ track = "memory"
 display_name = "Mem0 OSS"
 status = "candidate"
 role = "benchmark"
-implementation = { runner = "planned", executable = false }
-spec = { memory_system = { id = "mem0_oss", version = "TBD", internal_models = "TBD" }, ingestion = { mode = "session_ordered", reset_scope = "run" }, retrieval = { mode = "native", context_token_budget = "TBD", witness_required = true } }
+implementation = { runner = "memory", adapter = "mem0", executable = true, requires_memory_config = true }
+spec = { memory_system = { id = "mem0", version = "2.0.7", internal_models = "experiment", embedding_provider = "huggingface", embedding_model = "BAAI/bge-small-zh-v1.5", vector_provider = "qdrant" }, ingestion = { mode = "session_ordered", reset_scope = "run", cleanup_scope = "collection" }, retrieval = { mode = "native", top_k = 3, context_token_budget = 0, budget_enforced = false, witness_required = false } }
 
 [[systems]]
 schema_version = 2

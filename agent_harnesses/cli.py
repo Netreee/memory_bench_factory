@@ -69,6 +69,7 @@ def cmd_validate(args) -> int:
                     "id": target.target_id,
                     "system": target.system_id,
                     "model": target.model_dict(),
+                    "memory_config": dict(target.memory_config or {}) or None,
                 }
                 for target in experiment.targets
             ],
