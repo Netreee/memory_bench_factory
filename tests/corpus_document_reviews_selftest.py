@@ -169,6 +169,15 @@ class DocumentReviewTests(unittest.TestCase):
                     rehash(receipt)
                 self.assertFalse(cc._review_receipt_matches(self.ws, 0, doc))
 
+    def test_full_corpus_validation_replays_one_shared_history_once(self):
+        report, _ = self.review(positive)
+        docs = deepcopy(self.docs); cc.attach_receipts(docs, report, 0)
+        corpus = {'sessions': [{'session_id': 0, 'docs': docs}]}
+        original = cc._replay_review_validation
+        with patch.object(cc, '_replay_review_validation', wraps=original) as replay:
+            cc.validate_corpus(self.ws, corpus)
+        self.assertEqual(replay.call_count, 1)
+
     def test_report_mirror_does_not_override_bound_raw(self):
         report, _ = self.review(positive)
         report['document_reviews'][1]['reason'] = 'Changed opinion outside the actual raw response'

@@ -150,9 +150,14 @@ SCENARIOS = {
 
 
 ART = {"input": "00_input.json", "whitepaper": "01_whitepaper.json", "world": "02_world.json",
-       "orders": "03_orders.json", "questions": "04_questions.json", "corpus": "05_corpus.json",
+       "orders": "03_orders.json", "questions": "04_questions.json", "disclosure": "02_disclosure_ready.json",
+       "corpus": "05_corpus.json",
        "grounding": "06_grounded_questions.json", "quality": "07_release.json"}
 CORPUS_CKPT = "05_corpus.ckpt.json"
+CORPUS_WARNING = "05_corpus_warning.json"
+QUESTION_WARNING = "04_questions_warning.json"
+ORDER_WARNING = "03_orders_warning.json"
+WORLD_REPAIR_FAILURE = "02_world_repair_failure.json"
 CORPUS_RENDER_CONTRACT_VERSION = 12
 
 # ★作答协议(B类①修复):benchmark 出厂【显式声明】None 的两类语义 + 期望作答,治"None 未定义→理性系统被误判"。
@@ -266,7 +271,8 @@ def stage_whitepaper(run: Run):
     elif pack is not None:
         # Freeze the execution strategy with the original whitepaper. Existing
         # saved papers retain their own strategy and review bindings.
-        wp["world_generation"] = {"strategy": "agentic", "version": 1}
+        wp["world_generation"] = {"strategy": "agentic", "version": 2, "blueprint_repair_attempts": 1,
+                                  "disclosure_strategy": "direct_batches_v1"}
     wp["quality_contract"] = {"version": 4, "corpus_review": True,
                               "world_semantic_review": True,
                               "public_disclosure": True,
@@ -282,6 +288,46 @@ def stage_whitepaper(run: Run):
 
 
 def stage_world(run: Run):
+    """Route an author's explicit blueprint conflict to its original architect."""
+    from pipeline.blueprint_feasibility import BlueprintReviewRequested, revise_constraints
+    original = run.read(ART["whitepaper"])
+    policy = original.get("world_generation") or {}
+    allowed = (policy.get("strategy") == "agentic" and policy.get("version") == 2
+               and policy.get("blueprint_repair_attempts") == 1)
+    archive = "02_blueprint_revision_attempts.json"
+    attempts = run.read(archive).get("attempts", []) if run.has(archive) else []
+    original_seed_audit = run.read("01_seed_audit.json") if run.has("01_seed_audit.json") else None
+    changed = False
+    try:
+        while True:
+            try:
+                return _stage_world_once(run)
+            except BlueprintReviewRequested as request:
+                # A published world has downstream consumers. Revising its
+                # definition requires a fresh generation, never an in-place edit.
+                if not allowed or attempts or run.has(ART["world"]):
+                    raise
+                run.log("  ↻ 世界作者请求上游复核字段约束；保留旧稿，交原架构师修订并独立复核")
+                audit = {}
+                try:
+                    revised = revise_constraints(run.read(ART["whitepaper"]), run.tracer, request.evidence, audit)
+                    validate_seed_identity(run, revised)
+                finally:
+                    attempts.append(audit)
+                    run.write(archive, {"attempts": attempts})
+                run.write(ART["whitepaper"], revised)
+                changed = True
+                if "seed_audit" in revised:
+                    run.write("01_seed_audit.json", revised["seed_audit"])
+    except BaseException:
+        if changed:
+            run.write(ART["whitepaper"], original)
+            if original_seed_audit is not None:
+                run.write("01_seed_audit.json", original_seed_audit)
+        raise
+
+
+def _stage_world_once(run: Run):
     wp = run.read(ART["whitepaper"])
     validate_seed_identity(run, wp)
     existing = None
@@ -307,6 +353,9 @@ def stage_world(run: Run):
             ensure_ascii=False, sort_keys=True, separators=(",", ":"))
         checkpoint_id = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:20]
         agent_options["checkpoint_path"] = run.dir / f"02_world_agent_{checkpoint_id}.json"
+        reused = (run.manifest.get("derived_from") or {}).get("world_construction_checkpoints", [])
+        if reused and not run.has(ART["world"]) and agent_options["checkpoint_path"].name not in reused:
+            raise WorldBlueprintError("恢复参数与已保存世界不匹配；停止，避免重新生成世界")
         options.update(agent_options)
     try:
         ws = build_world(wp, run.tracer, run.log, existing=existing,
@@ -317,6 +366,8 @@ def stage_world(run: Run):
     _prepare_lines(wp, ws, run.log)
     seed_audit = validate_seed_world(wp, ws)
     review = None
+    review_warning = None
+    repair_failure = None
     if review_enabled:
         task_input = run.read(ART["input"])
         run.write("02_world_draft.json", draft)
@@ -339,12 +390,14 @@ def stage_world(run: Run):
                         "scope": "Author grouping for navigation; acquisition times still need independent authoring"}
                 plan_report = disclosure.author_plan(
                     wp, ws, run.tracer, task_input=task_input,
-                    feedback=disclosure_feedback)
+                    feedback=disclosure_feedback,
+                    **({"checkpoint_dir": run.dir} if (wp.get("world_generation") or {}).get(
+                        "disclosure_strategy") == "direct_batches_v1" else {}))
                 disclosure_attempts.append(plan_report)
                 run.write("02_disclosure_plan_attempts.json", {"attempts": disclosure_attempts})
                 if plan_report.get("status") != "ready" or disclosure.validate_plan(ws):
                     run.write("02_world_candidate.json", ws.to_dict())
-                    raise WorldBlueprintError("公开信息安排未形成有效候选；见 02_disclosure_plan_attempts.json")
+                    run.log("  ⚠ 公开信息安排未形成有效候选；保留作者记录，世界候选继续进入审阅与下游诊断")
             run.write("02_world_candidate.json", ws.to_dict())
             review = world_semantics.review_world(
                 wp, ws, run.tracer, task_input=task_input,
@@ -360,7 +413,14 @@ def stage_world(run: Run):
             disclosure_repair = disclosure_enabled and targets.get("disclosure") is True
             if (attempt or review.get("status") not in ("failed", "unresolved")
                     or not (truth_repair or disclosure_repair)):
-                raise WorldBlueprintError("世界业务审阅尚未通过；见 02_world_review_attempts.json，候选未发布")
+                # Review execution and fallible semantic opinions belong to
+                # release certification, not production liveness. Preserve the
+                # exact candidate and opinion, continue all downstream stages,
+                # and let 07_quality keep the result ineligible.
+                review_warning = world_semantics.generation_warning(
+                    review, wp, ws, task_input=task_input)
+                run.log("  ⚠ 世界审阅未认证当前候选；候选带待补审警告继续生产，正式发布资格保持关闭")
+                break
             if not truth_repair:
                 run.log("  ↻ 公开信息安排需要返修；保留世界真值，返回原作者重拟安排并复核")
                 continue
@@ -376,6 +436,27 @@ def stage_world(run: Run):
                     repair_input={"draft": draft, "feedback": review,
                                   "targets": {k: targets[k] for k in ("intrinsic", "structure") if k in targets},
                                   "max_calls": repair_call_limit}, **agent_options)
+            except Exception as exc:
+                # The review already left us a complete candidate and a
+                # release-blocking opinion.  A failed optional repair must not
+                # discard those artifacts or terminate the remaining factory.
+                # Preserve the exact pre-repair candidate; 07_quality will keep
+                # it ineligible through the bound generation warning.
+                repair_failure = {
+                    "version": "world-repair-failure/v1", "status": "error",
+                    "release_eligible": False,
+                    "error_type": type(exc).__name__, "error": str(exc),
+                    "binding": {
+                        "whitepaper_hash": _canonical_hash(wp),
+                        "world_hash": _canonical_hash(ws.to_dict()),
+                        "review_hash": _canonical_hash(review),
+                    },
+                }
+                review_warning = world_semantics.generation_warning(
+                    review, wp, ws, task_input=task_input)
+                run.log(f"  ⚠ 世界有限返修未完成:{type(exc).__name__}: {str(exc)[:160]}；"
+                        "保留返修前候选和审阅意见，继续后续生产并关闭发布资格")
+                break
             finally:
                 if repaired_draft:
                     run.write("02_world_repair_draft.json", repaired_draft)
@@ -395,25 +476,277 @@ def stage_world(run: Run):
             "scope": "LLM-reviewed publication schedule; not a question difficulty claim"}
     if review is not None:
         bundle[world_semantics.REVIEW_ARTIFACT] = review
-        metadata["world_semantic_review"] = {"status": review["status"], "attempts": len(attempts)}
-    _publish_world_bundle(run, bundle, metadata)
+        if review_warning is not None:
+            bundle[world_semantics.WARNING_ARTIFACT] = review_warning
+        if repair_failure is not None:
+            bundle[WORLD_REPAIR_FAILURE] = repair_failure
+        metadata["world_semantic_review"] = {
+            "status": review["status"], "attempts": len(attempts),
+            "generation_disposition": "warning_continue" if review_warning else "certified",
+            "release_eligible": review_warning is None}
+    remove = []
+    if review_warning is None:
+        remove.append(world_semantics.WARNING_ARTIFACT)
+    if repair_failure is None:
+        remove.append(WORLD_REPAIR_FAILURE)
+    _publish_world_bundle(run, bundle, metadata, remove=remove)
 
 
-def _publish_world_bundle(run: Run, bundle: dict, metadata: dict):
+def _business_work_plan_context(run: Run):
+    """Recover the original author's bounded navigation hint from its saved draft."""
+    if not run.has("02_world_draft.json"):
+        return None
+    draft = run.read("02_world_draft.json")
+    units = (draft.get("agent") or {}).get("units", []) if isinstance(draft, dict) else []
+    plan = []
+    for unit in units:
+        if not isinstance(unit, dict):
+            continue
+        raw = unit.get("raw") or {}
+        plan.append({"unit_id": unit.get("unit_id"), "intent": unit.get("intent"),
+                     "entities": [item.get("name") for item in (raw.get("entities") or [])
+                                  if isinstance(item, dict) and item.get("name")],
+                     "events": [item.get("id") for item in (raw.get("events") or [])
+                                if isinstance(item, dict) and item.get("id")]})
+    if not plan:
+        return None
+    return {"business_work_plan": plan,
+            "scope": "Author grouping for navigation; acquisition times still need independent authoring"}
+
+
+def _release_current_world_review(run: Run, wp, ws, task) -> bool:
+    """A recoverable execution warning permits progress, never certification.
+
+    Disclosure recovery must refresh an errored/warned opinion before grounding.
+    Exact warning bindings remain useful evidence for recovery, but accepting one
+    here would guarantee that the later release gate rejects the run.
+    """
+    from pipeline import world_semantics
+    if (run.has(world_semantics.WARNING_ARTIFACT)
+            or not run.has(world_semantics.REVIEW_ARTIFACT)):
+        return False
+    try:
+        review = run.read(world_semantics.REVIEW_ARTIFACT)
+        return (review.get("status") == "passed"
+                and not world_semantics.validate_review(review, wp, ws, task_input=task))
+    except (ValueError, OSError, TypeError, KeyError, AttributeError):
+        return False
+
+
+def _recoverable_current_world_review(run: Run, wp, ws, task):
+    """Return an exactly bound nonpassing opinion for targeted recovery only."""
+    from pipeline import world_semantics
+    if not (run.has(world_semantics.REVIEW_ARTIFACT)
+            and run.has(world_semantics.WARNING_ARTIFACT)):
+        return None
+    try:
+        review = run.read(world_semantics.REVIEW_ARTIFACT)
+        warning = run.read(world_semantics.WARNING_ARTIFACT)
+        if not world_semantics.validate_generation_warning(
+                warning, review, wp, ws, task_input=task):
+            return review
+    except (ValueError, OSError, TypeError, KeyError, AttributeError):
+        pass
+    return None
+
+
+def stage_disclosure(run: Run):
+    """Complete or validate public disclosure without regenerating the frozen world.
+
+    Recovery runs may already contain whitepaper, world, orders and questions.
+    This stage resumes only the missing disclosure author checkpoint, refreshes
+    the bound world opinion once, then lets corpus production continue.  World
+    truth is checked before and after so this recovery stage cannot rewrite it.
+    """
+    from pipeline import disclosure, world_semantics
+    wp = run.read(ART["whitepaper"])
+    task = run.read(ART["input"])
+    ws = WorldState.from_dict(run.read(ART["world"]))
+    validate_seed_identity(run, wp)
+    validate_seed_world(wp, ws)
+    truth_before = disclosure._world(ws)
+    old_plan_hash = ((getattr(ws, "disclosure", None) or {}).get("plan_hash"))
+
+    if not disclosure.enabled(wp):
+        receipt = {"version": "disclosure-ready/v1", "status": "disabled",
+                   "world_hash": _canonical_hash(ws.to_dict())}
+        run.write(ART["disclosure"], receipt)
+        return
+
+    # A completed historical plan and opinion can be certified with zero calls.
+    # This is the common insurance recovery path.
+    plan_errors = disclosure.validate_plan(ws)
+    review_current = (not plan_errors
+                      and _release_current_world_review(run, wp, ws, task))
+
+    disclosure_attempts = (run.read("02_disclosure_plan_attempts.json").get("attempts", [])
+                           if run.has("02_disclosure_plan_attempts.json") else [])
+    if plan_errors:
+        report = disclosure.author_plan(
+            wp, ws, run.tracer, task_input=task,
+            feedback=_business_work_plan_context(run), checkpoint_dir=run.dir)
+        disclosure_attempts.append(report)
+        run.write("02_disclosure_plan_attempts.json", {"attempts": disclosure_attempts})
+        plan_errors = disclosure.validate_plan(ws)
+        if report.get("status") != "ready" or plan_errors:
+            raise WorldBlueprintError(
+                "公开安排恢复尚未完成；已保留检查点，可从 disclosure 阶段继续: "
+                + str(report.get("error") or plan_errors[:1]))
+
+    if disclosure._world(ws) != truth_before:
+        raise WorldBlueprintError("公开安排恢复改动了世界真值；拒绝发布恢复候选")
+
+    review = run.read(world_semantics.REVIEW_ARTIFACT) if (
+        review_current and run.has(world_semantics.REVIEW_ARTIFACT)) else None
+    warning = (run.read(world_semantics.WARNING_ARTIFACT)
+               if review_current and run.has(world_semantics.WARNING_ARTIFACT) else None)
+    recoverable_review = None if review_current else _recoverable_current_world_review(run, wp, ws, task)
+    can_target_repair = (isinstance(recoverable_review, dict)
+                         and (recoverable_review.get("repair_targets") or {}).get("disclosure") is True
+                         and (ws.disclosure or {}).get("strategy") in
+                         {"direct-disclosure/v1", "direct-disclosure/v2"})
+    if can_target_repair:
+        review = recoverable_review
+    elif not review_current:
+        review = world_semantics.review_world(
+            wp, ws, run.tracer, task_input=task,
+            author_responses=_business_work_plan_context(run))
+        prior = (run.read("02_world_review_attempts.json").get("attempts", [])
+                 if run.has("02_world_review_attempts.json") else [])
+        prior.append(review)
+        run.write("02_world_review_attempts.json", {"attempts": prior})
+        errors = world_semantics.validate_review(review, wp, ws, task_input=task)
+        warning = None if review.get("status") == "passed" and not errors else \
+            world_semantics.generation_warning(review, wp, ws, task_input=task)
+
+    # A disclosure-only semantic rejection edits only the named public records,
+    # then receives one fresh independent review.  It never reauthors the world,
+    # the full disclosure plan, questions, or corpus, and never loops.
+    semantic_repair = None
+    if ((review.get("repair_targets") or {}).get("disclosure") is True
+            and (ws.disclosure or {}).get("strategy") in
+            {"direct-disclosure/v1", "direct-disclosure/v2"}):
+        from pipeline import disclosure_batches
+        semantic_repair = disclosure_batches.repair(wp, ws, run.tracer, review)
+        run.write("02_disclosure_semantic_repair.json", semantic_repair)
+        if semantic_repair.get("status") == "ready":
+            if disclosure._world(ws) != truth_before:
+                raise WorldBlueprintError("公开安排局部返修改动了世界真值；拒绝发布恢复候选")
+            author_context = _business_work_plan_context(run) or {}
+            author_context = {**author_context,
+                              "disclosure_semantic_repair": {
+                                  "status": "ready",
+                                  "repaired_record_ids": semantic_repair.get("repaired_record_ids", [])}}
+            # Checkpoints bind the exact pre-repair world and previous-review
+            # envelope.  Migrating one into the post-repair review guarantees
+            # a message mismatch at entry zero, so discard only these derived
+            # caches and retain the source run plus provider trace as evidence.
+            cleared_checkpoints = 0
+            for checkpoint in run.dir.glob("02_world_review_*.ckpt.json"):
+                checkpoint.unlink(missing_ok=True)
+                cleared_checkpoints += 1
+            semantic_repair["cleared_stale_review_checkpoints"] = cleared_checkpoints
+            run.write("02_disclosure_semantic_repair.json", semantic_repair)
+            previous_review = review
+            review = world_semantics.review_world(
+                wp, ws, run.tracer, task_input=task, previous=previous_review,
+                author_responses=author_context)
+            prior = (run.read("02_world_review_attempts.json").get("attempts", [])
+                     if run.has("02_world_review_attempts.json") else [])
+            prior.extend([previous_review, review])
+            run.write("02_world_review_attempts.json", {"attempts": prior})
+            errors = world_semantics.validate_review(review, wp, ws, task_input=task)
+            warning = None if review.get("status") == "passed" and not errors else \
+                world_semantics.generation_warning(review, wp, ws, task_input=task)
+
+    new_plan_hash = (ws.disclosure or {}).get("plan_hash")
+    receipt = {"version": "disclosure-ready/v1", "status": "ready",
+               "truth_hash": _canonical_hash(truth_before),
+               "plan_hash": new_plan_hash,
+               "world_hash": _canonical_hash(ws.to_dict()),
+               "review_hash": _canonical_hash(review),
+               "review_status": review.get("status"),
+               "release_eligible": warning is None}
+    bundle = {ART["world"]: ws.to_dict(), ART["disclosure"]: receipt,
+              world_semantics.REVIEW_ARTIFACT: review}
+    remove = []
+    if warning is None:
+        remove.append(world_semantics.WARNING_ARTIFACT)
+    else:
+        bundle[world_semantics.WARNING_ARTIFACT] = warning
+    _publish_world_bundle(run, bundle, {
+        "public_disclosure": {"records": len(ws.disclosure.get("records", [])),
+                              "undisclosed_references": len(ws.disclosure.get("undisclosed", [])),
+                              "author_attempts": len(disclosure_attempts),
+                              "recovery_stage": True},
+        "world_semantic_review": {"status": review.get("status"),
+                                  "generation_disposition": "warning_continue" if warning else "certified",
+                                  "release_eligible": warning is None,
+                                  "targeted_disclosure_repair": (semantic_repair or {}).get("status")}},
+        remove=remove, invalidate_corpus=(old_plan_hash != new_plan_hash))
+    # Historical large runs can contain a complete frozen corpus plus an
+    # incomplete optional L3 proposal.  Preserve the warning and bind its exact
+    # impact to L3 question identities; later stages may withhold only that
+    # line.  Any mismatch leaves the warning unresolved and release-ineligible.
+    from pipeline import order_warning
+    resolution_path = run.dir / order_warning.RESOLUTION_ARTIFACT
+    if run.has(order_warning.WARNING_ARTIFACT) and run.has(order_warning.PROPOSAL_ARTIFACT):
+        try:
+            resolution = order_warning.build_resolution(
+                wp, ws.to_dict(), run.read(ART["questions"]),
+                run.read(order_warning.WARNING_ARTIFACT),
+                run.read(order_warning.PROPOSAL_ARTIFACT))
+            run.write(order_warning.RESOLUTION_ARTIFACT, resolution)
+        except (ValueError, TypeError, KeyError, AttributeError):
+            resolution_path.unlink(missing_ok=True)
+    else:
+        resolution_path.unlink(missing_ok=True)
+
+
+def _disclosure_is_current(run: Run) -> bool:
+    try:
+        from pipeline import disclosure, world_semantics
+        wp = run.read(ART["whitepaper"])
+        ws = WorldState.from_dict(run.read(ART["world"]))
+        receipt = run.read(ART["disclosure"])
+        if not disclosure.enabled(wp):
+            return receipt == {"version": "disclosure-ready/v1", "status": "disabled",
+                               "world_hash": _canonical_hash(ws.to_dict())}
+        if disclosure.validate_plan(ws):
+            return False
+        _require_current_world_review(run, wp, ws)
+        review = run.read(world_semantics.REVIEW_ARTIFACT)
+        warning = run.read(world_semantics.WARNING_ARTIFACT) if run.has(world_semantics.WARNING_ARTIFACT) else None
+        expected = {"version": "disclosure-ready/v1", "status": "ready",
+                    "truth_hash": _canonical_hash(disclosure._world(ws)),
+                    "plan_hash": ws.disclosure.get("plan_hash"),
+                    "world_hash": _canonical_hash(ws.to_dict()),
+                    "review_hash": _canonical_hash(review),
+                    "review_status": review.get("status"),
+                    "release_eligible": warning is None}
+        return receipt == expected
+    except (ValueError, OSError, TypeError, KeyError, AttributeError):
+        return False
+
+
+def _publish_world_bundle(run: Run, bundle: dict, metadata: dict, remove=(), *, invalidate_corpus=True):
     """Restore the previously published world/opinion if the commit is interrupted.
 
     The stage lock serializes writers. Readers still verify content bindings,
     so a crash between individual atomic writes cannot certify a mixed bundle.
     """
-    names = list(bundle) + [CORPUS_CKPT]
+    names = list(dict.fromkeys([*bundle, *remove, *([CORPUS_CKPT] if invalidate_corpus else [])]))
     previous = {name: (run.dir / name).read_bytes() if (run.dir / name).exists() else None
                 for name in names}
     prior_algo = deepcopy(run.manifest.get("algo", {}))
     try:
         for name, value in bundle.items():
             run.write(name, value)
+        for name in remove:
+            (run.dir / name).unlink(missing_ok=True)
         run.set_algo(**metadata)
-        (run.dir / CORPUS_CKPT).unlink(missing_ok=True)
+        if invalidate_corpus:
+            (run.dir / CORPUS_CKPT).unlink(missing_ok=True)
     except BaseException:
         for name, content in previous.items():
             path = run.dir / name
@@ -433,7 +766,7 @@ def _publish_world_bundle(run: Run, bundle: dict, metadata: dict):
 
 
 def _require_current_world_review(run: Run, wp: dict, ws=None):
-    """Resume guards replay the saved opinion; they never start a model call."""
+    """Permit a bound candidate warning while keeping release certification closed."""
     from pipeline import world_semantics, disclosure
     if not world_semantics.enabled(wp, run.manifest.get("config", {})):
         if disclosure.enabled(wp):
@@ -444,8 +777,15 @@ def _require_current_world_review(run: Run, wp: dict, ws=None):
     ws = ws if ws is not None else WorldState.from_dict(run.read(ART["world"]))
     review = run.read(world_semantics.REVIEW_ARTIFACT)
     errors = world_semantics.validate_review(review, wp, ws, task_input=run.read(ART["input"]))
-    if review.get("status") != "passed" or errors:
-        raise WorldBlueprintError("世界业务审阅缺失、未通过或已过期；请先运行原 world 阶段")
+    if review.get("status") == "passed" and not errors:
+        return
+    if run.has(world_semantics.WARNING_ARTIFACT):
+        warning_errors = world_semantics.validate_generation_warning(
+            run.read(world_semantics.WARNING_ARTIFACT), review, wp, ws,
+            task_input=run.read(ART["input"]))
+        if not warning_errors:
+            return
+    raise WorldBlueprintError("世界业务审阅及其候选继续生产凭据缺失或已过期；请先运行原 world 阶段")
 
 
 def _world_is_current(run: Run) -> bool:
@@ -465,6 +805,19 @@ def _require_current_corpus_review(run: Run, wp: dict, corpus_obj=None):
     corpus_obj = corpus_obj if corpus_obj is not None else run.read(ART["corpus"])
     report = validate_corpus(ws, corpus_obj)
     if report.get("status") != "passed" or report.get("issues"):
+        if run.has(CORPUS_WARNING):
+            warning = run.read(CORPUS_WARNING)
+            binding = warning.get("binding") if isinstance(warning, dict) else None
+            candidate_hash = (_canonical_hash(run.read("05_corpus_candidate.json"))
+                              if run.has("05_corpus_candidate.json") else None)
+            if (warning.get("version") == "corpus-generation-warning/v1"
+                    and warning.get("status") == "warning"
+                    and warning.get("release_eligible") is False
+                    and binding == {"whitepaper_hash": _canonical_hash(wp),
+                                    "world_hash": _canonical_hash(ws.to_dict()),
+                                    "corpus_hash": _canonical_hash(corpus_obj),
+                                    "candidate_hash": candidate_hash}):
+                return
         codes = list(dict.fromkeys(issue.get("code", "unknown") for issue in report.get("issues", [])))
         raise ValueError(f"正文审阅缺失、未通过或已过期:{codes}；请先运行原 corpus 阶段")
 
@@ -505,6 +858,7 @@ def _questions_is_current(run: Run) -> bool:
 
 def stage_orders(run: Run):
     wp = run.read(ART["whitepaper"]); ws = WorldState.from_dict(run.read(ART["world"]))
+    (run.dir / ORDER_WARNING).unlink(missing_ok=True)
     validate_seed_identity(run, wp)
     validate_seed_world(wp, ws)
     _require_current_world_review(run, wp, ws)
@@ -541,16 +895,30 @@ def stage_orders(run: Run):
                     and quality.get("isolated_reference_audit") is True):
                 raise ValueError("Process proposals require original public semantic review and task-support scoring")
             proposal = {}
+            proposal_error = None
             try:
                 proposal = propose_process_orders(wp, ws, target=target,
-                    chat_json=run.tracer.chat_json, model=config.MODEL)
+                    chat_json=run.tracer.chat_json, model=config.MODEL,
+                    checkpoint_path=run.dir / "03_process_proposals.ckpt.json")
+            except Exception as exc:
+                proposal_error = exc
             finally:
                 if proposal:
                     run.write("03_process_proposals.json", proposal)
-            if proposal.get("status") != "completed":
-                raise RuntimeError("Original process proposal execution failed; see 03_process_proposals.json")
-            orders = run_lines(wp, ws, run.log, quotas=quotas,
-                question_budget=budget, stats=supply, process_proposals=proposal)
+            if proposal.get("status") == "completed":
+                (run.dir / ORDER_WARNING).unlink(missing_ok=True)
+                orders = run_lines(wp, ws, run.log, quotas=quotas,
+                    question_budget=budget, stats=supply, process_proposals=proposal)
+            else:
+                run.write(ORDER_WARNING, {"version": "order-generation-warning/v1",
+                    "status": "warning", "release_eligible": False,
+                    "error_type": type(proposal_error).__name__ if proposal_error else "IncompleteProposal",
+                    "error": str(proposal_error) if proposal_error else str(proposal.get("error") or
+                        "Original process proposal did not complete"),
+                    "binding": {"whitepaper_hash": _canonical_hash(wp),
+                                "world_hash": _canonical_hash(ws.to_dict()),
+                                "proposal_hash": _canonical_hash(proposal)}})
+                run.log("  ⚠ L3 过程订单提案未完成；保留提案记录，其余可用订单继续进入出题和最终质量报告")
         else:
             # Ordinary lines keep exactly their original selection behavior.
             run.log(f"  Process proposal not requested: active={active}, target={target}, typed_events={len(ws.events)}")
@@ -603,8 +971,13 @@ def stage_questions(run: Run):
         about["answer_protocol"] = protocol
         run.write("00_about.json", about)
     audit = {}
+    question_error = None
     try:
-        qs = phrase_questions(orders, wp, run.tracer, run.log, audit=audit)
+        qs = phrase_questions(orders, wp, run.tracer, run.log, audit=audit,
+                              checkpoint_path=run.dir / "04_wording.ckpt.json")
+    except Exception as exc:
+        question_error = exc
+        qs = []
     finally:
         if audit:
             run.write("04_wording_report.json", audit)
@@ -612,6 +985,17 @@ def stage_questions(run: Run):
         provenance = run.read(ART["input"])["seed"]
         qs = [{**q, "seed": provenance} for q in qs]
     run.write(ART["questions"], qs)
+    if question_error is None:
+        (run.dir / QUESTION_WARNING).unlink(missing_ok=True)
+    else:
+        run.write(QUESTION_WARNING, {"version": "question-generation-warning/v1",
+            "status": "warning", "release_eligible": False,
+            "error_type": type(question_error).__name__, "error": str(question_error),
+            "binding": {"whitepaper_hash": _canonical_hash(wp),
+                        "orders_hash": _canonical_hash(orders),
+                        "questions_hash": _canonical_hash(qs)}})
+        run.log(f"  ⚠ 出题阶段没有形成可继续使用的题面:{type(question_error).__name__}: "
+                f"{str(question_error)[:160]}；保存完整审计并继续语料、接地和质量报告")
     run.set_algo(questions=len(qs))
 
 
@@ -635,8 +1019,14 @@ def _corpus_checkpoint_identity(wp: dict, world: dict, target: int,
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def _canonical_hash(value) -> str:
+    return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True,
+        separators=(",", ":"), allow_nan=False).encode("utf-8")).hexdigest()
+
+
 def stage_corpus(run: Run):
-    wp = run.read(ART["whitepaper"]); world = run.read(ART["world"])
+    wp = run.read(ART["whitepaper"]); frozen_wp = deepcopy(wp); world = run.read(ART["world"])
+    prior_published_corpus = deepcopy(run.read(ART["corpus"])) if run.has(ART["corpus"]) else None
     ws = WorldState.from_dict(world)
     validate_seed_identity(run, wp)
     validate_seed_world(wp, ws)
@@ -688,18 +1078,63 @@ def stage_corpus(run: Run):
     identity = _corpus_checkpoint_identity(wp, world, target, delta_mode, only, pairs)
     ckpt = run.dir / CORPUS_CKPT
     if ckpt.exists():                                       # 中断续渲只读独立 checkpoint
-        st = run.read(CORPUS_CKPT)
-        if st.get("identity") == identity:
-            corpus, done = st["corpus"], set(st["done_weeks"])
-            run.log(f"  ↻ 续渲:已完成 {len(done)} 周")
-        else:
+        try:
+            st = run.read(CORPUS_CKPT)
+            if not isinstance(st, dict) or not isinstance(st.get("corpus"), dict) \
+                    or not isinstance(st.get("done_weeks"), list):
+                raise ValueError("corpus checkpoint shape is invalid")
+        except Exception as exc:
+            # A checkpoint is only an optimization.  Its corruption cannot
+            # invalidate a previously published corpus or stop a clean rebuild.
+            run.log(f"  ⚠ 语料续跑 checkpoint 无法读取:{type(exc).__name__}: {str(exc)[:160]}；"
+                    "忽略坏缓存，从正式语料或空候选继续")
             if delta_mode and run.has(ART["corpus"]):
+                st = run.read(ART["corpus"])
+                corpus, done = st["corpus"], set(st["done_weeks"])
+            else:
+                corpus, done = {"sessions": []}, set()
+        else:
+            if st.get("identity") == identity:
+                corpus, done = st["corpus"], set(st["done_weeks"])
+                run.log(f"  ↻ 续渲:已完成 {len(done)} 周")
+            elif delta_mode and run.has(ART["corpus"]):
                 st = run.read(ART["corpus"])
                 corpus, done = st["corpus"], set(st["done_weeks"])
                 run.log("  ⓘ 渲染 checkpoint 不匹配，增量改从已发布完整语料开始")
             else:
                 corpus, done = {"sessions": []}, set()
                 run.log("  ⓘ 渲染 checkpoint 与当前输入不匹配，忽略并从空语料开始")
+    elif run.has("05_corpus_candidate.json") and run.has(CORPUS_WARNING):
+        # A fail-soft run publishes its partial corpus for diagnostics and may
+        # later be copied into a derived recovery run without the live
+        # checkpoint.  Reuse that work only when the warning binds the exact
+        # frozen whitepaper, world and candidate bytes used by this run.
+        try:
+            candidate = run.read("05_corpus_candidate.json")
+            warning = run.read(CORPUS_WARNING)
+            binding = warning.get("binding") if isinstance(warning, dict) else None
+            sessions = (candidate.get("corpus") or {}).get("sessions")
+            candidate_done = candidate.get("done_weeks")
+            session_ids = [item.get("session_id") for item in sessions]
+            expected_sessions = set(ws.sessions())
+            if (warning.get("version") != "corpus-generation-warning/v1"
+                    or not isinstance(binding, dict)
+                    or binding.get("whitepaper_hash") != _canonical_hash(frozen_wp)
+                    or binding.get("world_hash") != _canonical_hash(world)
+                    or binding.get("candidate_hash") != _canonical_hash(candidate)
+                    or not isinstance(sessions, list)
+                    or not isinstance(candidate_done, list)
+                    or any(type(sid) is not int for sid in session_ids)
+                    or len(session_ids) != len(set(session_ids))
+                    or set(session_ids) != set(candidate_done)
+                    or not set(candidate_done) <= expected_sessions):
+                raise ValueError("partial corpus recovery binding or coverage is invalid")
+            corpus, done = candidate["corpus"], set(candidate_done)
+            run.log(f"  ↻ 续渲:复用精确绑定的部分语料 {len(done)}/{len(expected_sessions)} 期")
+        except Exception as exc:
+            corpus, done = {"sessions": []}, set()
+            run.log(f"  ⓘ 部分语料恢复证据无效:{type(exc).__name__}: {str(exc)[:160]}；"
+                    "从空候选开始")
     elif delta_mode and run.has(ART["corpus"]):             # 非剧情闭环的增量渲染从上一版成品起步
         st = run.read(ART["corpus"])
         corpus, done = st["corpus"], set(st["done_weeks"])
@@ -710,11 +1145,35 @@ def stage_corpus(run: Run):
         run.write(CORPUS_CKPT, {"identity": identity, "corpus": corpus,
                                 "done_weeks": sorted(done)})
 
-    render_corpus(wp, ws, target, run.tracer, corpus, done, save, run.log,
-                  only_entities=only, only_entity_sessions=pairs)
-    # 只有整个渲染成功后才发布最终产物；中断时旧成品不会被半成品覆盖。
-    run.write(ART["corpus"], {"corpus": corpus, "done_weeks": sorted(done)})
-    ckpt.unlink(missing_ok=True)
+    corpus_error = None
+    try:
+        render_corpus(wp, ws, target, run.tracer, corpus, done, save, run.log,
+                      only_entities=only, only_entity_sessions=pairs)
+    except Exception as exc:
+        corpus_error = exc
+    # A partial corpus is still a useful candidate for downstream diagnostics.
+    # Bind the warning to exact inputs; release remains closed and a later
+    # explicit rerun can reuse the checkpoint to fill the missing material.
+    candidate_corpus = {"corpus": corpus, "done_weeks": sorted(done)}
+    if corpus_error is None:
+        run.write(ART["corpus"], candidate_corpus)
+        (run.dir / CORPUS_WARNING).unlink(missing_ok=True)
+        (run.dir / "05_corpus_candidate.json").unlink(missing_ok=True)
+        ckpt.unlink(missing_ok=True)
+    else:
+        run.write("05_corpus_candidate.json", candidate_corpus)
+        published_corpus = prior_published_corpus if prior_published_corpus is not None else candidate_corpus
+        if prior_published_corpus is None:
+            run.write(ART["corpus"], published_corpus)
+        run.write(CORPUS_WARNING, {"version": "corpus-generation-warning/v1",
+            "status": "warning", "release_eligible": False,
+            "error_type": type(corpus_error).__name__, "error": str(corpus_error),
+            "binding": {"whitepaper_hash": _canonical_hash(frozen_wp),
+                        "world_hash": _canonical_hash(world),
+                        "corpus_hash": _canonical_hash(published_corpus),
+                        "candidate_hash": _canonical_hash(candidate_corpus)}})
+        run.log(f"  ⚠ 正文阶段留下待补材料:{type(corpus_error).__name__}: {str(corpus_error)[:160]}；"
+                "保存现有正文并继续接地与最终质量报告")
     ch = sum(len(dd.get("content", "")) for x in corpus["sessions"] for dd in x["docs"])
     run.set_algo(docs=sum(len(x["docs"]) for x in corpus["sessions"]), chars=ch)
 
@@ -768,13 +1227,46 @@ def stage_grounding(run: Run):
             max_calls=cfg.get("semantic_max_calls"),
             isolated_reference=(wp.get("quality_contract") or {}).get("isolated_reference_audit", False),
             max_tokens=cfg.get("semantic_max_tokens", 4096),
-            max_input_chars=cfg.get("semantic_max_input_chars", 200000))
+            max_input_chars=cfg.get("semantic_max_input_chars", 200000),
+            checkpoint_dir=run.dir / "06_review_checkpoints",
+            workers=cfg.get("semantic_workers", 1))
         run.write(REVIEW_ARTIFACT, semantic)
         run.write("06_grounding_report.json", report)
         if not report["delivery_safe"]:
-            raise RuntimeError("Public review execution is not delivery-safe; see 06_semantic_review.json")
+            # Keep the full review trace and continue to the release stage.
+            # An unavailable reviewer can withhold candidates; it cannot erase
+            # the completed questions/corpus or abort the production run.
+            report["provisional_before_delivery_validation"] = {
+                "overall": deepcopy(report.get("overall", {})),
+                "by_line": deepcopy(report.get("by_line", {})),
+                "by_capability": deepcopy(report.get("by_capability", {})),
+                "candidate_count": len(kept)}
+            kept = []
+            for group in ("overall",):
+                if isinstance(report.get(group), dict):
+                    report[group]["grounded"] = 0
+                    report[group]["survival"] = 0.0
+            for group in ("by_line", "by_capability"):
+                for row in (report.get(group) or {}).values():
+                    if isinstance(row, dict):
+                        row["grounded"] = 0
+                        row["survival"] = 0.0
+            report["n_pending"] = max(int(report.get("n_pending", 0) or 0),
+                                      int((report.get("overall") or {}).get("n", 0) or 0))
+            run.log("  ⚠ 公开题目审阅执行未形成安全交付集；保留候选与完整记录，继续生成最终质量报告")
     else:
         kept, report = run_grounding(questions, corpus_obj)
+    from pipeline import order_warning
+    if (run.has(order_warning.WARNING_ARTIFACT)
+            and run.has(order_warning.PROPOSAL_ARTIFACT)
+            and run.has(order_warning.RESOLUTION_ARTIFACT)):
+        receipt = run.read(order_warning.RESOLUTION_ARTIFACT)
+        warning = run.read(order_warning.WARNING_ARTIFACT)
+        proposal = run.read(order_warning.PROPOSAL_ARTIFACT)
+        world = run.read(ART["world"])
+        if not order_warning.validate_resolution(receipt, wp, world, questions, warning, proposal):
+            kept, report = order_warning.apply_resolution(kept, report, receipt)
+            run.log(f"  ⓘ 订单警告按产线收口：隔离 {report['n_scoped_excluded']} 道 L3 入选题，其余产线继续")
     run.write(ART["grounding"], kept)
     run.write("06_grounding_report.json", report)
     o = report["overall"]
@@ -810,7 +1302,7 @@ def stage_grounding(run: Run):
 
 def stage_quality(run: Run):
     """Release is separate from generation completion and mechanical grounding."""
-    from pipeline.quality import evaluate_release, ReleaseError
+    from pipeline.quality import evaluate_release
     if (run.read(ART["whitepaper"]).get("seed_contract") or {}).get("schema_version") == 2:
         from pipeline.seed_lineage import ARTIFACT as lineage_artifact, seed_lineage_report
         run.write(lineage_artifact, seed_lineage_report(run.dir))
@@ -821,13 +1313,17 @@ def stage_quality(run: Run):
                           "issue_count": len(report["issues"])})
     if not report["eligible"]:
         codes = list(dict.fromkeys(issue["code"] for issue in report["issues"]))
-        raise ReleaseError(f"质量验收未通过:{codes}；中间产物仅供审计")
+        run.log(f"  ⚠ 端到端生产已完成，发布资格暂未通过:{codes}；候选、审阅记录和质量报告均已落盘")
+        return
     run.log(f"  ✓ 发布资格通过:{report['checks']['coverage']['final_count']} 题；输入与检查版本已绑定")
 
 
 def _quality_is_current(run: Run) -> bool:
     from pipeline.quality import quality_snapshot
-    return quality_snapshot(run.dir)["eligible"]
+    snapshot = quality_snapshot(run.dir)
+    codes = {issue.get("code") for issue in snapshot.get("issues", []) if isinstance(issue, dict)}
+    return (run.has(ART["quality"]) and snapshot.get("status") in ("passed", "failed")
+            and "invalid_release_receipt" not in codes)
 
 
 STAGES = [
@@ -837,7 +1333,9 @@ STAGES = [
     Stage("orders",     ["whitepaper", "world"],  stage_orders,     ART["orders"]),
     Stage("well_posed", ["orders", "world"],      stage_well_posed, "03_well_posed_report.json"),  # ★边A闸:出题前剔 ill-posed(覆写 03_orders)
     Stage("questions",  ["orders", "well_posed"], stage_questions,  ART["questions"], is_current=_questions_is_current),
-    Stage("corpus",     ["whitepaper", "world"],  stage_corpus,     ART["corpus"], is_current=_corpus_is_current),
+    Stage("disclosure", ["whitepaper", "world"],  stage_disclosure, ART["disclosure"],
+          is_current=_disclosure_is_current, refreshes=("world",), freshness_covers=("world",)),
+    Stage("corpus",     ["whitepaper", "world", "disclosure"],  stage_corpus,     ART["corpus"], is_current=_corpus_is_current),
     Stage("grounding",  ["questions", "corpus"],  stage_grounding,  ART["grounding"]),  # ★命门3:gold↔语料 汇合校验
     Stage("quality", ["world", "questions", "corpus", "grounding"], stage_quality, ART["quality"],
           is_current=_quality_is_current),
@@ -868,6 +1366,8 @@ def main():
     ap.add_argument("--target-mtokens", type=float, default=None, help="目标 token(M);新 run 缺省 1.0,续 run 沿用")
     ap.add_argument("--question-budget", type=int, default=None,
                     help="普通流程总订单上限；新 run 缺省 30，续 run 沿用；不承诺最终存活题数")
+    ap.add_argument("--semantic-workers", type=int, default=None,
+                    help="逐题语义审阅并行数；只并行相互独立的题，最终仍按原顺序统一验收")
     ap.add_argument("--tag", default=None, help="人类标签(进 manifest,不影响 run_id)")
     ap.add_argument("--from", dest="from_stage", default=None, help=f"从哪个 stage 起跑 {list(ART)}")
     ap.add_argument("--to", dest="to_stage", default=None, help="跑到哪个 stage 止")
@@ -893,6 +1393,8 @@ def main():
         ap.error("--question-budget 必须为正整数")
     if a.question_budget is not None and a.min_questions is not None:
         ap.error("--question-budget 与闭环 --min-questions 不能同时指定")
+    if a.semantic_workers is not None and not 1 <= a.semantic_workers <= 16:
+        ap.error("--semantic-workers 必须在 1 到 16 之间")
     if a.total_only and a.min_questions is None:
         ap.error("--total-only requires --min-questions")
     if not 8 <= a.max_world_entities <= 80 or a.max_rounds < 1 or (a.min_questions is not None and a.min_questions < 1):
@@ -919,6 +1421,8 @@ def main():
         run_id, scenario = new_run_id(requested_scenario), requested_scenario
 
     cfg = {"from": a.from_stage, "to": a.to_stage, "only": a.only}
+    if a.semantic_workers is not None:
+        cfg["semantic_workers"] = a.semantic_workers
     if a.world_semantic_review:
         cfg["world_semantic_review"] = True
     manifest_path = RUNS_DIR / run_id / "manifest.json"

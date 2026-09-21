@@ -33,7 +33,18 @@ def _atomic_write_json(path: Path, obj) -> None:
             json.dump(obj, f, ensure_ascii=False, indent=2)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp, path)
+        # Windows scanners/readers can briefly hold a destination without
+        # sharing delete access.  The complete temporary file is safe to retry;
+        # keep the wait short and bounded so a real permission problem still
+        # surfaces instead of stalling a generation run.
+        for attempt in range(8):
+            try:
+                os.replace(tmp, path)
+                break
+            except PermissionError:
+                if attempt == 7:
+                    raise
+                time.sleep(min(0.05 * (2 ** attempt), 0.5))
     finally:
         tmp.unlink(missing_ok=True)
 
@@ -133,6 +144,8 @@ class Stage:
     fn: Callable           # fn(run) -> None
     artifact: str          # 产物文件名(NN_<name>.json)
     is_current: Callable | None = None  # Optional content/version freshness check.
+    refreshes: tuple[str, ...] = ()  # Stale ancestors this stage explicitly revalidates before publishing.
+    freshness_covers: tuple[str, ...] = ()  # Ancestors fully replayed by this stage's freshness check.
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -416,6 +429,21 @@ def _dependent_stage_names(stage_name: str, stages: list[Stage]) -> list[str]:
 def drive(run: Run, stages: list, from_stage=None, to_stage=None, only=None, force=False):
     names = [s.name for s in stages]
     by_name = {s.name: s for s in stages}
+    # Content-bound semantic receipts can be expensive to replay for a large
+    # world.  Within one drive call, a successful freshness result remains valid
+    # until any stage writes.  A write clears the whole cache, so no downstream
+    # stage can rely on a result computed for an older artifact set.
+    current_cache = {}
+    def is_current(name):
+        stage = by_name[name]
+        if stage.is_current is None:
+            return True
+        if name not in current_cache:
+            current_cache[name] = bool(stage.is_current(run))
+            if current_cache[name]:
+                for covered in stage.freshness_covers:
+                    current_cache[covered] = True
+        return current_cache[name]
     for nm in ([only] if only else names[(names.index(from_stage) if from_stage else 0):
                                           (names.index(to_stage) if to_stage else len(names) - 1) + 1]):
         st = by_name[nm]
@@ -442,12 +470,17 @@ def drive(run: Run, stages: list, from_stage=None, to_stage=None, only=None, for
                     if need not in ancestors:
                         ancestors.add(need)
                         pending.append(need)
-            for need in names:
+            # Descendant receipts may fully replay an ancestor (for example the
+            # disclosure receipt includes the bound world opinion).  Check the
+            # most downstream ancestor first so one verified receipt can cover
+            # its declared inputs without weakening any standalone check.
+            for need in reversed(names):
                 if (need in ancestors and by_name[need].is_current is not None
-                        and not by_name[need].is_current(run)):
+                        and need not in st.refreshes
+                        and not is_current(need)):
                     raise SystemExit(f"✗ stage『{nm}』依赖的前序『{need}』验收已过期。"
                                      f"先从 --from {need} 重新运行。")
-            if run.is_done(nm) and not force and (st.is_current is None or st.is_current(run)):
+            if run.is_done(nm) and not force and is_current(nm):
                 run.log(f"⏭  跳过 {nm}(已完成;--force 重跑)")
                 continue
             # A freshness-triggered rebuild changes upstream artifacts just as
@@ -455,6 +488,7 @@ def drive(run: Run, stages: list, from_stage=None, to_stage=None, only=None, for
             invalidated = (_dependent_stage_names(nm, stages)
                            if force or run.is_done(nm) else None)
             _run_stage_locked(run, nm, st.fn, st.artifact, invalidated)
+            current_cache.clear()
     _finalize_run(run, names)
 
 

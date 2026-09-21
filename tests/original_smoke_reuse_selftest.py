@@ -4,6 +4,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -108,6 +109,109 @@ class ReuseTests(unittest.TestCase):
         reuse_original_stages(self.source, self.target, "questions")
         self.assertFalse((self.target / "05_corpus.ckpt.json").exists())
 
+    def test_exact_corpus_resume_copies_review_checkpoints_with_receipt(self):
+        self.question_source()
+        self.write("05_corpus.json", {"corpus": {"sessions": []}})
+        self.manifest["stages"]["corpus"] = {
+            "done": True, "status": "succeeded", "artifact": "05_corpus.json"}
+        self.manifest["status"] = "done"
+        self.write("manifest.json", self.manifest)
+        checkpoints = self.source / "06_review_checkpoints"
+        checkpoints.mkdir()
+        (checkpoints / "a.json").write_bytes(b'{"saved":1}')
+        (checkpoints / "b.json").write_bytes(b'{"saved":2}')
+        result = reuse_original_stages(
+            self.source, self.target, "corpus", reuse_review_checkpoints=True)
+        for name in ("a.json", "b.json"):
+            self.assertEqual((checkpoints / name).read_bytes(),
+                             (self.target / "06_review_checkpoints" / name).read_bytes())
+        receipt = result["derived_from"]["semantic_review_checkpoints"]
+        self.assertEqual(receipt["count"], 2)
+        self.assertEqual(receipt["total_bytes"], 22)
+        self.assertEqual(len(receipt["set_sha256"]), 64)
+
+    def test_review_checkpoints_require_exact_corpus_and_existing_files(self):
+        self.question_source()
+        with self.assertRaisesRegex(ValueError, "exact corpus reuse"):
+            reuse_original_stages(
+                self.source, self.target, "questions", reuse_review_checkpoints=True)
+        self.assertFalse(self.target.exists())
+
+    def test_disclosure_recovery_accepts_stale_downstream_running_manifest(self):
+        self.question_source()
+        self.manifest = json.loads((self.source / "manifest.json").read_text(encoding="utf-8"))
+        self.manifest.update(status="running", current_stage="grounding")
+        self.write("manifest.json", self.manifest)
+        result = reuse_original_stages(
+            self.source, self.target, "questions", repair_disclosure=True)
+        provenance = result["derived_from"]
+        self.assertTrue(provenance["stale_downstream_run_accepted"])
+        self.assertEqual(provenance["source_manifest_status"], "running")
+        self.assertEqual(provenance["source_manifest_current_stage"], "grounding")
+        self.assertEqual((self.source / "04_questions.json").read_bytes(),
+                         (self.target / "04_questions.json").read_bytes())
+
+    def test_disclosure_recovery_accepts_interrupted_disclosure_manifest(self):
+        self.question_source()
+        self.manifest = json.loads((self.source / "manifest.json").read_text(encoding="utf-8"))
+        self.manifest.update(status="running", current_stage="disclosure")
+        self.write("manifest.json", self.manifest)
+        result = reuse_original_stages(
+            self.source, self.target, "questions", repair_disclosure=True)
+        provenance = result["derived_from"]
+        self.assertTrue(provenance["stale_downstream_run_accepted"])
+        self.assertEqual(provenance["source_manifest_current_stage"], "disclosure")
+        self.assertEqual((self.source / "04_questions.json").read_bytes(),
+                         (self.target / "04_questions.json").read_bytes())
+
+    def test_disclosure_recovery_refreshes_stale_review_instead_of_reusing_it(self):
+        self.question_source()
+        self.write("02_world_review.json", {"status": "passed", "historical": True})
+        with patch("pipeline.world_semantics.enabled", return_value=True), \
+             patch("pipeline.world_semantics.validate_review",
+                   return_value=[{"code": "missing_or_stale_world_review"}]):
+            result = reuse_original_stages(
+                self.source, self.target, "questions", repair_disclosure=True)
+        self.assertEqual((self.target / "02_world_review.json").read_text(encoding="utf-8"),
+                         (self.source / "02_world_review.json").read_text(encoding="utf-8"))
+        self.assertEqual(result["derived_from"]["recovery"],
+                         "complete_or_validate_disclosure_then_resume_downstream")
+
+    def test_disclosure_recovery_drops_errored_review_checkpoint(self):
+        self.question_source()
+        self.write("02_world_review.json", {"status": "error"})
+        self.write("02_world_review_deadbeef.ckpt.json", {"transcript": [{"bad": True}]})
+        with patch("pipeline.world_semantics.enabled", return_value=False):
+            reuse_original_stages(self.source, self.target, "questions", repair_disclosure=True)
+        self.assertFalse((self.target / "02_world_review_deadbeef.ckpt.json").exists())
+
+    def test_disclosure_recovery_keeps_nonerror_review_checkpoint(self):
+        self.question_source()
+        self.write("02_world_review.json", {"status": "unresolved"})
+        self.write("02_world_review_deadbeef.ckpt.json", {"transcript": [{"saved": True}]})
+        with patch("pipeline.world_semantics.enabled", return_value=False):
+            reuse_original_stages(self.source, self.target, "questions", repair_disclosure=True)
+        self.assertTrue((self.target / "02_world_review_deadbeef.ckpt.json").exists())
+
+    def test_disclosure_recovery_keeps_checkpoint_after_temporary_windows_lock(self):
+        self.question_source()
+        self.write("02_world_review.json", {"status": "error",
+                   "error": "Original reviewer execution failed: [WinError 5] access denied"})
+        self.write("02_world_review_deadbeef.ckpt.json", {"transcript": [{"saved": True}]})
+        with patch("pipeline.world_semantics.enabled", return_value=False):
+            reuse_original_stages(self.source, self.target, "questions", repair_disclosure=True)
+        self.assertTrue((self.target / "02_world_review_deadbeef.ckpt.json").exists())
+
+    def test_disclosure_recovery_keeps_checkpoint_after_repeated_review_revision(self):
+        self.question_source()
+        self.write("02_world_review.json", {"status": "error",
+                   "error": "Four consecutive invalid world review actions: "
+                            "Submitted review revision did not change the opinion"})
+        self.write("02_world_review_deadbeef.ckpt.json", {"transcript": [{"saved": True}]})
+        with patch("pipeline.world_semantics.enabled", return_value=False):
+            reuse_original_stages(self.source, self.target, "questions", repair_disclosure=True)
+        self.assertTrue((self.target / "02_world_review_deadbeef.ckpt.json").exists())
+
     def test_incomplete_questions_cannot_be_reused(self):
         self.question_source()
         self.manifest["stages"]["questions"]["done"] = False
@@ -115,6 +219,64 @@ class ReuseTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             reuse_original_stages(self.source, self.target, "questions")
         self.assertFalse(self.target.exists())
+
+    def test_historical_world_checkpoint_recompiles_without_generation_calls(self):
+        source = ROOT / "output/experiment_snapshots/insurance_large_20260919_v7/output/runs/insurance_large_20260919_v7_01_insurance_r001"
+        if not source.exists():
+            self.skipTest("Local historical run is optional")
+        result = reuse_original_stages(source, self.target, "whitepaper",
+                                      reuse_world_checkpoint=True, model="glm-5.3-flash")
+        checkpoint = result["derived_from"]["world_construction_checkpoint"]
+        self.assertEqual((source / checkpoint).read_bytes(), (self.target / checkpoint).read_bytes())
+        self.assertTrue(result["derived_from"]["world_review_required"])
+        self.assertFalse((self.target / "02_world.json").exists())
+        from pipeline import world_agent, disclosure, closed_loop, run as run_module
+        from pipeline.world_state import WorldState
+        from pipeline.targetspec import TargetSpec
+        captured = []
+        class DisclosureReached(Exception):
+            pass
+        def denied(*args, **kwargs):
+            self.fail("A completed construction checkpoint must not call any author")
+        def at_disclosure(wp, ws, *args, **kwargs):
+            captured.append(disclosure._world(ws))
+            raise DisclosureReached()
+        with patch.object(world_agent.config, "STRUCTURE_MODEL", "glm-5.3-flash"), \
+             patch.object(run_module, "RUNS_DIR", self.target.parent), \
+             patch.object(disclosure, "author_plan", side_effect=at_disclosure):
+            run = run_module.Run(result["scenario"], self.target.name)
+            run.log = lambda *_: None
+            run.tracer.chat_json = denied
+            with self.assertRaises(DisclosureReached):
+                closed_loop.build_to_target(run, TargetSpec(min_questions=200, total_only=True,
+                                            max_world_entities=80, time_span_weeks=24))
+        old = WorldState.from_dict(json.loads((source / "02_world_candidate.json").read_text(encoding="utf-8")))
+        self.assertEqual(captured, [disclosure._world(old)])
+
+    def test_wrong_world_checkpoint_model_rejected_before_creating_destination(self):
+        source = ROOT / "output/experiment_snapshots/insurance_large_20260919_v7/output/runs/insurance_large_20260919_v7_01_insurance_r001"
+        if not source.exists():
+            self.skipTest("Local historical run is optional")
+        with self.assertRaisesRegex(ValueError, "binding mismatch"):
+            reuse_original_stages(source, self.target, "whitepaper",
+                                  reuse_world_checkpoint=True, model="wrong-model")
+        self.assertFalse(self.target.exists())
+
+    def test_corrupt_world_checkpoint_rejected_and_never_promoted_to_reviewed_world(self):
+        source = ROOT / "output/experiment_snapshots/insurance_large_20260919_v7/output/runs/insurance_large_20260919_v7_01_insurance_r001"
+        if not source.exists():
+            self.skipTest("Local historical run is optional")
+        result = reuse_original_stages(source, self.target, "whitepaper",
+                                      reuse_world_checkpoint=True, model="glm-5.3-flash")
+        checkpoint = self.target / result["derived_from"]["world_construction_checkpoint"]
+        state = json.loads(checkpoint.read_text(encoding="utf-8"))
+        state["steps"] += 1
+        checkpoint.write_text(json.dumps(state), encoding="utf-8")
+        other = Path(self.temp.name) / "rejected"
+        with self.assertRaisesRegex(ValueError, "binding mismatch"):
+            reuse_original_stages(self.target, other, "whitepaper",
+                                  reuse_world_checkpoint=True, model="glm-5.3-flash")
+        self.assertFalse(other.exists())
 
 
 if __name__ == "__main__":

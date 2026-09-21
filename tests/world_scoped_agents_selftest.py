@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import socket
 import sys
+import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -11,7 +12,7 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT), str(ROOT / "tests")]
 from pipeline import disclosure as d, world_semantics as review
-from pipeline.world_context import ReadWindow
+from pipeline.world_context import ReadWindow, ProgressGuard
 from world_semantics_selftest import fixture
 
 
@@ -149,8 +150,48 @@ class Tests(unittest.TestCase):
         tracer = Premature()
         report = review.review_world(self.wp, self.ws, tracer, self.task)
         self.assertEqual(report["status"], "error")
-        self.assertEqual(tracer.calls, 4)
-        self.assertIn("reading every", report["error"])
+        self.assertGreater(tracer.calls, 4)
+        self.assertIn("Invalid world review decision", report["error"])
+
+    def test_premature_finish_forces_next_exact_read_without_certifying(self):
+        self.author()
+        payload, _, _ = review._inputs(self.wp, self.ws, self.task, None, None)
+        window = review._scoped_review_context(payload)
+        keys = list(window.nodes)
+        window.read = {keys[0]}
+        state = {"issues": [], "mechanism_coverage": [], "disclosure_reviews": [],
+                 "note": "", "revisions": []}
+        result, advance = review._review_action(
+            {"action": "finish", "reason": "过早结束"}, window, state, payload)
+        self.assertIsNone(result)
+        self.assertTrue(advance)
+        self.assertNotEqual(window.read, set(window.nodes))
+
+    def test_witness_without_world_ref_is_rejected_at_submission_time(self):
+        self.author()
+        payload, _, _ = review._inputs(self.wp, self.ws, self.task, None, None)
+        window = review._scoped_review_context(payload)
+        first = next(iter(window.nodes))
+        window.read = {first}
+        mechanism = payload["seed"]["mechanisms"][0]["id"]
+        state = {"issues": [], "mechanism_coverage": [], "disclosure_reviews": [],
+                 "note": "", "revisions": []}
+        action = {"action": "submit", "issues": [], "disclosure_reviews": [],
+                  "mechanism_coverage": [{"mechanism_id": mechanism,
+                      "status": "witnessed", "refs": [], "reason": "声称已见证",
+                      "observed_sequence": "缺少世界节点"}], "note": "当前批意见"}
+        with self.assertRaisesRegex(ValueError, "actual world ref"):
+            review._review_action(action, window, state, payload)
+        self.assertEqual(state["mechanism_coverage"], [])
+
+    def test_error_receipt_reports_original_execution_failure(self):
+        self.author()
+        report = {"version": review.VERSION, "strategy": "agentic", "status": "error",
+                  "error_type": "ValueError", "error": "invalid finish action"}
+        errors = review.validate_review(report, self.wp, self.ws, self.task)
+        self.assertEqual(errors, [{"code": "world_review_execution_error",
+                                  "error_type": "ValueError",
+                                  "message": "invalid finish action"}])
 
     def test_cannot_arrange_unread_fact_and_can_recover_with_actual_read(self):
         class Recover(ScopedAgentFixture):
@@ -212,6 +253,254 @@ class Tests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "total input"):
             window.control({"action": "inspect", "ids": ["a"]})
         self.assertEqual(window.visible, {})
+
+    def test_progress_guard_counts_new_index_pages_but_rejects_page_loop(self):
+        window = ReadWindow({}, {str(i): {"value": i} for i in range(130)})
+        guard = ProgressGuard("offline reader", limit=2)
+        window.messages("offline", {}); window.mark_sent()
+        guard.observe(window.progress_marker())
+        window.control({"action": "index", "offset": 60})
+        window.messages("offline", {}); window.mark_sent()
+        guard.observe(window.progress_marker())
+        window.control({"action": "index", "offset": 0})
+        window.messages("offline", {}); window.mark_sent()
+        guard.observe(window.progress_marker())
+        with self.assertRaisesRegex(ValueError, "no cumulative progress"):
+            guard.observe(window.progress_marker())
+
+    def test_world_reviewer_directory_loop_fails_fast(self):
+        self.author()
+        class Loop:
+            def __init__(self): self.calls = 0
+            def chat_json(self, *args, **kwargs):
+                self.calls += 1
+                return {"action": "index", "offset": 0 if self.calls % 2 else 60}
+        tracer = Loop()
+        result = review.review_world(self.wp, self.ws, tracer, self.task)
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(tracer.calls, 4)
+        self.assertIn("delivery is automatic", result["error"])
+
+    def test_world_reviewer_does_not_advance_without_batch_record(self):
+        self.author()
+        seen = []
+        class OneBadThenReview(ScopedAgentFixture):
+            def chat_json(inner, step, messages, **params):
+                payload = json.loads(messages[-1]["content"])
+                if step == review.STEP:
+                    seen.append((tuple(payload["unread_ids"]), tuple(payload["exact_reads"])))
+                    if len(seen) == 1:
+                        return {"action": "continue"}
+                return super().chat_json(step, messages, **params)
+        result = review.review_world(self.wp, self.ws, OneBadThenReview(), self.task)
+        self.assertEqual(result["status"], "passed", result)
+        self.assertGreaterEqual(len(seen), 2)
+        self.assertEqual(seen[0][1], seen[1][1])
+
+    def test_validator_feedback_allows_same_identity_revision_with_audit(self):
+        self.author()
+        payload, _, _ = review._inputs(self.wp, self.ws, self.task, None, None)
+        window = review._scoped_review_context(payload)
+        window.read = set(window.nodes)
+        ref_id = next(r["ref_id"] for key in window.read
+                      for r in window.nodes[key].get("reference_index", []))
+        old = {"id": "i1", "finding": "旧意见", "refs": [ref_id],
+               "alternative_reading": "旧解释", "disposition": "non_blocking"}
+        new = {**old, "finding": "收到校验反馈后的修订意见", "alternative_reading": "修订解释"}
+        state = {"issues": [deepcopy(old)], "mechanism_coverage": [],
+                 "disclosure_reviews": [], "note": "旧批次", "revisions": []}
+        action = {"action": "submit", "issues": [new], "mechanism_coverage": [],
+                  "disclosure_reviews": [], "note": "根据 finish 校验错误修订同一意见。"}
+        with self.assertRaisesRegex(ValueError, "Repeated submitted review identity"):
+            review._review_action(action, window, deepcopy(state), payload)
+        _, advance = review._review_action(action, window, state, payload,
+            allow_revision=True, revision_reason="finish validator rejected the old citation")
+        self.assertTrue(advance)
+        self.assertEqual(state["issues"], [new])
+        self.assertEqual(state["revisions"][0]["previous"], old)
+        self.assertEqual(state["revisions"][0]["replacement"], new)
+
+    def test_unchanged_opinion_can_acknowledge_a_new_batch_but_cannot_loop_after_all_reads(self):
+        self.author()
+        payload, _, _ = review._inputs(self.wp, self.ws, self.task, None, None)
+        window = review._scoped_review_context(payload)
+        keys = list(window.nodes)
+        window.read = set(keys[:-1])
+        ref_id = next(r["ref_id"] for key in window.read
+                      for r in window.nodes[key].get("reference_index", []))
+        old = {"id": "i1", "finding": "意见保持", "refs": [ref_id],
+               "alternative_reading": "已核对", "disposition": "non_blocking"}
+        state = {"issues": [deepcopy(old)], "mechanism_coverage": [],
+                 "disclosure_reviews": [], "note": "此前批次", "revisions": []}
+        action = {"action": "submit", "issues": [deepcopy(old)],
+                  "mechanism_coverage": [], "disclosure_reviews": [],
+                  "note": "新交付材料没有改变既有意见。"}
+        _, advance = review._review_action(
+            action, window, state, payload, allow_revision=True,
+            revision_reason="premature finish")
+        self.assertTrue(advance)
+        self.assertEqual(state["issues"], [old])
+        window.read = set(window.nodes)
+        with self.assertRaisesRegex(ValueError, "output finish"):
+            review._review_action(
+                action, window, state, payload, allow_revision=True,
+                revision_reason="premature finish")
+
+    def test_migrated_checkpoint_keeps_maximal_compatible_prefix(self):
+        old_rows = [{"messages_hash": f"old-{i}", "call": {}, "raw_output": {}}
+                    for i in range(3)]
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            checkpoint = folder / "02_world_review_historical.ckpt.json"
+            checkpoint.write_text(json.dumps({
+                "identity": "historical", "transcript": old_rows,
+                "hash": review._hash(old_rows), "legacy_resume_prefix": 3,
+            }), encoding="utf-8")
+            tracer = SimpleNamespace(pfile=folder / "prompts.jsonl")
+            calls = []
+            def session(*args, **kwargs):
+                calls.append(deepcopy(kwargs))
+                if len(calls) == 1:
+                    raise ValueError(
+                        "Scoped review exact-read messages or call changed at entry 2")
+                return ({}, {"protocol": "test"}, {"step": review.STEP, "params": {}},
+                        [], {"decision": "accept"})
+            with patch.object(review, "_scoped_review_session", side_effect=session), \
+                 patch.object(review, "_parse", return_value={"status": "passed"}):
+                result = review._review_agentic(
+                    self.wp, self.ws, tracer, self.task, None, None)
+            self.assertEqual(result["status"], "passed")
+            self.assertEqual(len(calls[0]["resume"]), 3)
+            self.assertEqual(len(calls[1]["resume"]), 2)
+            self.assertEqual(calls[1]["legacy_resume_prefix"], 2)
+            self.assertEqual(calls[1]["compatibility_resume_length"], 2)
+
+    def test_reviewer_accepts_bounded_state_echo_and_long_batch_note(self):
+        self.author()
+        payload, _, _ = review._inputs(self.wp, self.ws, self.task, None, None)
+        window = review._scoped_review_context(payload)
+        state = {"issues": [], "mechanism_coverage": [], "disclosure_reviews": [],
+                 "note": "", "revisions": []}
+        action = {"action": "submit", "issues": [], "mechanism_coverage": [],
+                  "disclosure_reviews": [], "note": "审" * 1436,
+                  "revision_count": 0,
+                  "working_state": review._scoped_review_state(state)}
+        _, advance = review._review_action(action, window, state, payload)
+        self.assertTrue(advance)
+        self.assertEqual(len(state["note"]), 1436)
+
+        bad = deepcopy(action)
+        bad["revision_count"] = 3
+        _, advance = review._review_action(bad, window, {"issues": [], "mechanism_coverage": [],
+            "disclosure_reviews": [], "note": "", "revisions": []}, payload)
+        self.assertTrue(advance)
+
+        malformed = deepcopy(action)
+        malformed["revision_count"] = "stale"
+        with self.assertRaisesRegex(ValueError, "nonnegative integer"):
+            review._review_action(malformed, window, {"issues": [], "mechanism_coverage": [],
+                "disclosure_reviews": [], "note": "", "revisions": []}, payload)
+
+        with self.assertRaisesRegex(ValueError, "Unknown scoped review submission fields"):
+            review._review_action(action, window, {"issues": [], "mechanism_coverage": [],
+                "disclosure_reviews": [], "note": "", "revisions": []}, payload, legacy=True)
+
+    def test_premature_consolidated_final_is_saved_as_batch_and_keeps_reading(self):
+        self.author()
+        payload, _, _ = review._inputs(self.wp, self.ws, self.task, None, None)
+        window = review._scoped_review_context(payload)
+        state = {"issues": [], "mechanism_coverage": [], "disclosure_reviews": [],
+                 "note": "", "revisions": []}
+        raw = {"mechanism_coverage": [], "disclosure_reviews": [], "issues": [],
+               "repair_targets": {"intrinsic": [], "structure": False, "disclosure": False},
+               "limitations": "尚有原始节点未读。", "reason": "当前批综合判断。",
+               "decision": "unresolved"}
+        result, advance = review._review_action(raw, window, state, payload)
+        self.assertIsNone(result)
+        self.assertTrue(advance)
+        self.assertEqual(state["note"], "当前批综合判断。")
+
+    def test_complete_consolidated_final_withdraws_progress_only_issue(self):
+        self.author()
+        payload, _, _ = review._inputs(self.wp, self.ws, self.task, None, None)
+        window = review._scoped_review_context(payload)
+        window.read = set(window.nodes)
+        ref_id = next(r["ref_id"] for key in window.read
+                      for r in window.nodes[key].get("reference_index", []))
+        early = {"id": "progress_only", "finding": "仍有材料未读。", "refs": [ref_id],
+                 "alternative_reading": "全部读取后重新判断。", "disposition": "unresolved"}
+        state = {"issues": [early], "mechanism_coverage": [], "disclosure_reviews": [],
+                 "note": "早期进度意见", "revisions": []}
+        raw = {"mechanism_coverage": [], "disclosure_reviews": [], "issues": [],
+               "repair_targets": {"intrinsic": [], "structure": False, "disclosure": False},
+               "limitations": "全部原始节点已读取。", "reason": "最终没有阻断问题。",
+               "decision": "accept"}
+        with patch.object(review, "_parse") as parse:
+            result, advance = review._review_action(raw, window, state, payload)
+        self.assertFalse(advance)
+        self.assertEqual(result["issues"], [])
+        self.assertEqual(state["issues"], [])
+        self.assertEqual(state["revisions"][-1]["previous"], early)
+        self.assertIsNone(state["revisions"][-1]["replacement"])
+        parse.assert_called_once()
+
+    def test_complete_final_can_echo_compact_disclosure_working_state(self):
+        self.author()
+        payload, _, _ = review._inputs(self.wp, self.ws, self.task, None, None)
+        window = review._scoped_review_context(payload)
+        window.read = set(window.nodes)
+        record = payload["disclosure_record_contexts"][0]
+        full = {"record_id": record["record_id"], "understanding": "已提交完整理解。",
+                "refs": [record["record_ref_id"]], "reason": "完整依据已在前一批提交。",
+                "status": "compatible"}
+        state = {"issues": [], "mechanism_coverage": [],
+                 "disclosure_reviews": [deepcopy(full)], "note": "此前批次",
+                 "revisions": []}
+        raw = {"mechanism_coverage": [],
+               "disclosure_reviews": [{"record_id": full["record_id"],
+                                        "status": "compatible"}],
+               "issues": [],
+               "repair_targets": {"intrinsic": [], "structure": False,
+                                  "disclosure": False},
+               "limitations": "全部节点已读。", "reason": "确认已提交意见。",
+               "decision": "accept"}
+        with patch.object(review, "_parse") as parse:
+            result, advance = review._review_action(raw, window, state, payload)
+        self.assertFalse(advance)
+        self.assertEqual(result["disclosure_reviews"], [full])
+        parse.assert_called_once()
+
+    def test_finish_reaffirms_consolidated_opinion_after_last_transport_read(self):
+        self.author()
+        payload, _, _ = review._inputs(self.wp, self.ws, self.task, None, None)
+        window = review._scoped_review_context(payload)
+        keys = list(window.nodes)
+        window.read = set(keys[:-1])
+        ref_id = next(r["ref_id"] for key in window.read
+                      for r in window.nodes[key].get("reference_index", []))
+        early = {"id": "unread_progress", "finding": "仍有节点未读。", "refs": [ref_id],
+                 "alternative_reading": "读完后可撤回。", "disposition": "unresolved"}
+        state = {"issues": [early], "mechanism_coverage": [], "disclosure_reviews": [],
+                 "note": "早期进度", "revisions": []}
+        consolidated = {"mechanism_coverage": [], "disclosure_reviews": [], "issues": [],
+                        "repair_targets": {"intrinsic": [], "structure": False,
+                                           "disclosure": False},
+                        "limitations": "完整意见已形成。", "reason": "当前结论通过。",
+                        "decision": "accept"}
+        result, advance = review._review_action(consolidated, window, state, payload)
+        self.assertIsNone(result)
+        self.assertTrue(advance)
+        window.read = set(window.nodes)
+        finish = {"action": "finish", "decision": "accept",
+                  "repair_targets": deepcopy(consolidated["repair_targets"]),
+                  "reason": "读完最后节点后确认通过。", "limitations": "全部节点已读。"}
+        with patch.object(review, "_parse") as parse:
+            result, advance = review._review_action(finish, window, state, payload)
+        self.assertFalse(advance)
+        self.assertEqual(result["issues"], [])
+        self.assertEqual(state["issues"], [])
+        self.assertIsNone(state["revisions"][-1]["replacement"])
+        parse.assert_called_once()
 
     def test_raised_provider_error_records_entered_call(self):
         class Broken:

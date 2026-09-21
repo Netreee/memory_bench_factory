@@ -288,7 +288,7 @@ def _missing_refs(ws, raw):
 
 def _call(model):
     return {"step": STEP, "params": {"model": _text(model, "author model"), "temperature": 0.2,
-            "max_tokens": MAX_TOKENS, "retries": 1, "strict_json": True,
+            "max_tokens": MAX_TOKENS, "retries": 3, "strict_json": True,
             "response_format": {"type": "json_object"}}}
 
 
@@ -306,8 +306,11 @@ def compile_plan(wp, ws, raw, task_input=None, feedback=None, model="offline-fix
     return plan
 
 
-def author_plan(wp, ws, tracer, task_input=None, feedback=None):
+def author_plan(wp, ws, tracer, task_input=None, feedback=None, *, checkpoint_dir=None):
     """Author then perform bounded shape/ref repairs; provider failures stop."""
+    if (wp.get("world_generation") or {}).get("disclosure_strategy") == "direct_batches_v1":
+        from pipeline.disclosure_batches import author
+        return author(wp, ws, tracer, task_input, feedback, checkpoint_dir)
     from pipeline.world_context import enabled as agentic_enabled
     if agentic_enabled(wp):
         return _author_agentic(wp, ws, tracer, task_input, feedback)
@@ -373,6 +376,9 @@ def validate_plan(ws):
         plan = getattr(ws, "disclosure", None)
         if not isinstance(plan, dict) or not plan:
             raise ValueError("Missing public disclosure plan")
+        if plan.get("strategy") in ("direct-disclosure/v1", "direct-disclosure/v2"):
+            from pipeline.disclosure_batches import validate
+            return validate(ws)
         if plan.get("strategy") == "agentic":
             return _validate_agentic_plan(ws)
         saved = {k: deepcopy(v) for k, v in plan.items() if k != "plan_hash"}
@@ -421,10 +427,11 @@ def validate_plan(ws):
         return [{"code": "missing_or_stale_disclosure", "message": f"{type(exc).__name__}: {exc}"}]
 
 
-def _occurrences(ws, session, *, history=False):
-    errors = validate_plan(ws)
-    if errors:
-        raise ValueError(errors[0]["message"])
+def _occurrences(ws, session, *, history=False, validated=False):
+    if not validated:
+        errors = validate_plan(ws)
+        if errors:
+            raise ValueError(errors[0]["message"])
     _session(ws, session)
     plan = ws.disclosure
     by_ref = {item["ref"]: item for item in plan["catalogue"]}
@@ -515,7 +522,7 @@ def _author_action(action, window, raw, ws):
 
 
 def _scoped_author_session(wp, ws, task_input, feedback, model, tracer=None, transcript=None, records=None):
-    from pipeline.world_context import INSTRUCTION, MAX_STEPS
+    from pipeline.world_context import INSTRUCTION, MAX_STEPS, ProgressGuard
     payload = _payload(wp, ws, task_input, feedback)
     window = _scoped_author_context(payload)
     system = SYSTEM.split("只输出三键 JSON：")[0] + INSTRUCTION + SCOPED_AUTHOR_RULES
@@ -523,6 +530,7 @@ def _scoped_author_session(wp, ws, task_input, feedback, model, tracer=None, tra
     raw = {"records": [], "undisclosed": [], "reason": "尚未完成安排"}
     records = [] if records is None else records
     action_error, failures = None, 0
+    progress = ProgressGuard("Disclosure author")
     for number in range(MAX_STEPS):
         state = _scoped_author_state(raw, ws)
         if action_error is not None:
@@ -549,6 +557,7 @@ def _scoped_author_session(wp, ws, task_input, feedback, model, tracer=None, tra
             raise RuntimeError("Original author execution failed: " + str(action["__error__"]))
         try:
             raw, finished = _author_action(action, window, raw, ws)
+            progress.observe((window.progress_marker(), _hash(raw)))
         except (ValueError, KeyError, TypeError) as exc:
             action_error, failures = str(exc), failures + 1
             if failures >= 4:
@@ -610,25 +619,26 @@ def _fact(record, item, ws):
             "acquisition_context": record["acquisition_context"]}
 
 
-def session_facts(ws, s):
+def session_facts(ws, s, *, validated=False):
     if not getattr(ws, "disclosure", None):
         from pipeline.render import _session_facts
         return _session_facts(ws, s)
-    return [_fact(record, item, ws) for record, item in _occurrences(ws, s) if item["kind"] == "fact"]
+    return [_fact(record, item, ws) for record, item in _occurrences(ws, s, validated=validated)
+            if item["kind"] == "fact"]
 
 
-def session_events(ws, s):
+def session_events(ws, s, *, validated=False):
     if not getattr(ws, "disclosure", None):
         return [deepcopy(item) for item in ws.events if item.get("session") == s]
     return [{**deepcopy(item["event"]), "target_ref": item["ref"], "disclosure_id": record["id"],
              "disclosure_session": record["session"], "disclosure_date": ws.date_of_session(record["session"]),
              "channel": record["channel"], "acquisition_context": record["acquisition_context"]}
-            for record, item in _occurrences(ws, s) if item["kind"] == "event"]
+            for record, item in _occurrences(ws, s, validated=validated) if item["kind"] == "event"]
 
 
-def source_assertions(ws, s):
+def source_assertions(ws, s, *, validated=False):
     # Existing L5 declarations retain their original public publication times.
-    if getattr(ws, "disclosure", None):
+    if getattr(ws, "disclosure", None) and not validated:
         errors = validate_plan(ws)
         if errors:
             raise ValueError(errors[0]["message"])
@@ -643,12 +653,12 @@ def source_assertions(ws, s):
     return sorted({row["assertion_id"]: row for row in rows}.values(), key=lambda item: item["assertion_id"])
 
 
-def context(ws, s, entities=None):
+def context(ws, s, entities=None, *, validated=False):
     if not getattr(ws, "disclosure", None):
         from pipeline.corpus_contract import canonical_context
         return canonical_context(ws, s, entities)
     from pipeline.corpus_contract import VERSION as CORPUS_VERSION, public_stage_rules
-    occurrences = list(_occurrences(ws, s, history=True))
+    occurrences = list(_occurrences(ws, s, history=True, validated=validated))
     selected = None if entities is None else set(entities)
     facts = []
     events, claims, public_records = [], [], {}
@@ -675,7 +685,8 @@ def context(ws, s, entities=None):
     return {"version": CORPUS_VERSION, "disclosure_version": VERSION, "session": s,
         "document_date": ws.date_of_session(s), "period_label": f"第{s+1}{ws.period_unit()}",
         "truth_hash": ws.disclosure["binding"]["truth_hash"], "disclosure_hash": ws.disclosure["plan_hash"],
-        "facts": facts, "events": events, "source_assertions": source_assertions(ws, s),
+        "facts": facts, "events": events,
+        "source_assertions": source_assertions(ws, s, validated=validated),
         "public_claims": claims, "disclosures": list(public_records.values()),
         "field_schemas": [{"entity_type": item.get("id"), "fields": deepcopy(item.get("fields", []))}
                           for item in (ws.world_blueprint or {}).get("entity_types", [])],

@@ -99,6 +99,12 @@ class CouncilTracer:
             if self.always_bad or (self.first_bad and tag == "council.world"):
                 candidate["causal_rules"] = []
             return {"world_blueprint": candidate}
+        if tag == "council.blueprint_feasibility":
+            business = json.loads(messages[1]["content"])["business"]
+            return {"decision": "accept", "reason": "Fixture process is expressible", "issues": [],
+                    "mechanism_checks": [{"mechanism_id": m["id"], "status": "feasible",
+                        "walkthrough": "A revision is followed by review of the same report"}
+                        for m in business["mechanisms"]]}
         if tag == "council.map":
             return {"per_line": [
                 {"line": identity, "applicable": identity == "L1_timeline",

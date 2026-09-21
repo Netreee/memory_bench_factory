@@ -65,7 +65,7 @@ def _author_world(world):
     projected = deepcopy(world)
     plan = projected.get("disclosure")
     if isinstance(plan, dict):
-        for key in ("author_input", "source_inputs", "binding", "call"):
+        for key in ("author_input", "source_inputs", "binding", "call", "parts", "batch_binding", "transcript"):
             plan.pop(key, None)
     return projected
 
@@ -222,6 +222,9 @@ def _derive(raw, ws, target):
 
 
 def validate_process_report(report, wp, ws):
+    if isinstance(report, dict) and report.get("strategy") == "process-batches/v1":
+        from pipeline.process_batches import validate
+        return validate(report, wp, ws)
     if (not isinstance(report, dict) or report.get("version") != VERSION
             or report.get("status") != "completed"):
         raise ValueError("Process proposal execution is not complete")
@@ -239,8 +242,13 @@ def validate_process_report(report, wp, ws):
 
 
 def propose_process_orders(wp, ws, *, target, chat_json, model, max_calls=1,
-                           max_tokens=8192, max_input_chars=200000, record=None):
+                           max_tokens=8192, max_input_chars=200000, record=None, checkpoint_path=None):
     prepared = prepare_process_proposals(wp, ws, target=target, model=model, max_tokens=max_tokens)
+    if checkpoint_path is not None and target > 0 and (target > 8 or
+            sum(len(m["content"]) for m in prepared["messages"]) > max_input_chars):
+        from pipeline.process_batches import propose
+        return propose(wp, ws, target=target, chat_json=chat_json, model=model,
+                       max_tokens=max_tokens, checkpoint_path=checkpoint_path)
     if type(max_calls) is not int or max_calls not in (0, 1):
         raise ValueError("One-attempt proposal budget must be zero or one")
     if type(max_input_chars) is not int or max_input_chars <= 0:

@@ -141,6 +141,32 @@ def _observed_strings(value) -> list[str]:
     return list(dict.fromkeys(clean))
 
 
+def _normalize_haystack_plan(medium: dict) -> dict:
+    """Turn the medium agent's bounded proposal into an executable corpus plan."""
+    medium = medium if isinstance(medium, dict) else {}
+    raw = medium.get("haystack_plan")
+    raw = raw if isinstance(raw, dict) else {}
+    requested = raw.get("filler_documents_per_session")
+    documents = requested if type(requested) is int else 8
+    documents = max(8, min(12, documents))
+
+    def strings(value, limit):
+        clean = [item.strip() for item in value
+                 if isinstance(item, str) and item.strip()] if isinstance(value, list) else []
+        return list(dict.fromkeys(clean))[:limit]
+
+    genres = strings(raw.get("filler_genres"), 12)
+    topics = strings(raw.get("filler_topics"), 20)
+    why = raw.get("why")
+    return {
+        "version": "domain-native-haystack/v1",
+        "filler_documents_per_session": documents,
+        "filler_genres": genres,
+        "filler_topics": topics,
+        "why": why.strip()[:1000] if isinstance(why, str) and why.strip() else "",
+    }
+
+
 def _observed_blueprint_issues(blueprint: dict, observed: dict) -> list[str]:
     """检查蓝图是否完整且原样承接 few-shot 的字面字段硬事实。"""
     fields_by_name = {}
@@ -449,6 +475,7 @@ def _assemble_whitepaper(views: dict, desc: str) -> dict:
 
     temporal = blueprint["temporal_model"]
     n_ent = sum(t["count"] for t in type_specs)
+    corpus_plan = _normalize_haystack_plan(med)
     derived_sms = [{"field": f["name"], "states": f["states"]}
                    for t in type_specs for f in t.get("fields", [])
                    if f.get("name") and isinstance(f.get("states"), list) and f.get("states")]
@@ -463,6 +490,7 @@ def _assemble_whitepaper(views: dict, desc: str) -> dict:
         "medium": {"type": "documents", "genres": genres[:6], "cadence": temporal["cadence"],
                    "time_unit": temporal["unit"],
                    "candidates": (med.get("common_media") or []) + [m.get("form") for m in (med.get("unconventional_media") or [])]},
+        "corpus_plan": corpus_plan,
         "active_lines": active,
         "shared_world_spec": {"entities": {"count": n_ent},
                               "timeline": {"n_sessions": temporal["n_sessions"],
@@ -604,6 +632,7 @@ def central_office(desc, few_shot, tracer, log=print, *, seed_pack=None) -> dict
     # 架构师输出先过机械硬门；把明确错误与完整 observe 冻结清单共同回喂，避免修一处忘一处。
     world_out: dict = {}
     world_error = ""
+    feasibility_reviews = []
     observed_contract = json.dumps(
         {"observed_fields": (views.get("observe") or {}).get("observed_fields") or [],
          "observed_media": (views.get("observe") or {}).get("observed_media") or []},
@@ -656,12 +685,22 @@ def central_office(desc, few_shot, tracer, log=print, *, seed_pack=None) -> dict
                 log(f"    议会·world 第{world_attempt}轮未通过种子承接:{world_error}")
                 continue
             log(f"    议会·seed ✓({pack['seed_id']};结构承接验证)")
+            from pipeline.blueprint_feasibility import assess
+            review_wp = attach_seed_contract({"world_blueprint": blueprint}, pack)
+            review = assess(review_wp, tracer)
+            feasibility_reviews.append(review)
+            if review["decision"] != "accept":
+                world_error = "业务可执行性复核尚未通过：" + json.dumps(review["review"], ensure_ascii=False)
+                log(f"    议会·world 第{world_attempt}轮需修订业务约束:{world_error}")
+                continue
         log(f"    议会·world ✓(综合前置材料;第{world_attempt}轮)")
         break
     else:
-        raise WorldBlueprintError("world 架构师六轮后仍未通过机械/观察/种子校验:" + world_error)
+        raise WorldBlueprintError("world 架构师六轮后仍未通过机械/观察/种子/业务可执行性校验:" + world_error)
     # world 是能力映射的前置条件：先机械验骨架，再让 map 只判断哪些能力天然可读。
     views["world"] = {"world_blueprint": deepcopy(blueprint)}
+    if feasibility_reviews:
+        views["blueprint_feasibility"] = feasibility_reviews
     map_ask = ("基于下面这份【已经冻结并通过机械校验的 world_blueprint】做能力映射。"
                "只能引用其中已有的实体类型、字段、关系和事件；不准为了激活某条产线要求世界补结构。\n"
                + json.dumps(blueprint, ensure_ascii=False))

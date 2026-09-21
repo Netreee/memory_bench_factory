@@ -34,6 +34,12 @@ class RequiredSeedFieldTests(unittest.TestCase):
             calls.append(step)
             if step == "council.world":
                 return {"world_blueprint": deepcopy(blueprint)}
+            if step == "council.blueprint_feasibility":
+                payload = json.loads(messages[-1]["content"])
+                return {"decision": "accept", "reason": "Offline fixture for field preservation",
+                        "issues": [], "mechanism_checks": [{"mechanism_id": m["id"], "status": "feasible",
+                            "walkthrough": "Offline control-flow fixture, no semantic claim"}
+                            for m in payload["business"].get("mechanisms", [])]}
             if step == "council.map":
                 return {"per_line": [{"line": lid, "applicable": lid == "L1_timeline",
                     "gt_feasible": lid == "L1_timeline", "instantiation": "Read dated records",

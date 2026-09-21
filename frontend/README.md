@@ -27,7 +27,20 @@ cd memory-forge-showcase
 ./scripts/live-demo.sh
 ```
 
-浏览器打开 <http://127.0.0.1:3000>。不创建 `.env` 也可以浏览全部可回放历史记录。
+启动脚本会同时显示本机地址和局域网地址。同一局域网中的其他设备可打开脚本显示的地址，例如 `http://192.168.10.100:3000`。前端和本地 API 默认监听这台机器的所有网卡，但不会自动发布到公网；不创建 `.env` 也可以浏览全部可回放历史记录。
+
+如果机器有多个网卡或 VPN，自动识别的地址不正确，可以显式指定：
+
+```bash
+MEMORY_FORGE_PUBLIC_HOST=192.168.10.100 ./scripts/live-demo.sh
+```
+
+Linux 主机启用了 UFW 时，还需仅对所在局域网放行网页与本地 API 端口：
+
+```bash
+sudo ufw allow from 192.168.10.0/24 to any port 3000 proto tcp
+sudo ufw allow from 192.168.10.0/24 to any port 8791 proto tcp
+```
 
 启用真实 Live：
 

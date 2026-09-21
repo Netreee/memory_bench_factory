@@ -76,19 +76,30 @@ def validate_reference_proposal(reference):
 
 
 def audit_reference(question, corpus, public_protocol, *, model, chat_json,
-                    max_calls=1, max_input_chars=500000, max_tokens=16384, record=None):
+                    max_calls=1, max_input_chars=500000, max_tokens=16384, record=None,
+                    prepared_documents=None):
     # Validate before _questions' JSON copy can coerce non-string object keys.
     validate_reference_proposal(question.get("reference_proposal") if isinstance(question, dict) else None)
     row = agent_editing._questions([question])[0]
     reference = row.get("reference_proposal")
     if not isinstance(public_protocol, str) or not public_protocol.strip():
         raise ValueError("Public protocol required")
-    documents, _ = visible_documents(corpus, include_titles=False)
+    if prepared_documents is None:
+        documents, _ = visible_documents(corpus, include_titles=False)
+    else:
+        documents = deepcopy(prepared_documents)
+        if (not isinstance(documents, list) or not documents
+                or any(not isinstance(doc, dict) or not isinstance(doc.get("doc_id"), str)
+                       for doc in documents)
+                or len({doc["doc_id"] for doc in documents}) != len(documents)):
+            raise ValueError("prepared_documents must be a nonempty unique visible-document list")
     original = {key: reference[key] for key in ("answer", "rationale")}
     location_policy = reference_location_policy()
     location_observations = {}
 
     def validate(value):
+        from pipeline.paged_read import validate as validate_paged_read
+        validate_paged_read(value, documents)
         errors, claim_locations = [], []
         if value.get("decision") not in {"accept", "revise", "unresolved"}:
             errors.append("invalid_decision")

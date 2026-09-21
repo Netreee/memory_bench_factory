@@ -18,10 +18,12 @@ from pipeline.seed_world import seed_business_context, seed_protected_fields, se
 from pipeline.world_blueprint import WorldBlueprintError, normalize_world_blueprint, relation_owner_side
 from pipeline.world_joint_plan import apply_initial_states, BASELINE_INSTRUCTION
 from pipeline.world_state import WorldState, assemble_world, validate
+from pipeline.blueprint_feasibility import BlueprintReviewRequested
 
-VERSION = "original-world-agent/v1"
+VERSION = "original-world-agent/v3"
 TABLE_KEYS = ("entities", "relations", "events", "initial_states")
 MAX_CONTEXT_CHARS = 120_000
+FORMAT_ATTEMPTS = 3
 PLANNER_SYSTEM = """你管理原 pipeline 的世界生成。任务边界、共享对象、先后依赖由你按业务判断，计划可随实际结果修订。每次只输出一个动作 JSON。
 目标是逐步建立同一个世界。优先让完整业务过程的对象、关系、初态、事件一起生成；不要按固定实体数、类型或时间窗口机械切割。先安排整体布局，再细化下一项工作；可合并尚未完成的任务。合法稳定、未知、未触发情形可以保留。
 所有原任务/蓝图/日历保持不变；数量为全局最低要求，每个工作单元无需满足全部最低要求。机制需要真实对象上的前后过程，文字计划和数量本身不能证明业务机制成立。
@@ -31,6 +33,8 @@ PLANNER_SYSTEM = """你管理原 pipeline 的世界生成。任务边界、共�
 3. {"action":"revise","unit_id":"需要修改的已接受单元id","reason":"原事实哪里有问题，如何重新组织"}：撤回该单元和它后面全部单元；撤回事实将不再可引用。随后用 write 重新安排，可合并/拆分。更早的单元保持不变；撤回原稿仍可 inspect，通过 read_units 请求。
 4. {"action":"finish","reason":"全局事实已完整，说明机制怎样落实","issue_responses":[{"issue_id":"如有外部审阅问题，逐项填写","disposition":"addressed|disputed|deferred","response":"结合原任务与真实事实给出回应依据"}]}：交完整编译和种子验收；失败会返回问题，继续补写/修订。之后仍需原系统世界语义审阅和公开安排闸。
 5. {"action":"report_unresolved","reason":"具体无法完成的要求或上下文问题"}：如实停止。
+6. {"action":"request_blueprint_review","reason":"原任务要求与哪项蓝图约束冲突，引用失败证据","suggestion":"建议上游复核哪些字段约束"}：请求原白皮书作者复核。你不能改蓝图；上游可能拒绝修改。先区分自身事实错误与约束矛盾，不能仅因生成失败就要求删业务要求。
+同类错误反复出现时，结合 prior_failures 重新判断原因；可 inspect 读全旧事实，revise 更早的错误单元，或请求上游约束复核。循环确认/重开若受到 states 单向顺序阻碍，应提交矛盾证据。不要通过更换 unit_id 反复提交相同错误。occupied_ids 只列全局已用编号，实际业务事实需按引用读取。
 执行输出不足或上下文过大时缩小工作单元，保留已接受成果。外部审阅意见可以质疑，须基于原任务和事实逐项回应；可修改，也可给出依据反驳并保持事实，后续原语义闸将独立重审。新审阅反馈不得无回应直接 finish。
 只输出该动作所需字段，禁止编造问题、答案、评分或另建世界。"""
 
@@ -39,7 +43,10 @@ AUTHOR_SYSTEM = """你是原世界阶段的一位业务作者。完成 planner �
 严格 JSON：{"entities":[{"name":"唯一专名","type":"蓝图类型id","purpose":"可选作者用途说明","fields":{"内在字段":{"type":"stable","value":"值"},"变化字段":{"type":"evolving","trajectory":[{"session":0,"value":"值"},{"session":2,"value":"另一值"}]}}}],"relations":[{"id":"唯一id","type":"关系类型id","from":"实体名","to":"实体名","session":0}],"events":[{"id":"唯一id","type":"事件类型id","session":1,"participants":{"角色":"实体名"},"effects":[{"entity":"角色所指实体","field":"声明effect字段","set":"新值"}],"caused_by":"可省的父事件id"}],"initial_states":[]}。
 entities 只创建新对象，必须包含本类型全部内在字段。relation-owned/event-owned 字段仅通过关系、事件与合法 initial_states 生成，禁止在 entities.fields 暗写结构字段。静态关系 session=0，时变关系按业务安排，禁止重复边凑数量。事件角色准确且互异，effects 恰好覆盖声明，每个效果造成真实变化；因果 caused_by 引用真实父事件并遵守声明精确时间差。父事件可以是本次新增，也可以是明确读取的已有事件。
 对已有实体仅引用上下文里完整读取的实体，不改写其既有字段；所有旧事件/关系保留，新增实例id唯一。同一字段同一期不得双写冲突。数量目标在整个世界验收，本单位只完成指定业务范围，禁止填满全世界。不要输出 cascades 或额外事实字段。
-""" + BASELINE_INSTRUCTION
+""" + BASELINE_INSTRUCTION + """
+回复只能包含一个完整 JSON 对象，不得在对象前后添加说明或代码围栏。
+业务留痕通过蓝图声明的事实字段、关系和事件表达；若任务要求的留痕无法用当前蓝图表达，返回 needs_context 说明缺口，交由 planner 重排任务。
+"""
 
 
 def _digest(value):
@@ -54,7 +61,7 @@ def _binding(wp, existing):
             "model": config.STRUCTURE_MODEL,
             "implementation": {name: hashlib.sha256((directory / name).read_bytes()).hexdigest()
                                for name in ("world_agent.py", "world_gen.py", "world_state.py", "world_blueprint.py",
-                                            "world_joint_plan.py", "seed_world.py", "value_types.py")}}
+                                            "world_joint_plan.py", "seed_world.py", "value_types.py", "blueprint_feasibility.py")}}
 
 
 def _save(path, state):
@@ -113,7 +120,20 @@ def _compiled(table, blueprint, existing, complete, wp=None):
 
 def _context(wp, blueprint):
     calendar = WorldState(n_sessions=blueprint["temporal_model"]["n_sessions"], world_blueprint=blueprint)
-    return {"business": seed_business_context(wp), "blueprint": blueprint,
+    ownership = {}
+    for kind in blueprint["entity_types"]:
+        routes = {f["name"]: [] for f in kind["fields"]}
+        for relation in blueprint["relation_types"]:
+            side = relation_owner_side(blueprint, relation)
+            if relation[side + "_type"] == kind["id"]:
+                routes[relation["field"]].append({"via": "relation", "type": relation["id"]})
+        for event in blueprint["event_types"]:
+            for effect in event["effect_fields"]:
+                if event["roles"][effect["role"]] == kind["id"]:
+                    routes[effect["field"]].append({"via": "event", "type": event["id"], "role": effect["role"]})
+        ownership[kind["id"]] = {"intrinsic_fields": [name for name, route in routes.items() if not route],
+                                "structure_fields": {name: route for name, route in routes.items() if route}}
+    return {"business": seed_business_context(wp), "blueprint": blueprint, "field_write_routes": ownership,
             "calendar": [{"session": session, "date": calendar.date_of_session(session)}
                          for session in calendar.sessions()],
             "world_brief": {key: deepcopy(wp[key]) for key in ("scenario", "shared_world_spec") if key in wp}}
@@ -124,6 +144,8 @@ def _index(world, blueprint):
     relation_counts = Counter(item["type"] for item in world.relations)
     event_counts = Counter(item["type"] for item in world.events)
     return {"entities": [{"name": name, "type": kind} for name, kind in world.entity_types.items()],
+            "relations": [{key: item[key] for key in ("id", "type", "from", "to", "session") if key in item}
+                          for item in world.relations],
             "events": [{key: item[key] for key in ("id", "type", "session", "participants")}
                        for item in world.events],
             "remaining_minima": {
@@ -195,7 +217,8 @@ def _unit_issues(raw, context, world, blueprint):
         if name in world.entities:
             issues.append(f"cannot recreate accepted/existing entity {name}; revise its owning unit")
         if owned.get(entity.get("type"), set()).intersection(entity["fields"]):
-            issues.append(f"entity {name} writes structure-owned fields; use relations/events/initial_states")
+            wrong = sorted(owned[entity.get("type")].intersection(entity["fields"]))
+            issues.append(f"entity {name} writes structure-owned fields {wrong}; use field_write_routes and relations/events/initial_states")
         for field, value in entity["fields"].items():
             if not isinstance(value, dict) or value.get("type") not in ("stable", "evolving"):
                 issues.append(f"entity {name}.{field} needs stable/evolving specification")
@@ -212,7 +235,10 @@ def _unit_issues(raw, context, world, blueprint):
         if any(not isinstance(value, str) or not value for value in identifiers):
             issues.append(f"{key} require nonempty ids")
         elif len(identifiers) != len(set(identifiers)) or set(identifiers).intersection(known):
-            issues.append(f"{key} duplicate accepted or new ids")
+            duplicates = sorted({value for value, count in Counter(identifiers).items() if count > 1}
+                                | set(identifiers).intersection(known))
+            existing_rows = [item for item in getattr(world, key) if item["id"] in duplicates]
+            issues.append(f"{key} duplicate accepted or new ids {duplicates}; existing={json.dumps(existing_rows, ensure_ascii=False)}")
     for relation in raw["relations"]:
         if any(not isinstance(relation.get(key), str) or relation[key] not in allowed for key in ("from", "to")):
             issues.append("relation references an unread or unknown entity")
@@ -248,6 +274,7 @@ def generate_world(wp, tracer, existing=None, checkpoint_path=None, feedback=Non
         if (state.get("checkpoint_hash") != _digest({k: v for k, v in state.items() if k != "checkpoint_hash"})
                 or state.get("binding") != binding):
             raise WorldBlueprintError("world agent checkpoint input/source binding mismatch")
+    state.setdefault("prior_failures", [])
     if feedback and (not state["feedback_history"] or state["feedback_history"][-1]["hash"] != _digest(feedback)):
         state["feedback_history"].append({"hash": _digest(feedback), "feedback": deepcopy(feedback)})
         state["feedback_revision_required"] = bool(state["units"])
@@ -270,7 +297,8 @@ def generate_world(wp, tracer, existing=None, checkpoint_path=None, feedback=Non
             raw = tracer.chat_json(step, [{"role": "system", "content": system},
                                          {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
                                    model=config.STRUCTURE_MODEL, temperature=0.3,
-                                   max_tokens=max_tokens, retries=1, strict_json=True)
+                                   max_tokens=max_tokens, retries=FORMAT_ATTEMPTS, strict_json=True,
+                                   response_format={"type": "json_object"})
             if _binding(wp, existing) != binding:
                 raise WorldBlueprintError("world agent implementation/input changed while awaiting response")
             attempt["raw_output"] = deepcopy(raw)
@@ -311,6 +339,7 @@ def generate_world(wp, tracer, existing=None, checkpoint_path=None, feedback=Non
                                            "entities": [row["name"] for row in unit["raw"]["entities"]]}
                                           for unit in state["units"]],
                        "observation": state["observation"],
+                       "prior_failures": state["prior_failures"][-5:],
                        "remaining_steps": max_steps - state["steps"],
                        "review_feedback": state["feedback_history"][-1] if state["feedback_history"] else None,
                        "feedback_revision_required": state["feedback_revision_required"]}
@@ -343,6 +372,8 @@ def generate_world(wp, tracer, existing=None, checkpoint_path=None, feedback=Non
                         raise WorldBlueprintError("identical truncated work cannot be retried; change the business boundary/intent or read scope")
                     author_input = {**frozen, "task": action, "read_context": context,
                                     "occupied_names": list(world.entities),
+                                    "occupied_ids": {"relations": [r["id"] for r in world.relations],
+                                                     "events": [e["id"] for e in world.events]},
                                     "feedback": state["observation"]}
                     if len(json.dumps(author_input, ensure_ascii=False)) > MAX_CONTEXT_CHARS:
                         raise WorldBlueprintError("write context exceeds limit; choose narrower reads or split the task")
@@ -370,6 +401,11 @@ def generate_world(wp, tracer, existing=None, checkpoint_path=None, feedback=Non
                     if issues:
                         state["observation"] = {"rejected_unit": unit_id, "issues": issues,
                                                 "instruction": "Prior proposal was rejected atomically. Replan this unit; accepted facts are unchanged."}
+                        state["prior_failures"].append({"unit_id": unit_id, "intent": intent, "issues": issues})
+                        encoded = json.dumps(raw, ensure_ascii=False)
+                        state["observation"]["rejected_proposal"] = (deepcopy(raw) if len(encoded) <= 30000 else
+                            {"preview": encoded[:30000], "truncated": True,
+                             "instruction": "Failed proposal is large; inspect relevant existing facts and plan a smaller business unit."})
                     else:
                         state["units"].append({"unit_id": unit_id, "intent": intent, "action": deepcopy(action),
                                                "context": context, "raw": deepcopy(raw), "raw_hash": _digest(raw)})
@@ -404,15 +440,26 @@ def generate_world(wp, tracer, existing=None, checkpoint_path=None, feedback=Non
                     state.update(status="unresolved", observation={"unresolved": action.get("reason")})
                     save()
                     raise WorldBlueprintError("world agent unresolved: " + str(action.get("reason")))
+                elif kind == "request_blueprint_review":
+                    if not isinstance(action.get("reason"), str) or not action["reason"].strip():
+                        raise WorldBlueprintError("blueprint review request requires concrete reason")
+                    evidence = {"reason": action["reason"], "suggestion": action.get("suggestion"),
+                                "last_observation": deepcopy(state["observation"]),
+                                "prior_failures": deepcopy(state["prior_failures"][-5:])}
+                    state.update(status="blueprint_review_requested", upstream_request=evidence)
+                    save()
+                    raise BlueprintReviewRequested(evidence)
                 else:
                     raise WorldBlueprintError("unknown planner action; use inspect/write/revise/finish/report_unresolved")
+            except BlueprintReviewRequested:
+                raise
             except WorldBlueprintError as error:
                 if state["status"] == "unresolved":
                     raise
                 state["observation"] = {"action_rejected": str(error)}
             save()
     except Exception as error:
-        if state["status"] not in ("execution_error", "unresolved"):
+        if state["status"] not in ("execution_error", "unresolved", "blueprint_review_requested"):
             state.update(status="error", error=f"{type(error).__name__}: {error}")
         save()
         raise

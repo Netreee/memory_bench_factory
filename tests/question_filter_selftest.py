@@ -631,7 +631,7 @@ class DerivedReleaseTest(unittest.TestCase):
                 # Re-running the ordinary release checker cannot upgrade it.
                 self.assertFalse(evaluate_release(output)["eligible"])
 
-    def test_floor_violation_and_empty_subset_fail_release(self):
+    def test_floor_violation_warns_and_empty_subset_fails_release(self):
         from pipeline.quality import require_release, ReleaseError
         with tempfile.TemporaryDirectory() as tmp:
             source = Path(tmp)
@@ -642,14 +642,24 @@ class DerivedReleaseTest(unittest.TestCase):
                         set_correct(rows[1], True)
                 out = source / ("empty" if empty else "below-floor")
                 report = export_filtered_benchmark(bench, results, out)
-                self.assertEqual(report["result_scope"], "filtered_release_failed")
-                self.assertFalse(report["release"]["eligible"])
-                self.assertIn("empty_filtered_benchmark" if empty else "delivery_target_unmet",
-                              {issue["code"] for issue in report["release"]["issues"]})
+                self.assertEqual(report["result_scope"],
+                                 "filtered_release_failed" if empty else "release_eligible")
+                self.assertEqual(report["release"]["eligible"], not empty)
+                if empty:
+                    self.assertIn("empty_filtered_benchmark",
+                                  {issue["code"] for issue in report["release"]["issues"]})
+                else:
+                    self.assertNotIn("delivery_target_unmet",
+                                     {issue["code"] for issue in report["release"]["issues"]})
+                    self.assertIn("delivery_target_unmet",
+                                  {warning["code"] for warning in report["release"]["warnings"]})
                 manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
                 self.assertEqual(manifest["algo"]["targetspec"], target)
-                with self.assertRaises(ReleaseError):
-                    require_release(out / "06_grounded_questions.json")
+                if empty:
+                    with self.assertRaises(ReleaseError):
+                        require_release(out / "06_grounded_questions.json")
+                else:
+                    self.assertTrue(require_release(out / "06_grounded_questions.json")["eligible"])
 
     def test_research_source_cannot_upgrade_on_export_or_recheck(self):
         from pipeline.quality import require_release, evaluate_release, ReleaseError

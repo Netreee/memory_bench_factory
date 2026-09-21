@@ -84,26 +84,48 @@ class GateTests(unittest.TestCase):
         self.assertEqual(review.call_args_list[1].kwargs["previous"], failure)
         self.assertEqual(len(self.run.read("02_world_review_attempts.json")["attempts"]), 2)
 
-    def test_persistent_problem_stops_without_publishing_world(self):
+    def test_persistent_problem_publishes_candidate_with_release_warning(self):
         failure = {"status": "failed", "repair_targets": {"structure": True}}
         with patch.object(factory, "build_world", side_effect=self.builder) as build, \
              patch.object(factory, "_prepare_lines"), \
              patch.object(world_semantics, "review_world", return_value=failure):
-            with self.assertRaises(WorldBlueprintError): factory.stage_world(self.run)
+            factory.stage_world(self.run)
         self.assertEqual(build.call_count, 2)
-        self.assertFalse(self.run.has("02_world.json"))
+        self.assertTrue(self.run.has("02_world.json"))
         self.assertTrue(self.run.has("02_world_candidate.json"))
-        self.assertFalse(self.run.has(world_semantics.REVIEW_ARTIFACT))
+        self.assertEqual(self.run.read(world_semantics.REVIEW_ARTIFACT)["status"], "failed")
+        self.assertEqual(self.run.read(world_semantics.WARNING_ARTIFACT)["category"],
+                         "semantic_review_not_passed")
+        factory._require_current_world_review(self.run, self.run.read("01_whitepaper.json"))
 
-    def test_review_execution_error_does_not_trigger_business_rewrite(self):
+    def test_failed_optional_repair_keeps_pre_repair_candidate_and_continues(self):
+        failure = {"status": "failed", "repair_targets": {"structure": True}}
+        original = candidate("pre-repair")
+        with patch.object(factory, "build_world",
+                          side_effect=[original, WorldBlueprintError("repair planning budget exhausted")]) as build, \
+             patch.object(factory, "_prepare_lines"), \
+             patch.object(world_semantics, "review_world", return_value=failure):
+            factory.stage_world(self.run)
+        self.assertEqual(build.call_count, 2)
+        self.assertEqual(self.run.read("02_world.json"), original.to_dict())
+        self.assertEqual(self.run.read(world_semantics.REVIEW_ARTIFACT), failure)
+        self.assertEqual(self.run.read(world_semantics.WARNING_ARTIFACT)["release_eligible"], False)
+        repair = self.run.read(factory.WORLD_REPAIR_FAILURE)
+        self.assertEqual(repair["error_type"], "WorldBlueprintError")
+        self.assertEqual(repair["binding"]["world_hash"], factory._canonical_hash(original.to_dict()))
+        factory._require_current_world_review(self.run, self.run.read("01_whitepaper.json"))
+
+    def test_review_execution_error_continues_without_business_rewrite(self):
         with patch.object(factory, "build_world", side_effect=self.builder) as build, \
              patch.object(factory, "_prepare_lines"), \
              patch.object(world_semantics, "review_world", return_value={"status": "error"}):
-            with self.assertRaises(WorldBlueprintError): factory.stage_world(self.run)
+            factory.stage_world(self.run)
         self.assertEqual(build.call_count, 1)
-        self.assertFalse(self.run.has("02_world.json"))
+        self.assertTrue(self.run.has("02_world.json"))
+        self.assertEqual(self.run.read(world_semantics.WARNING_ARTIFACT)["category"],
+                         "review_execution_error")
 
-    def test_failure_preserves_previous_published_world_and_review(self):
+    def test_new_candidate_replaces_previous_world_with_bound_warning(self):
         old = candidate("previous").to_dict()
         receipt = {"status": "passed", "marker": "previous receipt"}
         self.run.write("02_world.json", old)
@@ -111,9 +133,10 @@ class GateTests(unittest.TestCase):
         with patch.object(factory, "build_world", side_effect=self.builder), \
              patch.object(factory, "_prepare_lines"), \
              patch.object(world_semantics, "review_world", return_value={"status": "unresolved"}):
-            with self.assertRaises(WorldBlueprintError): factory.stage_world(self.run)
-        self.assertEqual(self.run.read("02_world.json"), old)
-        self.assertEqual(self.run.read(world_semantics.REVIEW_ARTIFACT), receipt)
+            factory.stage_world(self.run)
+        self.assertNotEqual(self.run.read("02_world.json"), old)
+        self.assertEqual(self.run.read(world_semantics.REVIEW_ARTIFACT)["status"], "unresolved")
+        self.assertTrue(self.run.has(world_semantics.WARNING_ARTIFACT))
 
     def test_publish_write_failure_restores_whole_bundle_byte_for_byte(self):
         names = ["02_world.json", world_semantics.REVIEW_ARTIFACT, "02_seed_audit.json", factory.CORPUS_CKPT]
@@ -211,6 +234,44 @@ class FreshnessDriverTests(unittest.TestCase):
         self.current = False
         with self.assertRaises(SystemExit): drive(self.run, self.stages, from_stage="orders")
         self.assertEqual(self.calls, ["world", "orders"])
+
+    def test_declared_refresh_stage_can_revalidate_stale_dependency(self):
+        self.current = False
+        def refresh(run):
+            self.calls.append("review")
+            self.current = True
+            run.write("review.json", {"current": True})
+        stages = [self.stages[0],
+                  Stage("review", ["world"], refresh, "review.json", refreshes=("world",))]
+        drive(self.run, stages, only="review")
+        self.assertEqual(self.calls, ["world", "orders", "review"])
+        self.assertTrue(self.current)
+
+    def test_one_drive_replays_unchanged_freshness_once(self):
+        checks = []
+        stages = [Stage("world", [], self.stages[0].fn, "world.json",
+                        is_current=lambda _: checks.append("world") or True),
+                  self.stages[1],
+                  Stage("grounding", ["orders"],
+                        lambda run: run.write("grounding.json", {}), "grounding.json")]
+        drive(self.run, stages)
+        checks.clear()
+        drive(self.run, stages, from_stage="orders")
+        self.assertEqual(checks, ["world"])
+
+    def test_descendant_freshness_can_cover_ancestor_replay(self):
+        checks = []
+        stages = [Stage("world", [], self.stages[0].fn, "world.json",
+                        is_current=lambda _: checks.append("world") or True),
+                  Stage("disclosure", ["world"], self.stages[1].fn, "orders.json",
+                        is_current=lambda _: checks.append("disclosure") or True,
+                        freshness_covers=("world",)),
+                  Stage("corpus", ["world", "disclosure"],
+                        lambda run: run.write("corpus.json", {}), "corpus.json")]
+        drive(self.run, stages)
+        checks.clear()
+        drive(self.run, stages, only="corpus")
+        self.assertEqual(checks, ["disclosure"])
 
     def test_completed_indirect_descendant_cannot_skip_stale_world(self):
         for name in ("questions", "grounding"):

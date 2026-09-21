@@ -261,7 +261,7 @@ class CandidateTests(unittest.TestCase):
         def offline_provider(messages, **kwargs):
             self.assertEqual(kwargs.get("response_format"), {"type": "json_object"})
             self.assertIs(kwargs.get("strict_json"), True)
-            self.assertEqual(kwargs.get("retries"), 1)
+            self.assertEqual(kwargs.get("retries"), 3)
             result = replies.pop(0)
             return result(json.loads(messages[-1]["content"])) if callable(result) else result
         with tempfile.TemporaryDirectory(prefix="offline-corpus-format-") as td, patch.object(config, "chat_json", side_effect=offline_provider):

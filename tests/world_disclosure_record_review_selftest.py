@@ -65,7 +65,7 @@ class RecordReviewTests(unittest.TestCase):
         for actual, record in zip(locations, self.ws.disclosure['records']):
             self.assertEqual(actual['record']['source_value'], record)
         self.assertEqual(tracer.calls[0]['params'], {'model': 'offline-mini', 'temperature': 0,
-            'max_tokens': 16384, 'retries': 1, 'strict_json': True, 'response_format': {'type': 'json_object'}})
+            'max_tokens': 16384, 'retries': 3, 'strict_json': True, 'response_format': {'type': 'json_object'}})
 
     def test_resolved_record_contexts_preserve_every_exact_original_target_and_location(self):
         snapshot = deepcopy(self.ws.to_dict())

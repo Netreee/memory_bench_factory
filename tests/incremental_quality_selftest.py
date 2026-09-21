@@ -85,10 +85,12 @@ class IncrementalQualityTests(unittest.TestCase):
             done.add(0)
             save()
             raise RuntimeError("fixture interruption")
-        with patch.object(factory, "render_corpus", interrupted), self.assertRaisesRegex(RuntimeError, "fixture interruption"):
+        with patch.object(factory, "render_corpus", interrupted):
             factory.stage_corpus(self.run)
         self.assertEqual((self.run.dir / factory.ART["corpus"]).read_bytes(), old_bytes)
         self.assertTrue(self.run.has(factory.CORPUS_CKPT))
+        self.assertTrue(self.run.has(factory.CORPUS_WARNING))
+        self.assertTrue(self.run.has("05_corpus_candidate.json"))
         self.assertEqual(self.run.manifest["algo"]["render_strategy"]["effective"], "full")
         self.assertIn("missing_or_stale_document_review", self.run.manifest["algo"]["render_strategy"]["refresh_reasons"])
         self.assert_inputs_unchanged(inputs)
@@ -101,7 +103,7 @@ class IncrementalQualityTests(unittest.TestCase):
             done.add(0)
             save()
             raise RuntimeError("fixture interruption")
-        with patch.object(factory, "render_corpus", interrupted), self.assertRaises(RuntimeError):
+        with patch.object(factory, "render_corpus", interrupted):
             factory.stage_corpus(self.run)
         def resume(wp, ws, target, tracer, corpus, done, save, log, **scope):
             self.assertIsNone(scope["only_entities"])
@@ -116,7 +118,44 @@ class IncrementalQualityTests(unittest.TestCase):
         self.assertEqual(validate_corpus(world(True), final)["status"], "passed")
         self.assertEqual(final["done_weeks"], [0, 1])
         self.assertFalse(self.run.has(factory.CORPUS_CKPT))
+        self.assertFalse(self.run.has(factory.CORPUS_WARNING))
+        self.assertFalse(self.run.has("05_corpus_candidate.json"))
         self.assert_inputs_unchanged(inputs)
+
+    def test_full_refresh_resumes_exact_bound_partial_candidate_without_checkpoint(self):
+        self.run.manifest["config"].pop("render_only")
+        (self.run.dir / factory.ART["corpus"]).unlink()
+        candidate = {"corpus": {"sessions": [reviewed_session(world(), 0)]},
+                     "done_weeks": [0]}
+        self.run.write("05_corpus_candidate.json", candidate)
+        whitepaper = self.run.read(factory.ART["whitepaper"])
+        frozen_world = self.run.read(factory.ART["world"])
+        self.run.write(factory.CORPUS_WARNING, {
+            "version": "corpus-generation-warning/v1",
+            "status": "warning",
+            "release_eligible": False,
+            "binding": {
+                "whitepaper_hash": factory._canonical_hash(whitepaper),
+                "world_hash": factory._canonical_hash(frozen_world),
+                "corpus_hash": factory._canonical_hash(candidate),
+                "candidate_hash": factory._canonical_hash(candidate),
+            },
+        })
+
+        def resume(wp, ws, target, tracer, corpus, done, save, log, **scope):
+            self.assertEqual(done, {0})
+            self.assertEqual([s["session_id"] for s in corpus["sessions"]], [0])
+            corpus["sessions"].append(reviewed_session(ws, 1))
+            done.add(1)
+            save()
+
+        with patch.object(factory, "render_corpus", resume):
+            factory.stage_corpus(self.run)
+        final = self.run.read(factory.ART["corpus"])
+        self.assertEqual(final["done_weeks"], [0, 1])
+        self.assertEqual([s["session_id"] for s in final["corpus"]["sessions"]], [0, 1])
+        self.assertFalse(self.run.has(factory.CORPUS_WARNING))
+        self.assertFalse(self.run.has("05_corpus_candidate.json"))
 
     def test_same_world_delta_keeps_existing_documents(self):
         inputs = self.frozen_inputs()
@@ -137,6 +176,17 @@ class IncrementalQualityTests(unittest.TestCase):
 
     def test_same_world_delta_ignores_unrelated_checkpoint_uses_final(self):
         self.run.write(factory.CORPUS_CKPT, {"identity": "unrelated-checkpoint", "corpus": {"sessions": []}, "done_weeks": []})
+        def inspect(wp, ws, target, tracer, corpus, done, save, log, **scope):
+            self.assertEqual(corpus, self.old["corpus"])
+            self.assertEqual(done, {0, 1})
+            self.assertEqual(scope["only_entities"], {"新部门"})
+        with patch.object(factory, "render_corpus", inspect):
+            factory.stage_corpus(self.run)
+        self.assertEqual(self.run.read(factory.ART["corpus"]), self.old)
+        self.assertFalse(self.run.has(factory.CORPUS_CKPT))
+
+    def test_corrupt_optional_checkpoint_falls_back_to_published_corpus(self):
+        (self.run.dir / factory.CORPUS_CKPT).write_text('{"identity":', encoding="utf-8")
         def inspect(wp, ws, target, tracer, corpus, done, save, log, **scope):
             self.assertEqual(corpus, self.old["corpus"])
             self.assertEqual(done, {0, 1})

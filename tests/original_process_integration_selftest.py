@@ -4,6 +4,7 @@ import importlib.util
 import json
 from pathlib import Path
 import socket
+import tempfile
 import sys
 import unittest
 from unittest.mock import patch
@@ -19,6 +20,8 @@ from pipeline.well_posed import run_well_posed
 
 class Run:
     def __init__(self, wp, ws, proposal, budget=2, enabled=True):
+        self._temporary = tempfile.TemporaryDirectory()
+        self.dir = Path(self._temporary.name)
         self.manifest = {"config": {"question_budget": budget, "process_proposals": enabled}}
         self.data = {"01_whitepaper.json": deepcopy(wp), "02_world.json": ws.to_dict()}
         self.calls = []
@@ -117,13 +120,13 @@ class IntegrationTests(unittest.TestCase):
         self.assertEqual(run.calls, [])
         self.assertNotIn("03_orders.json", run.data)
 
-    def test_bad_model_response_preserved_without_publishing_orders(self):
+    def test_bad_model_response_preserved_and_other_orders_continue(self):
         run = Run(self.wp, self.ws, self.proposal)
         run.chat_json = lambda *a, **kw: {"__error__": "offline failure"}
-        with self.assertRaises(RuntimeError):
-            factory.stage_orders(run)
+        factory.stage_orders(run)
         self.assertEqual(run.data["03_process_proposals.json"]["status"], "error")
-        self.assertNotIn("03_orders.json", run.data)
+        self.assertIn("03_orders.json", run.data)
+        self.assertEqual(run.data[factory.ORDER_WARNING]["status"], "warning")
 
 
 if __name__ == "__main__":

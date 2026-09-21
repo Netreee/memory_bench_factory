@@ -51,6 +51,11 @@ class RenderJsonTests(unittest.TestCase):
                 'OPENAI_API_KEY': 'offline-render-json', 'OPENAI_BASE_URL': 'https://offline.invalid',
                 'MODEL': 'offline-model', 'LLM_MIN_COMPLETION_TOKENS': '0'}):
             spec.loader.exec_module(offline_config)
+        # Current production dispatch uses the cancellable async transport
+        # beneath config.chat. Keep this wire test local by replacing that
+        # exact boundary with the same fake completion used above.
+        offline_config._perform_request = lambda **kw: create(
+            model=kw['model'], messages=kw['messages'], **kw['parameters'])
         offline_config.pmap = lambda fn, items, **kw: [fn(item) for item in items]
         corpus = {'sessions': []}
         with tempfile.TemporaryDirectory(prefix='render-json-mode-offline-') as tmp:

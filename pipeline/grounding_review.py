@@ -4,13 +4,27 @@ This adapts the existing readers; it never creates a world, question or gold.
 Legacy lexical grounding is retained as a diagnostic, not a semantic veto.
 """
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
+import threading
 
 from pipeline.grounding import gather_evidence, _sessions_of, run_grounding
-from pipeline.semantic_review import review_questions, review_certification
+from pipeline.semantic_review import (SemanticReviewAuditError, review_questions,
+                                      review_certification)
 
 VERSION = "original-grounding-semantic/v2"
 REVIEW_ARTIFACT = "06_semantic_review.json"
+
+
+def _local_execution_failure(raw):
+    if not isinstance(raw, dict) or "__error__" not in raw:
+        return False
+    kind = (raw.get("__error_metadata__") or {}).get("kind")
+    return kind in {"json_syntax", "output_truncated", "empty_completion", "http_connect_timeout",
+        "http_pool_timeout", "http_connect_error", "http_read_error", "http_write_error",
+        "http_protocol_error", "http_read_timeout", "http_write_timeout", "total_deadline",
+        "http_status_500", "http_status_502", "http_status_503", "http_status_504",
+        "paged_invalid_action", "paged_allowance_exhausted"}
 
 
 def enabled(wp):
@@ -39,22 +53,53 @@ def execution_complete(review):
 
 
 def candidates_with_evidence(questions, corpus, *, isolated_reference=False):
-    # This semantic path reads the complete public history. A later document
-    # may retrospectively support an earlier fact; canonical evidence_sessions
-    # therefore cannot delimit its candidate pool. This is not a proof set.
-    pool = list(dict.fromkeys(str(d["doc_id"])
-                for session in _sessions_of(corpus) for d in session.get("docs", [])
-                if d.get("is_filler") is not True and d.get("doc_id")))
+    # Review every document in the declared time scope and every document that
+    # explicitly mentions the questioned entity anywhere in the public history.
+    # The latter keeps retrospective evidence/counterevidence visible.  This is
+    # only a bounded retrieval envelope: the three LLM roles still decide
+    # meaning, support and validity.  Questions without a declared time scope
+    # retain the complete public corpus because absence claims need global view.
+    sessions = _sessions_of(corpus)
+    public = [(session.get("session_id"), doc) for session in sessions
+              for doc in session.get("docs", []) if doc.get("doc_id")]
     rows = []
     from eval.grading import requires_semantic_grading
     from pipeline.reference_audit import validate_reference_proposal
     for question in questions:
+        declared = set(question.get("evidence_sessions") or [])
+        entity = str(question.get("entity") or "").strip()
+        scoped = [(sid, doc) for sid, doc in public if (not declared or not entity or sid in declared
+                  or (entity and entity in str(doc.get("content") or "")))]
+        # Candidate evidence remains signal-only.  The semantic readers also
+        # receive filler/distractor documents inside the same bounded scope so
+        # they can detect ambiguity and counterevidence.
+        pool = list(dict.fromkeys(str(doc["doc_id"]) for _, doc in scoped
+                                  if doc.get("is_filler") is not True))
+        semantic_pool = list(dict.fromkeys(str(doc["doc_id"]) for _, doc in scoped))
+        scope_fallback = False
+        if not pool or not semantic_pool:
+            # A declared session can contain only distractors after an upstream
+            # partial render.  Expanding this one question is safer than either
+            # crashing the batch or letting an empty scope pass as complete.
+            scope_fallback = True
+            pool = list(dict.fromkeys(str(doc["doc_id"]) for _, doc in public
+                                      if doc.get("is_filler") is not True))
+            semantic_pool = list(dict.fromkeys(str(doc["doc_id"]) for _, doc in public))
+        if not pool or not semantic_pool:
+            raise ValueError("Public corpus contains no signal documents")
         if requires_semantic_grading(question):
             # Never manufacture a natural reference from the canonical witness.
             validate_reference_proposal(question.get("reference_proposal"))
-        rows.append({**deepcopy(question), "evidence_doc_ids": pool[:],
-                     "candidate_evidence_doc_ids": pool[:],
-                     "evidence_scope": {"kind": "candidate_pool", "minimal_proof": "not_measured",
+        rows.append({**deepcopy(question), "evidence_doc_ids": pool,
+                     "candidate_evidence_doc_ids": pool,
+                     "semantic_scope_doc_ids": semantic_pool,
+                     "evidence_scope": {"kind": "declared_sessions_plus_entity_mentions/v1",
+                                        "declared_sessions": sorted(declared, key=str),
+                                        "entity_expansion": bool(entity),
+                                        "semantic_document_count": len(semantic_pool),
+                                        "full_public_document_count": len(public),
+                                        "full_corpus_fallback": scope_fallback,
+                                        "minimal_proof": "not_measured",
                                         "necessary_document_count": None, "difficulty_verified": False}})
         if isolated_reference and "reference_proposal" not in rows[-1]:
             # Expose the original reference as an explicit audit target, never
@@ -84,13 +129,14 @@ def candidates_with_evidence(questions, corpus, *, isolated_reference=False):
 def validate_delivery(questions, corpus, protocol, review):
     """Certify the selected subset's procedure; keep failed candidates pending.
 
-    Only completed parsed-format failures may be isolated. Provider, budget,
+    Completed candidate-bound failures may be isolated. Provider, budget,
     input-limit, audit-sink and missing-stage failures retain the whole-run stop.
     This never edits an opinion, repairs a reference or judges business truth.
     """
     result = {"version": "grounding-candidate-isolation/v1", "delivery_safe": False,
               "execution_complete": execution_complete(review), "source_count": len(questions),
               "selected_count": 0, "pending_count": 0, "parsed_format_failures": [], "issues": []}
+    result["isolated_execution_failures"] = []
     try:
         if not isinstance(review, dict) or review.get("audit_error"):
             raise ValueError("Missing review or global audit failure")
@@ -120,18 +166,25 @@ def validate_delivery(questions, corpus, protocol, review):
                 if status == "ok":
                     continue
                 allowed = "invalid_output" if stage == "reference_audit" else "invalid_review"
-                if status != allowed:
-                    raise ValueError(f"Non-isolatable execution failure: {stage}:{status}")
                 raw = ((item.get("reference_audit") or {}).get("raw_output") if stage == "reference_audit"
                        else item.get(stage + "_raw_output"))
-                if (not isinstance(raw, (dict, list))
+                # A bounded worker records one started/finished trace per
+                # candidate stage.  The complete-trace check below proves that
+                # the failure belongs to this candidate, even when an internal
+                # exception happened before a raw model response was available.
+                # The candidate remains pending and can never enter ``kept``.
+                local = (status == "model_error"
+                         and accounting.get("unit_failure_isolation") == "bounded-units/v1")
+                if status != allowed and not local:
+                    raise ValueError(f"Non-isolatable execution failure: {stage}:{status}")
+                if not local and (not isinstance(raw, (dict, list))
                         or isinstance(raw, dict) and "__error__" in raw):
                     raise ValueError("Format failure lacks an actual parsed raw opinion")
                 if item.get("review_state") != "pending" or review_certification(item)["status"] == "certified":
                     raise ValueError("Incomplete candidate must remain pending and uncertified")
-                result["parsed_format_failures"].append({"qid": item["source_qid"], "stage": stage,
+                result["isolated_execution_failures" if local else "parsed_format_failures"].append({"qid": item["source_qid"], "stage": stage,
                                                         "execution": deepcopy(execution)})
-        if result["parsed_format_failures"]:
+        if result["parsed_format_failures"] or result["isolated_execution_failures"]:
             # A partial delivery must retain the complete original attempt log,
             # including the malformed replies, rather than drop failed rows.
             records = review.get("records")
@@ -200,34 +253,170 @@ def selection(questions, review):
                                   "Candidate evidence is not necessary evidence or measured difficulty."]}
 
 
+def _merge_partition_reviews(candidates, reports):
+    """Merge independent question shards without changing candidate order.
+
+    Each shard sees the same immutable corpus/protocol and therefore produces
+    the same global binding.  Only item/record/call collections are shard-local.
+    The merge restores source order before the existing whole-review validator
+    replays every binding and audit record.
+    """
+    if not reports:
+        raise ValueError("Parallel semantic review produced no reports")
+    first = reports[0]
+    common = ("version", "mode", "publication_effect", "input_manifest", "binding",
+              "public_protocol", "documents", "source_map")
+    for report in reports[1:]:
+        if any(report.get(key) != first.get(key) for key in common):
+            raise ValueError("Parallel semantic review shards have different bindings")
+    by_qid = {}
+    records = []
+    calls_used = 0
+    audit_errors = []
+    for report in reports:
+        calls_used += int(report.get("calls_used", 0) or 0)
+        records.extend(report.get("records") or [])
+        if report.get("audit_error"):
+            audit_errors.append(deepcopy(report["audit_error"]))
+        for item in report.get("items") or []:
+            qid = item.get("source_qid")
+            if not qid or qid in by_qid:
+                raise ValueError("Parallel semantic review has missing/duplicate source identity")
+            by_qid[qid] = item
+    order = [row.get("qid") for row in candidates]
+    if len(set(order)) != len(order) or set(order) != set(by_qid):
+        raise ValueError("Parallel semantic review does not cover the original candidates")
+    first["items"] = [by_qid[qid] for qid in order]
+    first["records"] = records
+    first["calls_used"] = calls_used
+    first["summary"] = {"candidates": len(first["items"]),
+        "completed": sum(item.get("review_state") == "completed" for item in first["items"]),
+        "pending": sum(item.get("review_state") == "pending" for item in first["items"])}
+    if audit_errors:
+        first["audit_error"] = {"error_type": "ParallelSemanticReviewAuditError",
+                                "shard_errors": audit_errors}
+    return first
+
+
 def review_grounding(questions, corpus, protocol, *, chat_json, model,
                      max_calls=None, max_tokens=4096, max_input_chars=200000, record=None,
-                     isolated_reference=False):
+                     isolated_reference=False, checkpoint_dir=None, workers=1):
+    if type(workers) is not int or not 1 <= workers <= 16:
+        raise ValueError("Semantic review workers must be an integer from 1 to 16")
     candidates = candidates_with_evidence(questions, corpus, isolated_reference=isolated_reference)
     _, lexical = run_grounding(questions, corpus)
     stopped = False
     caller_invocations = 0
     suppressed_after_failure = 0
+    from pathlib import Path
+    import json
+    from pipeline.semantic_review import fingerprint
+    from pipeline.run import _atomic_write_json
+    from pipeline import paged_read
+    cache = Path(checkpoint_dir) if checkpoint_dir else None
+    active = threading.local()
+    state_lock = threading.Lock()
+    if cache:
+        cache.mkdir(parents=True, exist_ok=True)
+        # This is the logical full-input envelope. Every actual paged request
+        # remains below paged_read.LIMIT and retains all public documents.
+        max_input_chars = max(max_input_chars, len(json.dumps(corpus, ensure_ascii=False)) * 3 + 100000)
+    paging_contract = Path(paged_read.__file__).read_text(encoding="utf-8")
+    def cache_key(messages, params, candidate):
+        return fingerprint({"messages": messages, "params": params,
+                            "candidate_id": candidate,
+                            "paging": paging_contract})
+    def record_progress(event):
+        active.candidate = event.get("candidate_id")
+        if record:
+            record(deepcopy(event))
+        if cache and event.get("event") == "finished" and event.get("execution", {}).get("status") == "ok":
+            key = cache_key(event["messages"], event["params"], event.get("candidate_id"))
+            value = {"key": key, "output": deepcopy(event["output"])}
+            value["hash"] = fingerprint(value)
+            _atomic_write_json(cache / (key + ".json"), value)
 
     def invoke(step, messages, **kwargs):
         nonlocal stopped, caller_invocations, suppressed_after_failure
-        if stopped:
-            suppressed_after_failure += 1
-            raise RuntimeError("Previous review execution failed; no further provider calls")
+        candidate = getattr(active, "candidate", None)
+        with state_lock:
+            if stopped:
+                suppressed_after_failure += 1
+                raise RuntimeError("Previous review execution failed; no further provider calls")
         try:
-            caller_invocations += 1
-            result = chat_json(step, messages, **kwargs)
+            if cache:
+                path = cache / (cache_key(messages, kwargs, candidate) + ".json")
+                if path.exists():
+                    value = json.loads(path.read_text(encoding="utf-8"))
+                    if value.get("key") != path.stem or value.get("hash") != fingerprint({k:v for k,v in value.items() if k != "hash"}):
+                        raise ValueError("Semantic review checkpoint changed")
+                    return deepcopy(value["output"])
+            with state_lock:
+                caller_invocations += 1
+            result = (paged_read.call(step, messages, chat_json=chat_json, **{**kwargs, "retries": 3})
+                      if cache else chat_json(step, messages, **kwargs))
             if isinstance(result, dict) and "__error__" in result:
+                if cache and _local_execution_failure(result):
+                    return result
                 raise RuntimeError(str(result["__error__"]))
             return result
+        except paged_read.PagedReadExecutionError as exc:
+            if cache and _local_execution_failure(exc.response):
+                return exc.response
+            with state_lock:
+                stopped = True
+            raise
+        except paged_read.PagedReadProtocolError as exc:
+            # A model that repeatedly emits an invalid paging action makes only
+            # the current question incomplete.  Preserve the exact error and
+            # let review_questions continue with the remaining candidates.
+            return {"__error__": str(exc),
+                    "__error_metadata__": {"kind": exc.kind,
+                                             "candidate_id": candidate}}
         except Exception:
-            stopped = True
+            with state_lock:
+                stopped = True
             raise
 
-    review = review_questions(candidates, corpus, protocol, chat_json=invoke,
-                              reviewer_model=model, reader_model=model, max_calls=max_calls,
-                              max_tokens=max_tokens, max_input_chars=max_input_chars, record=record,
-                              reference_auditor_model=model if isolated_reference else None)
+    try:
+        worker_count = min(workers, len(candidates))
+        if worker_count == 1:
+            review = review_questions(candidates, corpus, protocol, chat_json=invoke,
+                                      reviewer_model=model, reader_model=model, max_calls=max_calls,
+                                      max_tokens=max_tokens, max_input_chars=max_input_chars, record=record_progress,
+                                      reference_auditor_model=model if isolated_reference else None)
+        else:
+            indexed_candidates = [{**candidate, "_semantic_candidate_id": f"q{index + 1:06d}"}
+                                  for index, candidate in enumerate(candidates)]
+            shards = [indexed_candidates[index::worker_count] for index in range(worker_count)]
+            if max_calls is None:
+                shard_budgets = [None] * worker_count
+            else:
+                quotient, remainder = divmod(max_calls, worker_count)
+                shard_budgets = [quotient + int(index < remainder) for index in range(worker_count)]
+            def review_shard(index):
+                try:
+                    return review_questions(shards[index], corpus, protocol, chat_json=invoke,
+                        reviewer_model=model, reader_model=model, max_calls=shard_budgets[index],
+                        max_tokens=max_tokens, max_input_chars=max_input_chars, record=record_progress,
+                        reference_auditor_model=model if isolated_reference else None)
+                except SemanticReviewAuditError as exc:
+                    report = deepcopy(exc.report)
+                    report.setdefault("audit_error", {
+                        "error_type": type(exc).__name__, "message": str(exc)})
+                    return report
+            with ThreadPoolExecutor(max_workers=worker_count,
+                                    thread_name_prefix="semantic-question") as pool:
+                reports = list(pool.map(review_shard, range(worker_count)))
+            review = _merge_partition_reviews(candidates, reports)
+    except SemanticReviewAuditError as exc:
+        # The exception deliberately carries the complete in-memory audit.
+        # Stop all later provider calls, retain that evidence, and let delivery
+        # validation reject the incomplete set instead of aborting the factory.
+        review = deepcopy(exc.report)
+        stopped = True
+        review.setdefault("audit_error", {
+            "error_type": type(exc).__name__, "message": str(exc)})
     kept, report = selection(candidates, review)
     report["lexical_diagnostic"] = lexical
     report["execution_stopped"] = stopped
@@ -237,6 +426,8 @@ def review_grounding(questions, corpus, protocol, *, chat_json, model,
                   "logical_calls_used": review["calls_used"],
                   "paid_provider_calls": None,
                   "scope": "Forwarded callable invocations; actual provider attempts and charges require the provider trace/bill."}
+    if cache:
+        accounting["unit_failure_isolation"] = "bounded-units/v1"
     report.update(accounting)
     review["execution_accounting"] = deepcopy(accounting)
     delivery = validate_delivery(candidates, corpus, protocol, review)

@@ -66,7 +66,8 @@ class WorldAgentTests(unittest.TestCase):
         table, metadata = generate_world(self.wp, tracer, log=lambda *_: None, **kwargs)
         self.assertFalse(tracer.script)
         for call in tracer.calls:
-            self.assertEqual(call["parameters"]["retries"], 1)
+            self.assertEqual(call["parameters"]["retries"], 3)
+            self.assertEqual(call["parameters"]["response_format"], {"type": "json_object"})
             self.assertEqual(call["parameters"]["model"], config.STRUCTURE_MODEL)
         return table, metadata, tracer
 

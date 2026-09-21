@@ -19,7 +19,7 @@ REFERENCE_ENCODING_VERSION = "legacy-reference-encoding/v1"
 COVERAGE_POLICY = "full-input-manifest-model-self-report/v1"
 CITATION_POLICY = "explicit-field-or-verbatim/v1"
 CERTIFICATION_POLICY = "semantic-review-procedure/v1"
-ISOLATED_CERTIFICATION_POLICY = "semantic-review-procedure/v3"
+ISOLATED_CERTIFICATION_POLICY = "semantic-review-procedure/v4"
 ANSWERABILITY = {"answerable", "unanswerable", "ambiguous", "unresolved"}
 VALIDITY = {"valid", "invalid", "ambiguous", "unresolved"}
 REFERENCE = {"supported", "contradicted", "ambiguous", "unsupported", "not_provided", "unresolved"}
@@ -254,12 +254,22 @@ def _candidates(questions) -> list[dict]:
             # Legacy gt/gold may itself be a structured answer. Preserve that
             # answer value without copying any adjacent candidate metadata.
             reference = {"answer": reference}
-        candidates.append({"candidate_id": f"q{index + 1:06d}",
+        semantic_scope = raw.get("semantic_scope_doc_ids")
+        if semantic_scope is not None and (not isinstance(semantic_scope, list)
+                or not semantic_scope or not all(isinstance(x, str) and x for x in semantic_scope)
+                or len(set(semantic_scope)) != len(semantic_scope)):
+            raise ValueError("semantic_scope_doc_ids must be a nonempty unique string list")
+        candidate_id = raw.get("_semantic_candidate_id", f"q{index + 1:06d}")
+        if (not isinstance(candidate_id, str) or not candidate_id.startswith("q")
+                or not candidate_id[1:].isdigit()):
+            raise ValueError("Internal semantic candidate identity is invalid")
+        candidates.append({"candidate_id": candidate_id,
                            "source_qid": raw.get("qid"), "question": raw["question"],
                            "source_identity": {"question_hash": question_hash(raw),
                                                "reference_hash": reference_hash(raw)},
                            "reference_provided": reference_key is not None,
                            "reference_proposal": _json_copy(reference),
+                           "semantic_scope_source_doc_ids": _json_copy(semantic_scope),
                            "reference_encoding": _reference_encoding(raw, reference, reference_key)})
     return candidates
 
@@ -322,8 +332,14 @@ def prepare_review(questions, corpus, public_protocol, *, reviewer_model: str,
         raise ValueError("Legacy reference encoding is not supported by isolated reference audit")
     version = ISOLATED_VERSION if isolated else VERSION
     policy = ISOLATED_CERTIFICATION_POLICY if isolated else CERTIFICATION_POLICY
+    # The public document view is immutable for the lifetime of one review.
+    # Large recovered worlds can contain hundreds of megabytes of rendered
+    # text; serializing that complete list once per question made preparation
+    # O(question_count * corpus_size) before the first provider request.  Keep
+    # the exact historical digest value, but compute it once and reuse it.
+    full_corpus_hash = fingerprint(documents)
     input_manifest = {"version": COVERAGE_POLICY, "document_count": len(documents),
-                      "corpus_hash": fingerprint(documents), "protocol_hash": fingerprint(public_protocol),
+                      "corpus_hash": full_corpus_hash, "protocol_hash": fingerprint(public_protocol),
                       "visible_view": {"include_titles": include_titles},
                       "documents": [{"doc_id": doc["doc_id"], "document_hash": fingerprint(doc),
                                      "fields": sorted(doc)} for doc in documents]}
@@ -332,7 +348,7 @@ def prepare_review(questions, corpus, public_protocol, *, reviewer_model: str,
                "coverage_policy": COVERAGE_POLICY, "citation_policy": CITATION_POLICY,
                "certification_policy": policy,
                "input_manifest_hash": fingerprint(input_manifest),
-               "corpus_hash": fingerprint(documents),
+               "corpus_hash": full_corpus_hash,
                "source_map_hash": fingerprint(source_map),
                "protocol_hash": fingerprint(public_protocol),
                "contract_hash": fingerprint({"blind": BLIND_SYSTEM, "adjudicate": ADJUDICATE_SYSTEM}),
@@ -346,12 +362,44 @@ def prepare_review(questions, corpus, public_protocol, *, reviewer_model: str,
             contract_hash=fingerprint({"blind": BLIND_SYSTEM, "reference_audit": reference_audit.SYSTEM,
                                        "adjudicate": ISOLATED_ADJUDICATE_SYSTEM}))
     items = []
+    source_to_visible = {}
+    for mapping in source_map:
+        source_id = mapping.get("source_doc_id")
+        if source_id is not None:
+            source_id = str(source_id)
+            if source_id in source_to_visible:
+                raise ValueError("Public source document IDs must be unique for scoped review")
+            source_to_visible[source_id] = mapping["doc_id"]
+    by_visible = {doc["doc_id"]: doc for doc in documents}
+    scope_hashes = {}
     for candidate in candidates:
+        requested = candidate.pop("semantic_scope_source_doc_ids")
+        if requested is None:
+            visible_ids = [doc["doc_id"] for doc in documents]
+            requested = [str(row.get("source_doc_id")) for row in source_map]
+        else:
+            missing = [doc_id for doc_id in requested if doc_id not in source_to_visible]
+            if missing:
+                raise ValueError("Scoped review refers to missing public documents: " + str(missing[:3]))
+            visible_ids = [source_to_visible[doc_id] for doc_id in requested]
+        scoped_documents = [by_visible[doc_id] for doc_id in visible_ids]
+        scope_key = tuple(visible_ids)
+        if scope_key not in scope_hashes:
+            scope_hashes[scope_key] = fingerprint(scoped_documents)
+        document_scope = {"version": "question-public-scope/v1",
+                          "source_doc_ids": requested,
+                          "visible_doc_ids": visible_ids,
+                          "document_count": len(scoped_documents),
+                          "corpus_hash": scope_hashes[scope_key],
+                          "full_corpus_hash": full_corpus_hash}
         candidate_binding = {**binding, **candidate["source_identity"],
+                             "corpus_hash": document_scope["corpus_hash"],
+                             "document_scope_hash": fingerprint(document_scope),
                              "encoding_hash": fingerprint(candidate["reference_encoding"]),
                              "proposal_hash": fingerprint({"provided": candidate["reference_provided"],
                                                            "proposal": candidate["reference_proposal"]})}
         items.append({**candidate, "binding": candidate_binding,
+                      "document_scope": document_scope,
                       "review_state": "pending", "execution": {"status": "not_run"},
                       "stage_execution": {}, "stage_evidence_location": {},
                       "evidence_location": {"status": "not_checked", "failed_stages": []},
@@ -510,6 +558,8 @@ def _validate_readable_response(response, stage: str, documents: list[dict], *,
         raise ValueError("Reviewer output must be a JSON object")
     if "__error__" in response:
         raise RuntimeError(str(response["__error__"]))
+    from pipeline.paged_read import validate as validate_paged_read
+    validate_paged_read(response, documents)
     for field in ("interpretation", "reasoning"):
         if not isinstance(response.get(field), str):
             raise ValueError(f"Missing string field: {field}")
@@ -667,7 +717,7 @@ def validate_isolated_completed(item: dict, documents: list[dict]) -> dict:
     replay = reference_audit.audit_reference(_reference_audit_question(item), documents, protocol,
         model=model, chat_json=lambda *_args, **_kwargs: deepcopy(audit["raw_output"]),
         max_calls=1, max_input_chars=max(1, sum(len(m["content"]) for m in audit.get("messages", [])) + 10000),
-        max_tokens=1)
+        max_tokens=1, prepared_documents=documents)
     if (not replay.get("proposal_ready") or replay["proposal"]["decision"] == "unresolved"
             or audit.get("execution", {}).get("status") != "ok" or not audit.get("proposal_ready")):
         raise ValueError("Reference audit is incomplete, unresolved or has invalid target/evidence locations")
@@ -706,6 +756,7 @@ def review_certification(item: dict) -> dict:
     this summary is intentionally not a substitute for those replay checks.
     """
     reasons = []
+    isolated = item.get("binding", {}).get("version") == ISOLATED_VERSION
     for stage, field in (("blind_read", "blind_read"), ("adjudicate", "adjudication")):
         if item.get("stage_execution", {}).get(stage, {}).get("status") != "ok":
             reasons.append(f"{stage}:execution_incomplete")
@@ -716,7 +767,13 @@ def review_certification(item: dict) -> dict:
             coverage = response.get("coverage", {})
             if coverage.get("status") != "complete" or coverage.get("scope_conflict") is not False:
                 reasons.append(f"{stage}:coverage_incomplete")
-        if item.get("stage_evidence_location", {}).get(stage, {}).get("status") != "located":
+        # In the isolated workflow the blind reader proposes an independent
+        # interpretation.  Its citation-location failure is disclosed to the
+        # adjudicator and retained in the receipt, but it is not a third veto
+        # once both the adjudicator evidence and the independent reference
+        # audit are located.  Execution and coverage remain mandatory.
+        if (not (isolated and stage == "blind_read")
+                and item.get("stage_evidence_location", {}).get(stage, {}).get("status") != "located"):
             reasons.append(f"{stage}:evidence_location_unverified")
     adjudication = item.get("adjudication") or {}
     if any(adjudication.get(field, "unresolved") == "unresolved"
@@ -724,7 +781,6 @@ def review_certification(item: dict) -> dict:
         reasons.append("semantic_unresolved")
     if adjudication.get("original_rationale_review", {}).get("status") == "unresolved":
         reasons.append("original_rationale_review_unresolved")
-    isolated = item.get("binding", {}).get("version") == ISOLATED_VERSION
     if isolated:
         audit = item.get("reference_audit") or {}
         if item.get("stage_execution", {}).get("reference_audit", {}).get("status") != "ok":
@@ -756,6 +812,9 @@ def _audit_notice(audit):
     result = {key: deepcopy(audit.get(key)) for key in (
         "raw_output", "proposal", "proposal_ready", "execution", "format_issues",
         "reference_audit_version", "reference_location_policy")}
+    for key in ("raw_output", "proposal"):
+        if isinstance(result.get(key), dict):
+            result[key].pop("_paged_read", None)
     result["claim_locations"] = [{key: deepcopy(value) for key, value in claim.items()
                                   if key != "resolved_evidence"}
                                  for claim in audit.get("claim_locations", [])]
@@ -793,6 +852,25 @@ def review_questions(questions, corpus, public_protocol, *, chat_json: Callable,
     report["budget"] = {"max_calls": max_calls, "max_input_chars": max_input_chars, "max_tokens": max_tokens}
     params = {"temperature": 0.0, "max_tokens": max_tokens, "retries": 1, "strict_json": True}
 
+    all_documents = {doc["doc_id"]: doc for doc in report["documents"]}
+
+    def item_documents(item):
+        scope = item.get("document_scope") or {}
+        ids = scope.get("visible_doc_ids")
+        if (not isinstance(ids, list) or not ids or len(set(ids)) != len(ids)
+                or any(doc_id not in all_documents for doc_id in ids)):
+            raise ValueError("Invalid question document scope")
+        documents = [all_documents[doc_id] for doc_id in ids]
+        # ``documents`` was materialized from the immutable report view during
+        # prepare_review.  Re-serializing all document bodies for every role of
+        # every question only repeats the digest already bound in ``scope``.
+        # The ID membership/order and the scope binding still get replayed here;
+        # full evaluator validation reconstructs and verifies the same digest.
+        if (scope.get("corpus_hash") != item.get("binding", {}).get("corpus_hash")
+                or fingerprint(scope) != item.get("binding", {}).get("document_scope_hash")):
+            raise ValueError("Question document scope binding mismatch")
+        return documents
+
     def emit(event):
         event = _json_copy(event)
         report["records"].append(event)
@@ -811,6 +889,7 @@ def review_questions(questions, corpus, public_protocol, *, chat_json: Callable,
                 raise SemanticReviewAuditError("Audit sink failed; review retained on exception", report) from exc
 
     for item in report["items"]:
+        scoped_documents = item_documents(item)
         stages = [("blind_read", BLIND_SYSTEM)]
         if isolated:
             stages.append(("reference_audit", None))
@@ -829,10 +908,11 @@ def review_questions(questions, corpus, public_protocol, *, chat_json: Callable,
                           "audit_binding": event["binding"], "binding": item["binding"]})
 
                 try:
-                    audit = audit_reference(_reference_audit_question(item), report["documents"],
+                    audit = audit_reference(_reference_audit_question(item), scoped_documents,
                         report["public_protocol"], model=reference_auditor_model,
                         chat_json=audit_chat, max_calls=int(report["calls_used"] < max_calls),
-                        max_input_chars=max_input_chars, max_tokens=max_tokens, record=audit_record)
+                        max_input_chars=max_input_chars, max_tokens=max_tokens, record=audit_record,
+                        prepared_documents=scoped_documents)
                 except AuditRecordError as exc:
                     item["reference_audit"] = deepcopy(exc.report)
                     item["stage_execution"][stage] = deepcopy(exc.report["execution"])
@@ -850,9 +930,12 @@ def review_questions(questions, corpus, public_protocol, *, chat_json: Callable,
                 # its fresh assessment cannot retroactively certify this audit.
                 continue
             payload = {"question": item["question"], "public_protocol": report["public_protocol"],
-                       "documents": report["documents"],
-                       "input_scope": {k: report["input_manifest"][k] for k in
-                                       ("document_count", "corpus_hash", "visible_view")}}
+                       "documents": scoped_documents,
+                       "input_scope": {"document_count": len(scoped_documents),
+                                      "corpus_hash": item["document_scope"]["corpus_hash"],
+                                       "visible_view": report["input_manifest"]["visible_view"],
+                                       "scope_version": item["document_scope"]["version"],
+                                       "full_corpus_hash": report["input_manifest"]["corpus_hash"]}}
             if stage == "adjudicate":
                 blind_location = item["stage_evidence_location"].get("blind_read", {
                     "status": "not_checked", "entries": []})
@@ -864,6 +947,8 @@ def review_questions(questions, corpus, public_protocol, *, chat_json: Callable,
                 payload.update(blind_read=item["blind_read"], reference_proposal=item["reference_proposal"],
                                 reference_provided=item["reference_provided"],
                                 blind_read_evidence_location=location_notice)
+                if isinstance(payload.get("blind_read"), dict):
+                    payload["blind_read"] = {k: deepcopy(v) for k,v in payload["blind_read"].items() if k != "_paged_read"}
                 if isolated:
                     payload["reference_audit"] = _audit_notice(item["reference_audit"] or {})
                     payload["blind_read_execution"] = item["stage_execution"].get("blind_read")
@@ -898,7 +983,7 @@ def review_questions(questions, corpus, public_protocol, *, chat_json: Callable,
                          "error_type": type(exc).__name__, "message": str(exc)}
             if error is None:
                 try:
-                    _validate_readable_response(output, stage, report["documents"],
+                    _validate_readable_response(output, stage, scoped_documents,
                                        reference_provided=item["reference_provided"], require_analysis=True)
                     if isolated and stage == "adjudicate":
                         targets = _isolated_target_locations(output, item["reference_proposal"])
@@ -906,7 +991,7 @@ def review_questions(questions, corpus, public_protocol, *, chat_json: Callable,
                     error = {"status": "invalid_review", "stage": stage,
                              "error_type": type(exc).__name__, "message": str(exc)}
             if error is None:
-                location = locate_citations(output["evidence"], report["documents"])
+                location = locate_citations(output["evidence"], scoped_documents)
             execution = error or {"status": "ok"}
             item["stage_execution"][stage] = deepcopy(execution)
             item["stage_evidence_location"][stage] = deepcopy(location)

@@ -48,6 +48,7 @@ class QueuedSDK(fixture.FakeSDK):
         super().__init__()
         self.outcome = outcome
         self.entered = threading.Event()
+        self.second_entered = threading.Event()
         self.release_first = threading.Event()
 
     def with_options(self, **options):
@@ -70,6 +71,8 @@ class QueuedSDK(fixture.FakeSDK):
                     return SimpleNamespace(id="returned-body", model=kwargs["model"], usage=None,
                         choices=[SimpleNamespace(index=0, finish_reason="stop",
                             message=SimpleNamespace(content=content, refusal=None))])
+            if index == 2:
+                self.second_entered.set()
             return SimpleNamespace(id="ok", model=kwargs["model"], usage=None,
                 choices=[SimpleNamespace(index=0, finish_reason="stop",
                     message=SimpleNamespace(content='{"ok":true}', refusal=None))])
@@ -82,18 +85,6 @@ class DispatchStopTests(unittest.TestCase):
 
     def exercise_queue(self, outcome, *, raw_first=False, attempts=1):
         api = QueuedSDK(outcome)
-        dispatch = ObservedLock()
-        locks = []
-        def new_lock():
-            # Only smoke's module-local threading alias is replaced; config,
-            # Tracer, SDK and executor retain their real threading primitives.
-            result = threading.Lock()
-            locks.append(result)
-            return result
-        def new_rlock():
-            locks.append(dispatch)
-            return dispatch
-        proxy = SimpleNamespace(Lock=new_lock, RLock=new_rlock, BoundedSemaphore=threading.BoundedSemaphore)
         observed = {}
         def calls(directory, cfg):
             tracer = Tracer(SimpleNamespace(dir=directory))
@@ -103,9 +94,10 @@ class DispatchStopTests(unittest.TestCase):
                 self.assertTrue(api.entered.wait(timeout=3))
                 second = pool.submit(tracer.chat_json, "world.disclosure_plan", [], max_tokens=4096)
                 try:
-                    self.assertTrue(dispatch.waiting.wait(timeout=3), "Second caller must really reach dispatch lock")
+                    self.assertTrue(api.second_entered.wait(timeout=3),
+                                    "Second caller must dispatch while the first is in flight")
                     profile = json.loads((directory / "experiment_profile.json").read_text(encoding="utf-8"))
-                    self.assertEqual((len(api.calls), profile["admitted_calls"]), (1, 1))
+                    self.assertEqual((len(api.calls), profile["admitted_calls"]), (2, 2))
                     observed["first_reservation"] = profile["reserved_upper_estimate_cny"]
                 finally:
                     api.release_first.set()
@@ -116,37 +108,37 @@ class DispatchStopTests(unittest.TestCase):
                         raise
                     first_answer = exc
                 observed["answers"] = [first_answer, second.result(timeout=5)]
-        with patch.object(smoke, "threading", proxy), patch.object(fixture, "FakeSDK", return_value=api):
-            result = self.run_tool(calls, ["--world-review-reasoning-effort", "medium", "--json-attempts", str(attempts)])
-        self.assertEqual(len(locks), 2, "Use separate ledger and dispatch locks")
-        if not raw_first:
-            self.assertGreaterEqual(dispatch.reentries, 1, "Actual config.chat_json must reenter bounded_chat")
+        with patch.object(fixture, "FakeSDK", return_value=api):
+            result = self.run_tool(calls, ["--world-review-reasoning-effort", "medium",
+                "--json-attempts", str(attempts), "--llm-concurrency", "2"])
         return result, observed
 
-    def test_first_provider_failure_blocks_already_waiting_request_before_admission(self):
+    def test_first_provider_failure_closes_future_admission_but_keeps_inflight_result(self):
         result, observed = self.exercise_queue("provider_error")
         self.assertIsNone(result.error)
-        self.assertEqual((len(result.api.calls), result.profile["admitted_calls"], len(result.requests)), (1,1,1))
+        self.assertEqual((len(result.api.calls), result.profile["admitted_calls"], len(result.requests)), (2,2,2))
         self.assertTrue(result.profile["stopped"])
-        self.assertEqual(result.profile["reserved_upper_estimate_cny"], observed["first_reservation"])
-        self.assertTrue(all("__error__" in answer for answer in observed["answers"]))
+        self.assertIn("__error__", observed["answers"][0])
+        self.assertEqual(observed["answers"][1], {"ok": True})
         self.assertEqual(result.requests[0]["step"], "world.semantic_review")
 
-    def test_first_empty_truncated_response_also_blocks_queue_before_sdk(self):
+    def test_local_truncation_preserves_failed_call_and_allows_next_bounded_unit(self):
         result, observed = self.exercise_queue("empty_length")
         self.assertIsNone(result.error)
-        self.assertEqual((len(result.api.calls), result.profile["admitted_calls"], len(result.requests)), (1,1,1))
-        self.assertTrue(result.profile["stopped"])
+        self.assertEqual((len(result.api.calls), result.profile["admitted_calls"], len(result.requests)), (2,2,2))
+        self.assertFalse(result.profile["stopped"])
         self.assertEqual(result.profile["reserved_upper_estimate_cny"], observed["first_reservation"])
-        self.assertTrue(all("__error__" in answer for answer in observed["answers"]))
+        self.assertIn("__error__", observed["answers"][0])
+        self.assertEqual(observed["answers"][1], {"ok": True})
 
-    def test_first_malformed_json_blocks_queue_after_real_config_strict_parse(self):
+    def test_local_malformed_json_preserves_failure_without_blocking_other_unit(self):
         result, observed = self.exercise_queue("malformed_json")
         self.assertIsNone(result.error)
-        self.assertEqual((len(result.api.calls), result.profile["admitted_calls"], len(result.requests)), (1,1,1))
-        self.assertTrue(result.profile["stopped"])
+        self.assertEqual((len(result.api.calls), result.profile["admitted_calls"], len(result.requests)), (2,2,2))
+        self.assertFalse(result.profile["stopped"])
         self.assertEqual(result.profile["reserved_upper_estimate_cny"], observed["first_reservation"])
-        self.assertTrue(all("__error__" in answer for answer in observed["answers"]))
+        self.assertIn("__error__", observed["answers"][0])
+        self.assertEqual(observed["answers"][1], {"ok": True})
         responses = [row for row in result.rows if row.get("event") == "response"]
         self.assertEqual(responses[0]["response"]["choices"][0]["finish_reason"], "stop")
         errors = [row for row in result.rows if row.get("event") == "json_error"]
@@ -155,13 +147,12 @@ class DispatchStopTests(unittest.TestCase):
         self.assertTrue(all(row["max_attempts"] == 1 for row in result.rows if row.get("event") == "json_attempt"))
 
     def test_recoverable_empty_reply_finishes_retry_before_admitting_waiting_request(self):
-        with patch("time.sleep"):
-            result, observed = self.exercise_queue("empty_length", attempts=3)
+        result, observed = self.exercise_queue("empty_length", attempts=3)
         self.assertIsNone(result.error)
         self.assertEqual(observed["answers"], [{"ok": True}, {"ok": True}])
         self.assertEqual((len(result.api.calls), result.profile["admitted_calls"]), (3, 3))
-        self.assertEqual([r["step"] for r in result.requests],
-            ["world.semantic_review", "world.semantic_review", "world.disclosure_plan"])
+        self.assertEqual(sorted(r["step"] for r in result.requests),
+            sorted(["world.semantic_review", "world.semantic_review", "world.disclosure_plan"]))
         self.assertFalse(result.profile["stopped"])
 
     def test_semantic_negative_json_is_not_an_execution_error_or_stop(self):
@@ -171,12 +162,12 @@ class DispatchStopTests(unittest.TestCase):
         self.assertEqual((len(result.api.calls), result.profile["admitted_calls"]), (2,2))
         self.assertFalse(result.profile["stopped"])
 
-    def test_raw_chat_failure_uses_same_lock_and_stops_waiting_json_request(self):
+    def test_raw_chat_failure_stops_future_admission_after_inflight_request(self):
         result, observed = self.exercise_queue("provider_error", raw_first=True)
         self.assertIsNone(result.error)
         self.assertIsInstance(observed["answers"][0], RuntimeError)
-        self.assertIn("__error__", observed["answers"][1])
-        self.assertEqual((len(result.api.calls), result.profile["admitted_calls"]), (1,1))
+        self.assertEqual(observed["answers"][1], {"ok": True})
+        self.assertEqual((len(result.api.calls), result.profile["admitted_calls"]), (2,2))
         self.assertTrue(result.profile["stopped"])
 
     def test_successful_first_call_admits_second_on_its_turn_with_separate_step_transport(self):
@@ -185,7 +176,7 @@ class DispatchStopTests(unittest.TestCase):
         self.assertEqual(observed["answers"], [{"ok":True}, {"ok":True}])
         self.assertEqual((len(result.api.calls), result.profile["admitted_calls"], len(result.requests)), (2,2,2))
         self.assertFalse(result.profile["stopped"])
-        self.assertAlmostEqual(result.profile["reserved_upper_estimate_cny"], 2*observed["first_reservation"])
+        self.assertAlmostEqual(result.profile["reserved_upper_estimate_cny"], observed["first_reservation"])
         self.assertEqual([r["kwargs"]["reasoning_effort"] for r in result.api.calls], ["medium", "low"])
         self.assertTrue(all(r["options"] == {"timeout":150, "max_retries":0} for r in result.api.calls))
         self.assertIsNone(smoke._TRACER_STEP.get())

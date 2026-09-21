@@ -20,7 +20,7 @@ from pipeline.world_state import Op, SET, Timeline, WorldState
 
 class ClosedLoopSemanticStopTests(unittest.TestCase):
     def exercise(self, *, semantic=True, outcome="pending", enough=False, execution_error=False,
-                 target_spec=None, extra_line=False):
+                 target_spec=None, extra_line=False, world_failure_on_call=None):
         with tempfile.TemporaryDirectory(prefix="bc_closed_loop_") as directory, ExitStack() as stack:
             stack.enter_context(patch.object(socket.socket, "connect", side_effect=AssertionError("Network prohibited")))
             stack.enter_context(patch.object(config, "chat", side_effect=AssertionError("API prohibited")))
@@ -45,6 +45,8 @@ class ClosedLoopSemanticStopTests(unittest.TestCase):
 
             def world(r):
                 calls.append("world")
+                if world_failure_on_call == calls.count("world"):
+                    raise RuntimeError("injected later-round provider stop")
                 ws = WorldState(entities={"entity": {"field": Timeline([Op(0, "2025-01-06", SET, "value")])}}, n_sessions=3)
                 r.write(factory.ART["world"], ws.to_dict())
 
@@ -112,28 +114,28 @@ class ClosedLoopSemanticStopTests(unittest.TestCase):
             artifacts = {p.name: run.read(p.name) for p in run.dir.glob("*.json")}
             return calls, deepcopy(run.manifest), artifacts, reports, raw_reviews, exception, result
 
-    def assert_quality_stop(self, outcome):
+    def assert_quality_warning_completion(self, outcome):
         calls, manifest, artifacts, reports, reviews, exc, result = self.exercise(outcome=outcome)
-        self.assertIsInstance(exc, WorldBlueprintError)
-        self.assertIn("UNMET_QUALITY_REVIEW", str(exc))
-        self.assertEqual(calls.count("world"), 1)
-        self.assertEqual(calls.count("corpus"), 1)
-        self.assertNotIn("quality", calls)
-        self.assertEqual(manifest["status"], "failed")
-        self.assertEqual(manifest["algo"]["met_status"], "UNMET_QUALITY_REVIEW")
-        self.assertEqual(artifacts["06_grounding_report.json"], reports[0])
-        self.assertEqual(artifacts["06_semantic_review.json"], reviews[0])
+        self.assertIsNone(exc)
+        self.assertEqual(result[1], "MET")
+        self.assertEqual(calls.count("world"), 2)
+        self.assertEqual(calls.count("corpus"), 2)
+        self.assertEqual(calls.count("quality"), 1)
+        self.assertEqual(manifest["status"], "done")
+        self.assertEqual(manifest["algo"]["met_status"], "MET")
+        self.assertEqual(artifacts["06_grounding_report.json"], reports[-1])
+        self.assertEqual(artifacts["06_semantic_review.json"], reviews[-1])
         self.assertEqual(len(artifacts[factory.ART["questions"]]), 3)
-        self.assertEqual(len(artifacts[factory.ART["grounding"]]), 1)
+        self.assertEqual(len(artifacts[factory.ART["grounding"]]), 3)
         self.assertFalse({"augment", "render_only", "render_only_pairs"} & manifest["config"].keys())
         detail = manifest["algo"]["quality_review_shortfall"]
         self.assertEqual(detail["pending_qids"] if outcome == "pending" else detail["rejected_qids"], ["q1", "q2"])
 
-    def test_unresolved_candidates_stop_before_world_growth(self):
-        self.assert_quality_stop("pending")
+    def test_unresolved_candidates_continue_through_quality(self):
+        self.assert_quality_warning_completion("pending")
 
-    def test_rejected_candidates_stop_without_changing_review(self):
-        self.assert_quality_stop("rejected")
+    def test_rejected_candidates_continue_without_changing_review(self):
+        self.assert_quality_warning_completion("rejected")
 
     def test_enough_eligible_candidates_finish_despite_other_pending(self):
         calls, manifest, artifacts, reports, reviews, exc, result = self.exercise(enough=True)
@@ -154,11 +156,13 @@ class ClosedLoopSemanticStopTests(unittest.TestCase):
         self.assertIn("L2_relational", manifest["config"]["quotas"])
 
     def test_total_only_preserves_explicit_line_floors(self):
-        calls, _, _, _, _, exc, result = self.exercise(enough=True, extra_line=True,
+        calls, manifest, _, _, _, exc, result = self.exercise(enough=True, extra_line=True,
             target_spec=TargetSpec(min_questions=2, total_only=True, per_line_min={"L2_relational": 1}))
-        self.assertIsInstance(exc, WorldBlueprintError)
-        self.assertIn("L2_relational", str(exc))
-        self.assertNotIn("corpus", calls)
+        self.assertIsNone(exc)
+        self.assertEqual(result[1], "COMPLETED_UNMET")
+        self.assertIn("corpus", calls)
+        self.assertIn("quality", calls)
+        self.assertTrue(manifest["algo"]["met_status"].startswith("UNMET:"))
 
     def test_legacy_drops_still_use_original_second_round_growth(self):
         calls, manifest, artifacts, reports, reviews, exc, result = self.exercise(semantic=False)
@@ -173,14 +177,25 @@ class ClosedLoopSemanticStopTests(unittest.TestCase):
         self.assertEqual(result[1], "MET")
         self.assertEqual(calls.count("world"), 2)
 
-    def test_review_execution_failure_remains_execution_failure(self):
+    def test_review_execution_failure_becomes_release_warning(self):
         calls, manifest, artifacts, reports, reviews, exc, result = self.exercise(execution_error=True)
-        self.assertIsInstance(exc, RuntimeError)
-        self.assertEqual(calls.count("world"), 1)
-        self.assertEqual(manifest["stages"]["grounding"]["status"], "failed")
-        self.assertNotEqual(manifest.get("algo", {}).get("met_status"), "UNMET_QUALITY_REVIEW")
-        self.assertNotIn(factory.ART["grounding"], artifacts)
-        self.assertEqual(artifacts["06_semantic_review.json"], reviews[0])
+        self.assertIsNone(exc)
+        self.assertEqual(result[1], "COMPLETED_UNMET")
+        self.assertEqual(calls.count("world"), 3)
+        self.assertEqual(manifest["stages"]["grounding"]["status"], "succeeded")
+        self.assertIn(factory.ART["grounding"], artifacts)
+        self.assertEqual(artifacts["06_semantic_review.json"], reviews[-1])
+        self.assertIn("quality", calls)
+
+    def test_later_round_failure_stops_new_work_but_still_runs_final_quality(self):
+        calls, manifest, artifacts, _, _, exc, result = self.exercise(world_failure_on_call=2)
+        self.assertIsNone(exc)
+        self.assertEqual(result[1], "COMPLETED_UNMET")
+        self.assertEqual(calls.count("world"), 2)
+        self.assertEqual(calls.count("quality"), 1)
+        self.assertEqual(manifest["status"], "failed")
+        self.assertEqual(manifest["algo"]["met_status"], "UNMET_EXECUTION")
+        self.assertEqual(artifacts["06_production_warning.json"]["release_eligible"], False)
 
 
 if __name__ == "__main__":

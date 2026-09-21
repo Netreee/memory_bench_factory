@@ -10,6 +10,7 @@ import sys
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import config
@@ -23,6 +24,23 @@ checks: list[tuple[bool, str]] = []
 
 def ck(name, cond):
     checks.append((bool(cond), name))
+
+
+with tempfile.TemporaryDirectory() as atomic_temp:
+    atomic_path = Path(atomic_temp) / "state.json"
+    real_replace = run_module.os.replace
+    attempts = []
+    def briefly_locked(source, target):
+        attempts.append((source, target))
+        if len(attempts) < 3:
+            raise PermissionError("temporary Windows sharing violation")
+        return real_replace(source, target)
+    with patch.object(run_module.os, "replace", side_effect=briefly_locked), \
+         patch.object(run_module.time, "sleep") as waited:
+        run_module._atomic_write_json(atomic_path, {"complete": True})
+    ck("Windows 临时文件占用有限重试后仍原子发布完整 JSON",
+       json.loads(atomic_path.read_text(encoding="utf-8")) == {"complete": True}
+       and len(attempts) == 3 and waited.call_count == 2)
 
 
 empty_response = SimpleNamespace(

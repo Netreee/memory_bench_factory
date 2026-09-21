@@ -9,6 +9,7 @@ from copy import deepcopy
 import json
 from pathlib import Path
 from pipeline.semantic_review import (prepare_review, fingerprint, _validate_response,
+                                      _validate_readable_response,
                                       COMMON, REFERENCE_POLICY, resolve_citations, CITATION_POLICY,
                                       VERSION as REVIEW_VERSION, ISOLATED_VERSION,
                                       validate_isolated_completed, review_certification, locate_citations)
@@ -340,8 +341,12 @@ class SemanticJudge:
             for field in ("question", "reference_proposal", "reference_provided", "source_identity", "reference_encoding", "source_qid"):
                 if current.get(field) != item[field] or field not in current:
                     raise ValueError(f"Stored review {field} does not match its input binding")
+            if current.get("document_scope") != item.get("document_scope"):
+                raise ValueError("Stored review document scope does not match its input binding")
             if current.get("review_state") == "completed":
-                self._validate_completed(current, prepared["documents"])
+                by_id = {doc["doc_id"]: doc for doc in prepared["documents"]}
+                scoped = [by_id[doc_id] for doc_id in item["document_scope"]["visible_doc_ids"]]
+                self._validate_completed(current, scoped)
             self.items[key].append(deepcopy(current))
         if any(not group for group in self.items.values()):
             raise ValueError("Missing or stale question/reference review")
@@ -413,11 +418,15 @@ class SemanticJudge:
         """Check a cached receipt's actual stages, not only its summary labels."""
         if (item.get("execution") or {}).get("status") != "ok":
             raise ValueError("Completed review has a failed execution")
+        isolated = (item.get("binding") or {}).get("version") == ISOLATED_VERSION
         blind, decision = item.get("blind_read"), item.get("adjudication")
-        _validate_response(blind, "blind_read", documents, require_analysis=True)
+        if isolated:
+            _validate_readable_response(blind, "blind_read", documents,
+                                        require_analysis=True)
+        else:
+            _validate_response(blind, "blind_read", documents, require_analysis=True)
         _validate_response(decision, "adjudicate", documents,
                            reference_provided=item["reference_provided"], require_analysis=True)
-        isolated = (item.get("binding") or {}).get("version") == ISOLATED_VERSION
         audit = validate_isolated_completed(item, documents) if isolated else None
         certification = review_certification(item)
         if item.get("item_certification") != certification or certification["status"] != "certified":
@@ -426,12 +435,23 @@ class SemanticJudge:
                      "adjudicate": locate_citations(decision["evidence"], documents)}
         if isolated:
             locations["reference_audit"] = audit["evidence_location"]
+        failed_stages = [stage for stage, value in locations.items()
+                         if value["status"] == "failed"]
+        all_located = all(value["status"] == "located" for value in locations.values())
+        location_summary = {"status": "failed" if failed_stages else
+                            "located" if all_located else "not_checked",
+                            "failed_stages": failed_stages}
         if (item.get("stage_evidence_location") != locations
-                or item.get("evidence_location") != {"status": "located", "failed_stages": []}
+                or item.get("evidence_location") != location_summary
                 or (item.get("semantic") or {}).get("status") != "resolved"):
             raise ValueError("Completed review location or semantic summary is not current")
-        resolved_stages = {"blind_read": resolve_citations(blind["evidence"], documents),
-                           "adjudicate": resolve_citations(decision["evidence"], documents)}
+        resolved_stages = {
+            # A failed blind citation is an auditable proposal defect in the
+            # isolated workflow.  The adjudicator and reference auditor still
+            # require exact, replayable locations before certification.
+            "blind_read": (locations["blind_read"]["resolved_evidence"] if isolated
+                           else resolve_citations(blind["evidence"], documents)),
+            "adjudicate": resolve_citations(decision["evidence"], documents)}
         if isolated:
             resolved_stages["reference_audit"] = audit["resolved_evidence"]
         if (item.get("stage_resolved_evidence") != resolved_stages

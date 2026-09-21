@@ -9,12 +9,15 @@ from copy import deepcopy
 import hashlib
 import json
 from pathlib import Path
+import re
 
 from pipeline.reference_locations import locate_reference_target, validate_json_value
 from pipeline.world_blueprint import relation_owner_side
 
 VERSION = "original-world-semantics/v13"
 REVIEW_ARTIFACT = "02_world_review.json"
+WARNING_ARTIFACT = "02_world_review_warning.json"
+WARNING_VERSION = "world-review-generation-warning/v1"
 STEP = "world.semantic_review"
 # Affordable reasoning models may consume the smaller completion allowance
 # before emitting a review. This is a ceiling, not a requested response length.
@@ -534,7 +537,7 @@ def _parse(raw, payload):
 def _params(model):
     _text(model, "reviewer model")
     return {"model": model, "temperature": 0, "max_tokens": MAX_TOKENS,
-            "retries": 1, "strict_json": True, "response_format": {"type": "json_object"}}
+            "retries": 3, "strict_json": True, "response_format": {"type": "json_object"}}
 
 
 def review_world(wp, ws, tracer, task_input=None, previous=None, author_responses=None):
@@ -605,10 +608,45 @@ def validate_review(report, wp, ws, task_input=None):
         return [{"code": "missing_or_stale_world_review", "message": f"{type(exc).__name__}: {exc}"}]
 
 
+def generation_warning(report, wp, ws, task_input=None):
+    """Bind an unapproved opinion to the exact candidate allowed downstream.
+
+    This receipt authorizes continued generation only.  Release validation
+    still reads the original review and therefore remains ineligible until a
+    current passing opinion exists.
+    """
+    if not isinstance(report, dict):
+        raise ValueError("A generation warning requires a saved world review")
+    validation_errors = validate_review(report, wp, ws, task_input=task_input)
+    if report.get("status") == "passed" and not validation_errors:
+        raise ValueError("A current passing review does not need a generation warning")
+    category = ("review_receipt_invalid" if report.get("status") == "passed"
+                else "review_execution_error" if report.get("status") == "error"
+                else "semantic_review_not_passed")
+    return {"version": WARNING_VERSION, "status": "warning", "category": category,
+            "release_eligible": False,
+            "binding": {"whitepaper_hash": _hash(wp), "world_hash": _hash(ws.to_dict()),
+                        "task_input_hash": _hash(task_input), "review_hash": _hash(report)}}
+
+
+def validate_generation_warning(warning, report, wp, ws, task_input=None):
+    try:
+        expected = generation_warning(report, wp, ws, task_input)
+        if warning != expected:
+            raise ValueError("World review generation warning is stale or changed")
+        return []
+    except Exception as exc:
+        return [{"code": "missing_or_stale_world_review_warning",
+                 "message": f"{type(exc).__name__}: {exc}"}]
+
+
 SCOPED_REVIEW_RULES = """
-分步审阅协议：先自行选择能一起判断的业务事实，inspect 后提交意见。
-{"action":"submit","issues":[],"mechanism_coverage":[],"disclosure_reviews":[],"note":"简短阅读记录"}
-三种意见列表内的元素严格沿用上面的原审阅 schema，可分多次提交。已提交的意见保留，不可同id覆盖；需要更多上下文时先读取后提交。
+分步审阅协议：程序按容量连续交付全部原始材料，分包只控制传输大小，不代表业务边界。
+读完当前 exact_reads 后必须提交审阅记录，程序收到合法 submit 后才交付下一批。
+需要回查已见过的具体节点时可 inspect。不输出 index 或 continue。
+LLM 负责每批的业务理解、跨批线索记录和最终判断；程序只负责传输和保存。
+{"action":"submit","issues":[],"mechanism_coverage":[],"disclosure_reviews":[],"note":"本批业务观察，写明关键事实及 ref id，最多1000字"}
+三种意见列表内的元素严格沿用上面的原审阅 schema，可分多次提交。通常不可同id覆盖；若 finish 的 action_error 明确指出已提交意见不合格，下一次 submit 可用同一 id 交修正版，系统会保留修订记录。需要更多上下文时先读取后提交。
 每条 disclosure_reviews 必须在读取该记录及其全部原引用内容后提交。issues 和 mechanism_coverage 的世界 refs 只能引用已经实际读取的节点。
 机制见证需要沿同一具体业务过程核对全部支撑事实，主动读取跨任务依赖，不能根据各处标签拼出见证。
 所有世界事实窗口和公开记录均实际读取，全部必要机制和记录均给出意见后，才能结束：
@@ -679,19 +717,97 @@ def _scoped_review_context(payload):
 def _scoped_review_state(state):
     return {"issues": state["issues"], "mechanism_coverage": state["mechanism_coverage"],
             "disclosure_reviews": [{"record_id": r["record_id"], "status": r["status"]}
-                                   for r in state["disclosure_reviews"]], "note": state["note"]}
+                                   for r in state["disclosure_reviews"]], "note": state["note"],
+            "revision_count": len(state.get("revisions", []))}
 
 
-def _review_action(raw, window, state, payload):
+def _review_action(raw, window, state, payload, *, allow_revision=False, revision_reason=None,
+                   legacy=False, strict_state_echo=False):
+    if not isinstance(raw, dict):
+        raise ValueError("World review action must be a JSON object")
+    final_fields = {"mechanism_coverage", "disclosure_reviews", "issues", "repair_targets",
+                    "limitations", "reason", "decision"}
+    final_shape = not legacy and "action" not in raw and set(raw) == final_fields
+    direct_final = final_shape and not strict_state_echo
+    compat_direct_final = final_shape and strict_state_echo
+    final_payload = deepcopy(raw) if direct_final else None
+    finish_after_submit = bool(direct_final and window.read == set(window.nodes))
+    if direct_final:
+        compact_disclosures = final_payload.get("disclosure_reviews")
+        if (isinstance(compact_disclosures, list) and compact_disclosures
+                and all(isinstance(row, dict) and set(row) == {"record_id", "status"}
+                        for row in compact_disclosures)):
+            # The bounded working-state view intentionally exposes disclosure
+            # opinions as identity+status only.  Models commonly echo that
+            # exact compact view in the consolidated final object.  Expand it
+            # solely from the already submitted full opinions, requiring an
+            # exact one-to-one identity and unchanged status; no reason, refs
+            # or business judgement is synthesized here.
+            submitted = {row["record_id"]: row for row in state["disclosure_reviews"]}
+            if (len(submitted) != len(state["disclosure_reviews"])
+                    or len(compact_disclosures) != len(submitted)
+                    or {row["record_id"] for row in compact_disclosures} != set(submitted)
+                    or any(submitted[row["record_id"]]["status"] != row["status"]
+                           for row in compact_disclosures)):
+                raise ValueError("Compact final disclosure state differs from submitted full opinions")
+            final_payload["disclosure_reviews"] = [
+                deepcopy(submitted[row["record_id"]]) for row in compact_disclosures]
+        # The main reviewer schema naturally encourages a consolidated final
+        # object.  If the exact-read transport still has unread nodes, preserve
+        # those opinions as the current batch submission and deliver the next
+        # originals.  Certification remains impossible until every node has
+        # actually been read.  When reading is complete, the same operation is
+        # an atomic submit+finish with revisions retained in the audit ledger.
+        note = final_payload.get("reason") or final_payload.get("limitations") or \
+            "当前综合意见已保存；继续读取剩余原始节点。"
+        raw = {"action": "submit", "issues": final_payload["issues"],
+               "mechanism_coverage": final_payload["mechanism_coverage"],
+               "disclosure_reviews": final_payload["disclosure_reviews"],
+               "note": note}
+        allow_revision = True
+        revision_reason = "consolidated final opinion submitted through exact-read transport"
+        if not finish_after_submit:
+            # Preserve the complete opinion while the transport delivers any
+            # final unrelated node.  A later explicit finish may reaffirm this
+            # decision after that last read; it must not fall back to obsolete
+            # progress-only rows accumulated before the complete opinion.
+            state["pending_consolidated_final"] = deepcopy(final_payload)
+    elif compat_direct_final:
+        # Reproduce the v20/v21 parser exactly while replaying its bound
+        # checkpoint prefix.  New calls use the submit+continue behavior above.
+        raw = {**deepcopy(raw), "action": "finish"}
+    if isinstance(raw, dict) and raw.get("action") == "index":
+        raise ValueError("World review material delivery is automatic; review the current exact_reads and submit a batch record")
+    if isinstance(raw, dict) and raw.get("action") == "continue":
+        raise ValueError("A batch review record is required before more material is delivered; use submit")
     if window.control(raw):
-        return None
+        return None, False
     if raw.get("action") == "submit":
         allowed = {"action", "issues", "mechanism_coverage", "disclosure_reviews", "note"}
-        if set(raw) - allowed:
+        echo_fields = set() if legacy else {"revision_count", "working_state"}
+        if set(raw) - allowed - echo_fields:
             raise ValueError("Unknown scoped review submission fields")
+        if ("revision_count" in raw
+                and (type(raw["revision_count"]) is not int or raw["revision_count"] < 0)):
+            raise ValueError("Echoed review revision count must be a nonnegative integer")
+        if (strict_state_echo and "revision_count" in raw
+                and raw["revision_count"] != len(state.get("revisions", []))):
+            raise ValueError("Echoed review revision count differs from current state")
+        if "working_state" in raw:
+            echo = raw["working_state"]
+            current = _scoped_review_state(state)
+            if not isinstance(echo, dict):
+                raise ValueError("Echoed working state must be an object")
+            if (strict_state_echo and any(echo.get(key) != current[key] for key in
+                                         ("issues", "mechanism_coverage", "disclosure_reviews",
+                                          "revision_count"))):
+                raise ValueError("Echoed working state differs from current review state")
         seen_refs = {r["ref_id"] for key in window.read
                      for r in window.nodes[key].get("reference_index", [])}
         seen_refs.update(r["ref_id"] for r in window.common["reference_index"])
+        world_refs = {r["ref_id"] for r in payload["reference_index"]
+                      if r["source"] == "world"}
+        opinion_changed = False
         for group, identity in (("issues", "id"), ("mechanism_coverage", "mechanism_id"),
                                 ("disclosure_reviews", "record_id")):
             rows = raw.get(group, [])
@@ -713,10 +829,17 @@ def _review_action(raw, window, state, payload):
                 if group == "mechanism_coverage" and (row["status"] not in ("witnessed", "not_covered", "unresolved")
                         or row[identity] not in {m["id"] for m in payload["seed"]["mechanisms"]}):
                     raise ValueError("Invalid mechanism identity or status")
+                if (group == "mechanism_coverage" and row["status"] == "witnessed"
+                        and not any(ref in world_refs for ref in row.get("refs", []))):
+                    # Reject the bad opinion while the exact source window that
+                    # prompted it is still visible.  Waiting until final parse
+                    # strands the reviewer with only compact working state and
+                    # makes a mechanical citation repair needlessly difficult.
+                    raise ValueError(
+                        "Witnessed mechanism must cite at least one actual world ref from exact_reads; "
+                        "submit a corrected opinion before finish")
                 if group == "disclosure_reviews" and row["status"] not in ("compatible", "repair", "unresolved"):
                     raise ValueError("Invalid disclosure review status")
-                if any(old[identity] == row[identity] for old in state[group]):
-                    raise ValueError("Repeated submitted review identity")
                 if not isinstance(row.get("refs"), list) or any(ref not in seen_refs for ref in row["refs"]):
                     raise ValueError("Review cites original nodes that were not actually read")
                 if group == "disclosure_reviews":
@@ -724,38 +847,168 @@ def _review_action(raw, window, state, payload):
                                      if r["record_id"] == row[identity]), None)
                     if not expected or expected["record_ref_id"] not in window.read:
                         raise ValueError("Disclosure opinion requires reading full joined record context")
-                state[group].append(deepcopy(row))
+                old_index = next((index for index, old in enumerate(state[group])
+                                  if old[identity] == row[identity]), None)
+                if old_index is None:
+                    state[group].append(deepcopy(row))
+                    opinion_changed = True
+                elif direct_final and state[group][old_index] == row:
+                    # A consolidated final repeats already submitted opinions.
+                    # They remain one opinion in state and one raw response in
+                    # the transcript; no semantic evidence is discarded.
+                    continue
+                elif not allow_revision:
+                    raise ValueError("Repeated submitted review identity")
+                elif state[group][old_index] == row:
+                    if strict_state_echo:
+                        # Reproduce historical parser feedback byte-for-byte
+                        # while replaying a copied checkpoint. The relaxed
+                        # no-change acknowledgement applies only to new calls.
+                        raise ValueError("Submitted review revision did not change the opinion")
+                    # A rejected premature finish can be followed by another
+                    # automatically delivered batch. The reviewer may read it
+                    # and conclude that the accumulated opinion remains valid.
+                    # That is real transport progress, not a failed revision.
+                    continue
+                else:
+                    # A failed finish is validator feedback on the accumulated
+                    # opinion. Let the reviewer correct that opinion in place;
+                    # the transcript and this revision ledger retain both
+                    # versions for replay instead of trapping the session in a
+                    # duplicate-ID loop.
+                    state.setdefault("revisions", []).append({
+                        "group": group, "identity": row[identity],
+                        "previous": deepcopy(state[group][old_index]),
+                        "replacement": deepcopy(row),
+                        "reason": str(revision_reason or "validator feedback")})
+                    state[group][old_index] = deepcopy(row)
+                    opinion_changed = True
+        if finish_after_submit:
+            # A direct final object is the reviewer's complete, consolidated
+            # opinion after every original node has been read.  Earlier batch
+            # submissions are working notes, so an omitted row is an explicit
+            # withdrawal rather than an opinion that should be unioned into the
+            # final decision.  Keep withdrawals in the revision ledger and make
+            # the final lists authoritative only at this fully-read boundary.
+            for group, identity in (("issues", "id"),
+                                    ("mechanism_coverage", "mechanism_id"),
+                                    ("disclosure_reviews", "record_id")):
+                final_rows = deepcopy(final_payload[group])
+                final_ids = {row[identity] for row in final_rows}
+                for old in state[group]:
+                    if old[identity] not in final_ids:
+                        state.setdefault("revisions", []).append({
+                            "group": group, "identity": old[identity],
+                            "previous": deepcopy(old), "replacement": None,
+                            "reason": "omitted from consolidated final opinion after all original nodes were read"})
+                if state[group] != final_rows:
+                    opinion_changed = True
+                state[group] = final_rows
+        if (not direct_final and not opinion_changed and not window.visible
+                and window.read == set(window.nodes)):
+            raise ValueError(
+                "All original world nodes are read and submitted opinions are unchanged; "
+                "output finish with the accumulated decision instead of resubmitting them")
         note = raw.get("note", "")
-        if not isinstance(note, str) or len(note) > 3000:
-            raise ValueError("Review note must be text of at most 3000 characters")
-        state["note"] = note
-        window.visible = {}
-        return None
+        note_limit = 1000 if legacy else 2000
+        if not isinstance(note, str) or not note.strip() or len(note) > note_limit:
+            raise ValueError(f"Each delivered batch needs a non-empty review note of at most {note_limit} characters")
+        state["note"] = (state["note"] + "\n" + note.strip()).strip()
+        if len(state["note"]) > 60000:
+            raise ValueError("Cumulative world review notes exceed 60000 characters; make each batch note concise")
+        if finish_after_submit:
+            result = {key: deepcopy(final_payload.get(key)) for key in
+                      ("decision", "reason", "limitations", "repair_targets")}
+            result.update(issues=deepcopy(state["issues"]),
+                          mechanism_coverage=deepcopy(state["mechanism_coverage"]))
+            if payload.get("public_disclosure_scope"):
+                result["disclosure_reviews"] = deepcopy(state["disclosure_reviews"])
+            _parse(result, payload)
+            return result, False
+        return None, True
     if raw.get("action") != "finish":
         raise ValueError("Unknown scoped world review action")
     if window.read != set(window.nodes):
-        raise ValueError("Cannot finish world review before reading every original world node")
+        # A premature finish is a request to stop reading, not a business
+        # opinion.  Keep the audit record and force delivery of the next unread
+        # originals instead of burning four retries on the same impossible
+        # action.  Certification remains impossible until every node is sent.
+        return None, True
+    pending_final = state.get("pending_consolidated_final")
+    if (isinstance(pending_final, dict)
+            and raw.get("decision") == pending_final.get("decision")
+            and raw.get("repair_targets") == pending_final.get("repair_targets")):
+        # The reviewer saw the last transport node and explicitly reaffirmed
+        # the same decision/routing.  Use its already validated consolidated
+        # opinion lists, with the current finish explanation, and retain any
+        # withdrawn working rows in the revision ledger.
+        result = {key: deepcopy(raw.get(key)) for key in
+                  ("decision", "reason", "limitations", "repair_targets")}
+        for group, identity in (("issues", "id"),
+                                ("mechanism_coverage", "mechanism_id"),
+                                ("disclosure_reviews", "record_id")):
+            final_rows = deepcopy(pending_final[group])
+            final_ids = {row[identity] for row in final_rows}
+            for old in state[group]:
+                if old[identity] not in final_ids:
+                    state.setdefault("revisions", []).append({
+                        "group": group, "identity": old[identity],
+                        "previous": deepcopy(old), "replacement": None,
+                        "reason": "withdrawn by complete opinion and reaffirmed after final original read"})
+            state[group] = final_rows
+        result.update(issues=deepcopy(state["issues"]),
+                      mechanism_coverage=deepcopy(state["mechanism_coverage"]))
+        if payload.get("public_disclosure_scope"):
+            result["disclosure_reviews"] = deepcopy(state["disclosure_reviews"])
+        _parse(result, payload)
+        return result, False
+    if compat_direct_final and any(raw.get(group) != state[group] for group in
+                                   ("issues", "mechanism_coverage", "disclosure_reviews")):
+        raise ValueError("Final opinion lists differ from submitted review state; submit revisions before finish")
     result = {key: deepcopy(raw.get(key)) for key in ("decision", "reason", "limitations", "repair_targets")}
     result.update(issues=deepcopy(state["issues"]), mechanism_coverage=deepcopy(state["mechanism_coverage"]))
     if payload.get("public_disclosure_scope"):
         result["disclosure_reviews"] = deepcopy(state["disclosure_reviews"])
     _parse(result, payload)
-    return result
+    return result, False
 
 
-def _scoped_review_session(wp, ws, task_input, previous, author_responses, model, tracer=None, transcript=None, records=None):
-    from pipeline.world_context import INSTRUCTION, MAX_STEPS
+def _scoped_review_session(wp, ws, task_input, previous, author_responses, model, tracer=None, transcript=None, records=None,
+                           resume=(), save=None, legacy_resume_prefix=0,
+                           compatibility_resume_length=0):
+    from pipeline.world_context import AUTO_DELIVERY_INSTRUCTION, MAX_STEPS, ProgressGuard
     payload, _, binding = _inputs(wp, ws, task_input, previous, author_responses)
     window = _scoped_review_context(payload)
-    system = _system(bool(payload.get("public_disclosure_scope"))) + INSTRUCTION + SCOPED_REVIEW_RULES
+    system = _system(bool(payload.get("public_disclosure_scope"))) + AUTO_DELIVERY_INSTRUCTION + SCOPED_REVIEW_RULES
     call = {"step": STEP, "params": _params(model)}
-    state = {"issues": [], "mechanism_coverage": [], "disclosure_reviews": [], "note": ""}
+    state = {"issues": [], "mechanism_coverage": [], "disclosure_reviews": [], "note": "",
+             "revisions": []}
     records = [] if records is None else records
     feedback, failures = None, 0
-    for number in range(MAX_STEPS):
+    # Measure the non-document envelope before selecting the first transport
+    # batch. Later state growth is measured again before every automatic batch.
+    window.messages(system, _scoped_review_state(state))
+    window.deliver_next_unread()
+    progress = ProgressGuard("World semantic reviewer")
+    # Capacity follows the actual review inventory, still bounded by the run's
+    # shared call/time/budget guard. Large worlds need more than a fixed 256 actions.
+    step_limit = min(2400, max(MAX_STEPS, len(window.nodes) * 3))
+    for number in range(step_limit):
+        if (number == compatibility_resume_length and compatibility_resume_length
+                and feedback is not None):
+            # The old implementation stopped after its fourth invalid action.
+            # Keep the precise feedback and accumulated state, but give the fixed
+            # parser a fresh bounded recovery allowance.
+            failures = 0
         working = _scoped_review_state(state)
         if feedback is not None:
             working["action_error"] = feedback
+        # Historical checkpoint prompts must replay byte-for-byte. Add the
+        # stronger finish hint only after the compatibility prefix, when a new
+        # provider action is actually being requested.
+        if window.read == set(window.nodes) and number >= compatibility_resume_length:
+            working["required_next_action"] = (
+                "All original nodes have been read. Output finish now; do not resubmit unchanged opinions.")
         messages = window.messages(system, working)
         window.mark_sent()
         # Inputs and exact action sequence reconstruct every byte offline; the
@@ -763,12 +1016,13 @@ def _scoped_review_session(wp, ws, task_input, previous, author_responses, model
         # hundreds of repeated frozen schemas in the published world receipt.
         entry = {"messages_hash": _hash(messages), "call": deepcopy(call), "raw_output": None}
         records.append(entry)
-        if transcript is not None:
-            if number >= len(transcript):
+        replay = transcript if transcript is not None else resume
+        if transcript is not None or number < len(resume):
+            if number >= len(replay):
                 raise ValueError("Incomplete scoped review transcript")
-            saved = transcript[number]
+            saved = replay[number]
             if saved.get("messages_hash") != _hash(messages) or saved.get("call") != call:
-                raise ValueError("Scoped review exact-read messages or call changed")
+                raise ValueError(f"Scoped review exact-read messages or call changed at entry {number}")
             raw = deepcopy(saved.get("raw_output"))
         else:
             try:
@@ -778,15 +1032,42 @@ def _scoped_review_session(wp, ws, task_input, previous, author_responses, model
                 raise
         entry["raw_output"] = deepcopy(raw)
         if isinstance(raw, dict) and "__error__" in raw:
+            records.pop()  # Failed calls stay in provider traces, never in resumable opinions.
             raise RuntimeError("Original reviewer execution failed: " + str(raw["__error__"]))
+        if save is not None:
+            save(records)
         prior = deepcopy(state)
         try:
-            result = _review_action(raw, window, state, payload)
+            legacy_entry = number < legacy_resume_prefix
+            strict_echo_entry = legacy_resume_prefix <= number < compatibility_resume_length
+            result, advance = _review_action(raw, window, state, payload,
+                allow_revision=feedback is not None, revision_reason=feedback,
+                legacy=legacy_entry, strict_state_echo=strict_echo_entry)
+            progress.observe((window.progress_marker(), _hash(_scoped_review_state(state))))
+            if advance:
+                window.visible = {}
+                window.messages(system, _scoped_review_state(state))
+                window.deliver_next_unread()
         except (ValueError, KeyError, TypeError) as exc:
             state = prior
             feedback, failures = str(exc), failures + 1
-            if failures >= 4:
-                raise ValueError("Four consecutive invalid world review actions: " + feedback) from exc
+            if "Witnessed mechanism must cite" in feedback:
+                feedback += (". Use action=submit with the same mechanism_id and refs copied exactly "
+                             "from a world node already shown in exact_reads; use unresolved or "
+                             "not_covered when no such evidence supports witnessed.")
+            elif feedback == "Review submission differs from original opinion schema":
+                feedback += (". Copy the exact row schema from the system instruction; preserve the "
+                             "business opinion and change only missing, extra, or misnamed fields.")
+            elif feedback == "Inspect needs 1 to 12 distinct existing ids":
+                feedback += ". Copy 1 to 12 ids exactly from the current index or unread_ids."
+            recovery_limit = 8 if any(marker in feedback for marker in (
+                "Witnessed mechanism must cite",
+                "Review submission differs from original opinion schema",
+                "Inspect needs 1 to 12 distinct existing ids",
+            )) else 4
+            if failures >= recovery_limit and number >= compatibility_resume_length:
+                raise ValueError(
+                    f"{recovery_limit} consecutive invalid world review actions: " + feedback) from exc
             continue
         feedback, failures = None, 0
         if result is not None:
@@ -794,6 +1075,10 @@ def _scoped_review_session(wp, ws, task_input, previous, author_responses, model
                 raise ValueError("Extra scoped review transcript entries")
             binding.update(protocol="agentic-exact-read/v1", protocol_hash=_hash(system),
                            transcript_hash=_hash(records), call_hash=_hash(call))
+            if legacy_resume_prefix:
+                binding["legacy_resume_prefix"] = legacy_resume_prefix
+            if compatibility_resume_length:
+                binding["compatibility_resume_length"] = compatibility_resume_length
             return payload, binding, call, records, result
     raise ValueError("World review exhausted bounded agent steps")
 
@@ -804,8 +1089,81 @@ def _review_agentic(wp, ws, tracer, task_input, previous, author_responses):
               "physical_requests": None, "physical_request_count_source": "original provider trace only", "transcript": []}
     try:
         import config
-        payload, binding, call, transcript, raw = _scoped_review_session(
-            wp, ws, task_input, previous, author_responses, config.REVIEWER_MODEL, tracer=tracer, records=report["transcript"])
+        from pathlib import Path
+        from pipeline.run import _atomic_write_json
+        resume, checkpoint, legacy_resume_prefix, compatibility_resume_length, migrated_from = [], None, 0, 0, None
+        identity = _hash({"wp": wp, "world": ws.to_dict(), "input": task_input, "previous": previous,
+            "author_responses": author_responses, "model": config.REVIEWER_MODEL,
+            "implementation": Path(__file__).read_text(encoding="utf-8")})
+        if isinstance(getattr(tracer, "pfile", None), Path):
+            checkpoint = tracer.pfile.parent / ("02_world_review_" + identity[:20] + ".ckpt.json")
+            if checkpoint.exists():
+                stored = json.loads(checkpoint.read_text(encoding="utf-8"))
+                if stored.get("identity") != identity or stored.get("hash") != _hash(stored.get("transcript")):
+                    raise ValueError("World review checkpoint binding changed")
+                resume = stored["transcript"]
+                legacy_resume_prefix = stored.get("legacy_resume_prefix", 0)
+                compatibility_resume_length = stored.get("compatibility_resume_length", 0)
+            else:
+                # A parser-only repair changes the implementation identity.  A
+                # copied recovery run may still contain the exact old provider
+                # transcript.  Select the uniquely longest valid transcript;
+                # message hashes are replayed before any new provider call, so
+                # unrelated or stale inputs fail closed.
+                candidates = []
+                for old_path in checkpoint.parent.glob("02_world_review_*.ckpt.json"):
+                    try:
+                        old = json.loads(old_path.read_text(encoding="utf-8"))
+                        rows = old.get("transcript")
+                        if (isinstance(rows, list) and rows
+                                and old.get("hash") == _hash(rows)):
+                            candidates.append((len(rows), old_path.name, old))
+                    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+                        continue
+                candidates.sort(key=lambda item: (-item[0], item[1]))
+                if candidates and (len(candidates) == 1 or candidates[0][0] > candidates[1][0]):
+                    _, migrated_from, stored = candidates[0]
+                    resume = stored["transcript"]
+                    legacy_resume_prefix = stored.get("legacy_resume_prefix", len(resume))
+                    compatibility_resume_length = len(resume)
+        def save(records):
+            if checkpoint:
+                body = {"identity": identity, "transcript": records, "hash": _hash(records)}
+                if legacy_resume_prefix:
+                    body.update(legacy_resume_prefix=legacy_resume_prefix,
+                                migrated_from_checkpoint=migrated_from)
+                if compatibility_resume_length:
+                    body["compatibility_resume_length"] = compatibility_resume_length
+                _atomic_write_json(checkpoint, body)
+        try:
+            payload, binding, call, transcript, raw = _scoped_review_session(
+                wp, ws, task_input, previous, author_responses, config.REVIEWER_MODEL, tracer=tracer,
+                records=report["transcript"], resume=resume, save=save,
+                legacy_resume_prefix=legacy_resume_prefix,
+                compatibility_resume_length=compatibility_resume_length)
+        except ValueError as exc:
+            # A parser-only upgrade may reproduce an old transcript exactly up
+            # to one action and then intentionally change the next prompt/state
+            # transition. Keep the maximal byte-identical prefix and ask the
+            # reviewer to continue from there. No provider call occurs before
+            # this mismatch, and discarded suffix responses remain preserved in
+            # the immutable source checkpoint.
+            mismatch = re.fullmatch(
+                r"Scoped review exact-read messages or call changed at entry (\d+)", str(exc))
+            if migrated_from is None or mismatch is None:
+                raise
+            prefix = int(mismatch.group(1))
+            if not 0 < prefix < len(resume):
+                raise
+            resume = resume[:prefix]
+            legacy_resume_prefix = min(legacy_resume_prefix, prefix)
+            compatibility_resume_length = prefix
+            report["transcript"].clear()
+            payload, binding, call, transcript, raw = _scoped_review_session(
+                wp, ws, task_input, previous, author_responses, config.REVIEWER_MODEL, tracer=tracer,
+                records=report["transcript"], resume=resume, save=save,
+                legacy_resume_prefix=legacy_resume_prefix,
+                compatibility_resume_length=compatibility_resume_length)
         report.update(input_snapshot=payload, binding=binding, call=call, transcript=transcript,
                       raw_output=raw, raw_output_hash=_hash(raw), caller_entered=True, logical_calls=len(transcript))
         report.update(_parse(raw, payload))
@@ -819,9 +1177,17 @@ def _validate_agentic_review(report, wp, ws, task_input):
     try:
         if not isinstance(report, dict) or report.get("version") != VERSION or report.get("strategy") != "agentic":
             raise ValueError("Missing agentic world review receipt")
+        if report.get("status") == "error":
+            error_type = report.get("error_type") or "WorldReviewExecutionError"
+            message = report.get("error") or "World review execution did not produce a final opinion"
+            return [{"code": "world_review_execution_error",
+                     "error_type": str(error_type), "message": str(message)}]
+        legacy_resume_prefix = (report.get("binding") or {}).get("legacy_resume_prefix", 0)
+        compatibility_resume_length = (report.get("binding") or {}).get("compatibility_resume_length", 0)
         payload, binding, call, transcript, raw = _scoped_review_session(wp, ws, task_input,
             report.get("previous"), report.get("author_responses"), report["call"]["params"]["model"],
-            transcript=report["transcript"])
+            transcript=report["transcript"], legacy_resume_prefix=legacy_resume_prefix,
+            compatibility_resume_length=compatibility_resume_length)
         if (report.get("input_snapshot") != payload or report.get("binding") != binding
                 or report.get("call") != call or report.get("raw_output") != raw
                 or report.get("raw_output_hash") != _hash(raw) or report.get("logical_calls") != len(transcript)

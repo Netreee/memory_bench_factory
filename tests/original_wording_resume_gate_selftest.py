@@ -182,7 +182,8 @@ class WordingResumeGateTests(unittest.TestCase):
         stages = self.completed_stages(real_questions=True)
         self.run.write(factory.ART["questions"], [self.outdated()])
         corpus_before = (self.run.dir / factory.ART["corpus"]).read_bytes()
-        def rephrase(orders, wp, tracer, log, *, audit):
+        def rephrase(orders, wp, tracer, log, *, audit, checkpoint_path):
+            self.assertEqual(checkpoint_path, self.run.dir / "04_wording.ckpt.json")
             self.assertEqual(orders, [self.question])
             audit.update(original_count=1, returned_qids=[self.question["qid"]], execution_status="completed")
             return [deepcopy(self.question)]

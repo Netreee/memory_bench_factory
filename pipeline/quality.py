@@ -33,7 +33,8 @@ def implementation_fingerprint() -> str:
         "world_state.py", "well_posed.py", "grounding.py", "grounding_review.py",
         "semantic_review.py", "reference_audit.py", "reference_locations.py",
         "question_wording.py", "render.py", "seed_world.py", "seed_pack.py", "seed_v2.py", "seed_run.py",
-        "world_semantics.py", "disclosure.py", "process_proposals.py")]
+        "world_semantics.py", "world_context.py", "disclosure.py", "disclosure_batches.py",
+        "process_proposals.py", "process_batches.py", "paged_read.py", "order_warning.py")]
     paths += sorted((ROOT / "pipeline/lines").glob("*.py"))
     paths += [ROOT / "eval" / name for name in ("judge.py", "grading.py", "semantic_judge.py",
                                                "answer_task_review.py", "provenance.py")]
@@ -50,6 +51,17 @@ def _release_inputs(directory):
     from pipeline import world_semantics
     wp_path = Path(directory) / "01_whitepaper.json"
     names = list(INPUTS)
+    for warning_name in ("02_world_review_warning.json", "02_world_repair_failure.json",
+                         "03_orders_warning.json",
+                         "04_questions_warning.json",
+                         "05_corpus_warning.json",
+                         "05_corpus_candidate.json", "06_production_warning.json"):
+        if (Path(directory) / warning_name).is_file():
+            names.append(warning_name)
+    if (Path(directory) / "03_orders_warning.json").is_file():
+        for evidence_name in ("03_process_proposals.json", "03_orders_warning_resolution.json"):
+            if (Path(directory) / evidence_name).is_file():
+                names.append(evidence_name)
     if wp_path.exists():
         wp = _read(directory, "01_whitepaper.json")
         manifest = _read(directory, "manifest.json") if (Path(directory) / "manifest.json").is_file() else {}
@@ -193,6 +205,42 @@ def evaluate_release(directory) -> dict:
             issues.append({"code": "unverified_source_derivation"})
         report["delivery_contract"] = _delivery_contract(directory)
         ws = WorldState.from_dict(_read(directory, "02_world.json"))
+        order_resolution = None
+        if (directory / "03_orders_warning.json").is_file():
+            from pipeline import order_warning
+            order_errors = []
+            try:
+                warning = _read(directory, order_warning.WARNING_ARTIFACT)
+                proposal = _read(directory, order_warning.PROPOSAL_ARTIFACT)
+                order_resolution = _read(directory, order_warning.RESOLUTION_ARTIFACT)
+                order_errors = order_warning.validate_resolution(
+                    order_resolution, wp, ws.to_dict(), _read(directory, "04_questions.json"),
+                    warning, proposal)
+            except (ValueError, OSError, TypeError, KeyError, AttributeError) as exc:
+                order_errors = [{"code": "invalid_order_warning_resolution",
+                                 "message": f"{type(exc).__name__}: {exc}"}]
+            checks["order_warning_scope"] = {
+                "status": "passed" if not order_errors else "failed",
+                "issues": order_errors,
+                "affected_lines": (order_resolution or {}).get("affected_lines", []),
+                "excluded_qids": (order_resolution or {}).get("excluded_qids", []),
+            }
+            if order_errors:
+                issues.append({"code": "order_generation_warning",
+                               "artifact": "03_orders_warning.json", "details": order_errors})
+            else:
+                warnings.append({"code": "order_warning_scoped_exclusion",
+                                 "lines": order_resolution["affected_lines"],
+                                 "excluded_questions": len(order_resolution["excluded_qids"])})
+        if (directory / "04_questions_warning.json").is_file():
+            issues.append({"code": "question_generation_warning",
+                           "artifact": "04_questions_warning.json"})
+        if (directory / "05_corpus_warning.json").is_file():
+            issues.append({"code": "corpus_generation_warning",
+                           "artifact": "05_corpus_warning.json"})
+        if (directory / "06_production_warning.json").is_file():
+            issues.append({"code": "production_execution_warning",
+                           "artifact": "06_production_warning.json"})
         from pipeline import world_semantics
         if world_semantics.enabled(wp, manifest.get("config", {})):
             world_review = _read(directory, world_semantics.REVIEW_ARTIFACT)
@@ -299,6 +347,9 @@ def evaluate_release(directory) -> dict:
                 warnings.append({"code": "parsed_format_failures_isolated_as_pending",
                                  "items": delivery["parsed_format_failures"]})
             expected_final, semantic_check = selection(candidates, review)
+            if order_resolution is not None and not (checks.get("order_warning_scope") or {}).get("issues"):
+                from pipeline import order_warning
+                expected_final, _ = order_warning.apply_resolution(expected_final, semantic_check, order_resolution)
             derivation = manifest.get("derived_from") or {}
             if derivation.get("operation") == "filter_all_selected_systems_correct":
                 inherited = derivation.get("semantic_review") or {}
@@ -342,15 +393,29 @@ def evaluate_release(directory) -> dict:
         targets = report["delivery_contract"]
         floors = targets.get("per_line_min", {})
         missing = {line: floor - counts[line] for line, floor in floors.items() if counts[line] < floor}
-        if len(questions) < targets.get("min_questions", 0) or missing:
-            issues.append({"code": "delivery_target_unmet", "per_line_missing": missing})
+        min_questions = targets.get("min_questions", 0)
+        shortfall = max(0, min_questions - len(questions))
+        if shortfall or missing:
+            # Delivery targets describe planned yield.  Semantic review is allowed to
+            # remove bad questions, so a smaller sound subset remains releasable.
+            # Keep the shortfall visible for capacity planning without turning it
+            # into a quality failure for the surviving questions.
+            warnings.append({
+                "code": "delivery_target_unmet",
+                "effect": "planning_shortfall_only",
+                "actual_questions": len(questions),
+                "min_questions": min_questions,
+                "shortfall": shortfall,
+                "per_line_missing": missing,
+            })
         active = [item.get("line") for item in wp.get("active_lines", []) if item.get("weight", 0) > 0]
         zero = [line for line in active if not counts[line]]
         if zero:
             warnings.append({"code": "planned_line_without_final_questions", "lines": zero})
         checks["coverage"] = {"final_count": len(questions), "by_line": dict(counts),
                               "planned_lines": active, "zero_output_lines": zero,
-                              "required_floors": floors}
+                              "required_floors": floors,
+                              "delivery_target_met": not shortfall and not missing}
     except Exception as exc:
         issues.append({"code": "release_evaluation_error", "message": f"{type(exc).__name__}: {exc}"[:500]})
     report.update(status="failed" if issues else "passed", eligible=not issues)
@@ -383,6 +448,8 @@ def quality_snapshot(run_dir) -> dict:
         from pipeline.world_semantics import REVIEW_ARTIFACT as WORLD_REVIEW_ARTIFACT
         if WORLD_REVIEW_ARTIFACT in _release_inputs(directory):
             required_checks.add("world_semantics")
+        if "03_orders_warning.json" in _release_inputs(directory):
+            required_checks.add("order_warning_scope")
         from pipeline.seed_run import GENERATION_ARTIFACT
         if GENERATION_ARTIFACT in _release_inputs(directory):
             required_checks.add("seed_input_identity")

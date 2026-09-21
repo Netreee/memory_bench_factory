@@ -111,7 +111,7 @@ class WorldSemanticsTests(unittest.TestCase):
         self.assertEqual(len(tracer.calls), 1)
         self.assertEqual(tracer.calls[0]["step"], "world.semantic_review")
         self.assertEqual(tracer.calls[0]["params"], {"model": "gpt-5.4-mini", "temperature": 0,
-                                                   "max_tokens": 16384, "retries": 1, "strict_json": True,
+                                                   "max_tokens": 16384, "retries": 3, "strict_json": True,
                                                    "response_format": {"type": "json_object"}})
         payload = json.loads(tracer.calls[0]["messages"][-1]["content"])
         self.assertEqual(payload["world"]["entities"], self.ws.to_dict()["entities"])
@@ -358,7 +358,7 @@ class WorldSemanticsTests(unittest.TestCase):
             if mode == "step": result["call"]["step"] = "another.step"
             elif mode == "model": result["call"]["params"]["model"] = "another-model"
             elif mode == "tokens": result["call"]["params"]["max_tokens"] = 128
-            elif mode == "retries": result["call"]["params"]["retries"] = 3
+            elif mode == "retries": result["call"]["params"]["retries"] = 5
             elif mode == "json": result["call"]["params"]["strict_json"] = False
             elif mode == "version": result["version"] = "old"
             elif mode == "physical": result["physical_requests"] = 1

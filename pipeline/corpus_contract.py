@@ -69,7 +69,8 @@ def public_stage_rules(ws) -> list[dict]:
     return rules
 
 
-def authoritative_source_assertions(ws, session: int, fact_keys=None) -> list[dict]:
+def authoritative_source_assertions(ws, session: int, fact_keys=None, *,
+                                    disclosure_validated=False) -> list[dict]:
     """Project existing L5 source declarations; never infer them from gold/text.
 
     ``fact_keys`` limits the projection to a signal group's (entity, field)
@@ -79,7 +80,8 @@ def authoritative_source_assertions(ws, session: int, fact_keys=None) -> list[di
     keys = None if fact_keys is None else set(fact_keys)
     if getattr(ws, "disclosure", None):
         from pipeline.disclosure import source_assertions
-        return [item for item in source_assertions(ws, session)
+        return [item for item in source_assertions(
+                    ws, session, validated=disclosure_validated)
                 if keys is None or (item["entity"], item["field"]) in keys]
     assertions = {}
     for conflict in getattr(ws, "conflicts", None) or []:
@@ -101,7 +103,8 @@ def authoritative_source_assertions(ws, session: int, fact_keys=None) -> list[di
     return [assertions[key] for key in sorted(assertions)]
 
 
-def canonical_context(ws, session: int, entities=None) -> dict:
+def canonical_context(ws, session: int, entities=None, *,
+                      disclosure_validated=False) -> dict:
     """Share observed history and bound author guidance, never hidden values.
 
     V2 business interpretation is a separate author/reviewer input. It is never
@@ -109,16 +112,18 @@ def canonical_context(ws, session: int, entities=None) -> dict:
     """
     if getattr(ws, "disclosure", None):
         from pipeline.disclosure import context
-        result = context(ws, session, entities=entities)
+        result = context(ws, session, entities=entities,
+                         validated=disclosure_validated)
         # Source obligations are selected per signal group, as on the legacy
         # path. A rule-only review must not certify unrelated source statements.
         result["source_assertions"] = []
         paper = ((ws.disclosure.get("source_inputs") or {}).get("whitepaper") or {})
         if (paper.get("seed_contract") or {}).get("schema_version") == 2:
             from pipeline.disclosure import validate_plan
-            issues = validate_plan(ws)
-            if issues:
-                raise ValueError("Invalid frozen seed/disclosure binding: " + str(issues[0]))
+            if not disclosure_validated:
+                issues = validate_plan(ws)
+                if issues:
+                    raise ValueError("Invalid frozen seed/disclosure binding: " + str(issues[0]))
             from pipeline.seed_world import seed_business_context
             result["business_interpretation"] = {
                 "scope": "private_author_and_fidelity_reviewer_guidance",
@@ -223,15 +228,16 @@ def explicit_future_claims(ws, session: int, content: str) -> list[dict]:
     return issues
 
 
-def fidelity_requirements(ws, session: int, *, facts=None, events=None) -> list[dict]:
+def fidelity_requirements(ws, session: int, *, facts=None, events=None,
+                          disclosure_validated=False) -> list[dict]:
     """Project this publication period's obligations, retaining truth versions."""
     from pipeline.world_state import EXPIRE, DELETE
     canonical_facts = []
     projected = bool(getattr(ws, "disclosure", None))
     if projected:
         from pipeline.disclosure import session_facts, session_events
-        canonical_facts = session_facts(ws, session)
-        event_candidates = session_events(ws, session)
+        canonical_facts = session_facts(ws, session, validated=disclosure_validated)
+        event_candidates = session_events(ws, session, validated=disclosure_validated)
     else:
         for name, fields in ws.entities.items():
             for field, timeline in fields.items():
@@ -267,10 +273,14 @@ def _fidelity_key(requirement: dict) -> str:
     return fingerprint({"kind": requirement["kind"], "target": requirement["target"]})
 
 
-def _validate_fidelity_requirements(ws, session, requirements):
+def _validate_fidelity_requirements(ws, session, requirements, *,
+                                    disclosure_validated=False,
+                                    canonical_keys=None):
     if not isinstance(requirements, list):
         raise ValueError("Fidelity requirements must be a list")
-    canonical = {_fidelity_key(item) for item in fidelity_requirements(ws, session)}
+    canonical = (canonical_keys if canonical_keys is not None else
+                 {_fidelity_key(item) for item in fidelity_requirements(
+                     ws, session, disclosure_validated=disclosure_validated)})
     keys = []
     for index, item in enumerate(requirements):
         if (not isinstance(item, dict) or set(item) != {"requirement_id", "kind", "target"}
@@ -573,7 +583,7 @@ def _review_attempt_payload(payload, previous=None):
 def _request_hash(payload):
     return fingerprint({"system": _review_attempt_system(payload), "payload": payload, "step": "corpus.review",
                         "parameters": {"temperature": 0.0, "max_tokens": REVIEW_MAX_TOKENS,
-                                       "retries": 1, "strict_json": True,
+                                       "retries": 3, "strict_json": True,
                                        "response_format": {"type": "json_object"}}})
 
 
@@ -631,17 +641,35 @@ def _replay_review_validation(history):
     return outcome, payload
 
 
-def _receipt_validation_matches(receipt, doc):
+def _receipt_validation_matches(receipt, doc, replay_cache=None):
     try:
         history = receipt["review_validation"]
-        if receipt.get("review_validation_hash") != fingerprint(history):
+        history_hash = fingerprint(history)
+        if receipt.get("review_validation_hash") != history_hash:
             return False
-        result, payload = _replay_review_validation(history)
+        # Every document in one reviewed batch carries the same immutable raw
+        # validation history.  Replaying that history once per document made a
+        # large corpus restart quadratic in the size of the saved review data.
+        # Hash every embedded copy (so a changed copy still fails), but cache the
+        # expensive deterministic replay by the verified content hash.
+        replay = replay_cache.get(history_hash) if replay_cache is not None else None
+        if replay is None:
+            result, payload = _replay_review_validation(history)
+            replay = {
+                "result": result,
+                "payload": payload,
+                "documents_hash": fingerprint(payload["documents"]),
+                "context_hash": fingerprint(payload["CANON"]),
+            }
+            if replay_cache is not None:
+                replay_cache[history_hash] = replay
+        else:
+            result, payload = replay["result"], replay["payload"]
         index = receipt["review_document_index"]
         if (type(index) is not int or not 0 <= index < len(payload["documents"])
                 or payload["documents"][index] != {"title": doc.get("title", ""), "content": doc.get("content", "")}
-                or fingerprint(payload["documents"]) != receipt["review_documents_hash"]
-                or fingerprint(payload["CANON"]) != receipt["context_hash"] or result["status"] != "passed"):
+                or replay["documents_hash"] != receipt["review_documents_hash"]
+                or replay["context_hash"] != receipt["context_hash"] or result["status"] != "passed"):
             return False
         fidelity = receipt.get("fidelity", {"requirements": [], "blind_reads": [], "coverage": []})
         if (fidelity["requirements"] != [t for t in payload["requirements"] if t["kind"] not in ("public_rule", "public_source")]
@@ -722,7 +750,7 @@ def review_documents(tracer, ws, session: int, docs: list[dict], *, context=None
                 response = tracer.chat_json(
                     "corpus.review", [{"role": "system", "content": _review_attempt_system(request)},
                                       {"role": "user", "content": json.dumps(request, ensure_ascii=False)}],
-                    temperature=0.0, max_tokens=REVIEW_MAX_TOKENS, retries=1, strict_json=True,
+                    temperature=0.0, max_tokens=REVIEW_MAX_TOKENS, retries=3, strict_json=True,
                     response_format={"type": "json_object"})
                 attempt["raw_output"] = deepcopy(response)
                 if not _parsed_review_opinion(response):
@@ -913,7 +941,8 @@ def _rule_support_binding_matches(receipt: dict, refs: list[str]) -> bool:
     return _support_binding_matches(receipt, refs, "public_rule_support_sets", PUBLIC_RULE_SUPPORT_VERSION)
 
 
-def _fidelity_receipt_matches(ws, session, doc):
+def _fidelity_receipt_matches(ws, session, doc, *, disclosure_validated=False,
+                              validation_cache=None):
     receipt = doc.get("quality_review") or {}
     fidelity = receipt.get("fidelity")
     if fidelity is None:
@@ -922,7 +951,18 @@ def _fidelity_receipt_matches(ws, session, doc):
         if not isinstance(fidelity, dict) or set(fidelity) != {"requirements", "blind_reads", "coverage"}:
             return False
         requirements, rows = fidelity["requirements"], fidelity["coverage"]
-        _validate_fidelity_requirements(ws, session, requirements)
+        fidelity_key = ("fidelity_requirement_keys", session)
+        canonical_keys = (validation_cache.get(fidelity_key)
+                          if validation_cache is not None else None)
+        if canonical_keys is None:
+            canonical_keys = {_fidelity_key(item) for item in fidelity_requirements(
+                ws, session, disclosure_validated=disclosure_validated)}
+            if validation_cache is not None:
+                validation_cache[fidelity_key] = canonical_keys
+        _validate_fidelity_requirements(
+            ws, session, requirements,
+            disclosure_validated=disclosure_validated,
+            canonical_keys=canonical_keys)
         _validate_blind_reads(fidelity["blind_reads"], requirements)
         refs = sorted(_fidelity_key(item) for item in requirements)
         if (not refs or receipt.get("fidelity_refs") != refs
@@ -953,9 +993,11 @@ def _fidelity_receipt_matches(ws, session, doc):
         return False
 
 
-def _review_receipt_matches(ws, session: int, doc: dict, context_hash=None) -> bool:
+def _review_receipt_matches(ws, session: int, doc: dict, context_hash=None,
+                            *, disclosure_validated: bool = False,
+                            replay_cache=None, validation_cache=None) -> bool:
     """Check receipt binding, not the truth of the model's semantic judgment."""
-    if getattr(ws, "disclosure", None):
+    if getattr(ws, "disclosure", None) and not disclosure_validated:
         from pipeline.disclosure import validate_plan
         if validate_plan(ws):
             return False
@@ -968,17 +1010,43 @@ def _review_receipt_matches(ws, session: int, doc: dict, context_hash=None) -> b
             or any(not isinstance(ref, str) for ref in source_refs)
             or any(not isinstance(item.get("assertion_id"), str) for item in sources)):
         return False
-    expected_sources = ({item["assertion_id"]: item
-                         for item in authoritative_source_assertions(ws, session)} if sources else {})
+    source_key = ("source_assertions", session)
+    expected_sources = (validation_cache.get(source_key)
+                        if validation_cache is not None else None)
+    if expected_sources is None and sources:
+        expected_sources = {item["assertion_id"]: item
+                            for item in authoritative_source_assertions(
+                                ws, session,
+                                disclosure_validated=disclosure_validated)}
+        if validation_cache is not None:
+            validation_cache[source_key] = expected_sources
+    expected_sources = expected_sources or {}
     if (source_refs != sorted(item["assertion_id"] for item in sources)
             or any(expected_sources.get(item["assertion_id"]) != item for item in sources)):
         return False
     if sources:
-        context = canonical_context(ws, session)
-        context["source_assertions"] = deepcopy(sources)
-        expected_context_hash = fingerprint(context)
+        # Different signal groups in the same period can review different
+        # authoritative-source subsets, so the public context binding includes
+        # the exact subset rather than only the period number.
+        context_key = ("source_context_hash", session, fingerprint(sources))
+        expected_context_hash = (validation_cache.get(context_key)
+                                 if validation_cache is not None else None)
+        if expected_context_hash is None:
+            context = canonical_context(
+                ws, session, disclosure_validated=disclosure_validated)
+            context["source_assertions"] = deepcopy(sources)
+            expected_context_hash = fingerprint(context)
+            if validation_cache is not None:
+                validation_cache[context_key] = expected_context_hash
     else:
-        expected_context_hash = context_hash or fingerprint(canonical_context(ws, session))
+        context_key = ("base_context_hash", session)
+        expected_context_hash = context_hash or (
+            validation_cache.get(context_key) if validation_cache is not None else None)
+        if expected_context_hash is None:
+            expected_context_hash = fingerprint(canonical_context(
+                ws, session, disclosure_validated=disclosure_validated))
+            if validation_cache is not None:
+                validation_cache[context_key] = expected_context_hash
     return bool(
         isinstance(refs, list) and all(isinstance(ref, str) for ref in refs)
         and receipt.get("version") == VERSION and receipt.get("status") == "passed"
@@ -994,8 +1062,10 @@ def _review_receipt_matches(ws, session: int, doc: dict, context_hash=None) -> b
         and receipt.get("public_source_refs", []) == source_refs
         and _support_binding_matches(receipt, source_refs, "public_source_support_sets",
                                      PUBLIC_SOURCE_SUPPORT_VERSION, fingerprint(sources))
-        and _fidelity_receipt_matches(ws, session, doc)
-        and _receipt_validation_matches(receipt, doc))
+        and _fidelity_receipt_matches(
+            ws, session, doc, disclosure_validated=disclosure_validated,
+            validation_cache=validation_cache)
+        and _receipt_validation_matches(receipt, doc, replay_cache=replay_cache))
 
 
 def reviewed_fidelity_provenance(ws, session, doc):
@@ -1044,7 +1114,27 @@ def _complete_support_refs(documents: list[dict], support_key: str) -> set[str]:
     return covered
 
 
-def public_rule_coverage_issues(ws, corpus: dict) -> list[dict]:
+def _cached_receipt_match(cache: dict | None, ws, session: int, doc: dict,
+                          context_hash=None, *, disclosure_validated=False) -> bool:
+    """Reuse an exact receipt check during one corpus validation pass."""
+    if cache is None:
+        return _review_receipt_matches(
+            ws, session, doc, context_hash, disclosure_validated=disclosure_validated)
+    document_cache = cache.setdefault("document_receipts", {})
+    replay_cache = cache.setdefault("review_replays", {})
+    validation_cache = cache.setdefault("validation_inputs", {})
+    key = (session, id(doc))
+    if key not in document_cache:
+        document_cache[key] = _review_receipt_matches(
+            ws, session, doc, context_hash,
+            disclosure_validated=disclosure_validated,
+            replay_cache=replay_cache,
+            validation_cache=validation_cache)
+    return document_cache[key]
+
+
+def public_rule_coverage_issues(ws, corpus: dict, *, receipt_cache=None,
+                                disclosure_validated=False) -> list[dict]:
     """Require reviewed public material for typed stage declarations.
 
     References identify source declarations. Coverage relies on the saved LLM
@@ -1062,10 +1152,11 @@ def public_rule_coverage_issues(ws, corpus: dict) -> list[dict]:
                 continue
             valid = (isinstance(refs, list) and all(isinstance(ref, str) for ref in refs)
                      and len(refs) == len(set(refs)) and set(refs) <= expected
-                     and sid == 0 and session.get("date") == canonical_context(ws, 0)["document_date"]
+                     and sid == 0 and session.get("date") == ws.date_of_session(0)
                      and not any(doc.get(flag) for flag in
                                  ("is_filler", "is_conflict", "is_sensitive", "is_rule_instance"))
-                     and _review_receipt_matches(ws, sid, doc))
+                     and _cached_receipt_match(receipt_cache, ws, sid, doc,
+                                               disclosure_validated=disclosure_validated))
             if valid:
                 valid_documents.append(doc)
             else:
@@ -1078,14 +1169,16 @@ def public_rule_coverage_issues(ws, corpus: dict) -> list[dict]:
     return issues
 
 
-def public_source_coverage_issues(ws, corpus: dict) -> list[dict]:
+def public_source_coverage_issues(ws, corpus: dict, *, receipt_cache=None,
+                                  disclosure_validated=False) -> list[dict]:
     """Validate complete saved LLM groups for every frozen L5 source assertion.
 
     This is an input/receipt check, not a keyword-based semantic source judge.
     Used by the semantic corpus path only; legacy rendering is unchanged.
     """
     expected = {item["assertion_id"]: item for session in ws.sessions()
-                for item in authoritative_source_assertions(ws, session)}
+                for item in authoritative_source_assertions(
+                    ws, session, disclosure_validated=disclosure_validated)}
     issues, valid_documents = [], []
     for session in corpus.get("corpus", corpus).get("sessions", []):
         sid = session.get("session_id")
@@ -1096,10 +1189,11 @@ def public_source_coverage_issues(ws, corpus: dict) -> list[dict]:
             valid = (isinstance(refs, list) and all(isinstance(ref, str) for ref in refs)
                      and len(refs) == len(set(refs)) and set(refs) <= set(expected)
                      and all(expected[ref]["session"] == sid for ref in refs)
-                     and session.get("date") == canonical_context(ws, sid)["document_date"]
+                     and session.get("date") == ws.date_of_session(sid)
                      and not any(doc.get(flag) for flag in
                                  ("is_filler", "is_conflict", "is_sensitive", "is_rule_instance"))
-                     and _review_receipt_matches(ws, sid, doc))
+                     and _cached_receipt_match(receipt_cache, ws, sid, doc,
+                                               disclosure_validated=disclosure_validated))
             if valid:
                 valid_documents.append(doc)
             else:
@@ -1111,7 +1205,8 @@ def public_source_coverage_issues(ws, corpus: dict) -> list[dict]:
     return issues
 
 
-def fidelity_coverage_issues(ws, corpus: dict) -> list[dict]:
+def fidelity_coverage_issues(ws, corpus: dict, *, receipt_cache=None,
+                             disclosure_validated=False) -> list[dict]:
     """Require complete saved groups for original same-session obligations."""
     # Identical value assertions across periods are different obligations.
     covered, issues = set(), []
@@ -1125,14 +1220,16 @@ def fidelity_coverage_issues(ws, corpus: dict) -> list[dict]:
             if not receipt.get("fidelity_refs"):
                 continue
             if (any(doc.get(flag) for flag in ("is_filler", "is_conflict", "is_sensitive", "is_rule_instance"))
-                    or not _review_receipt_matches(ws, sid, doc)
-                    or ("date" in session and session["date"] != canonical_context(ws, sid)["document_date"])):
+                    or not _cached_receipt_match(receipt_cache, ws, sid, doc,
+                                                 disclosure_validated=disclosure_validated)
+                    or ("date" in session and session["date"] != ws.date_of_session(sid))):
                 issues.append({"code": "invalid_fidelity_material", "doc_id": doc.get("doc_id")})
             else:
                 valid.append(doc)
         covered.update((sid, ref) for ref in _complete_support_refs(valid, "fidelity_support_sets"))
     for session in ws.sessions():
-        for item in fidelity_requirements(ws, session):
+        for item in fidelity_requirements(
+                ws, session, disclosure_validated=disclosure_validated):
             if (session, _fidelity_key(item)) not in covered:
                 issues.append({"code": "missing_fidelity_material", "session": session,
                                "kind": item["kind"], "target": deepcopy(item["target"])})
@@ -1140,6 +1237,7 @@ def fidelity_coverage_issues(ws, corpus: dict) -> list[dict]:
 
 
 def validate_corpus(ws, corpus: dict) -> dict:
+    disclosure_validated = False
     if getattr(ws, "disclosure", None):
         from pipeline.disclosure import validate_plan
         plan_issues = validate_plan(ws)
@@ -1149,21 +1247,32 @@ def validate_corpus(ws, corpus: dict) -> dict:
                     "diagnostics": {}, "reviewed_signal_documents": 0,
                     "scope": ["public_disclosure_binding"],
                     "limitations": ["A valid plan is not a proof of its semantic quality."]}
+        disclosure_validated = True
     sessions = corpus.get("corpus", corpus).get("sessions", [])
-    issues = (public_rule_coverage_issues(ws, corpus) + public_source_coverage_issues(ws, corpus)
-              + fidelity_coverage_issues(ws, corpus))
+    receipt_cache = {}
+    issues = (public_rule_coverage_issues(
+                  ws, corpus, receipt_cache=receipt_cache,
+                  disclosure_validated=disclosure_validated)
+              + public_source_coverage_issues(
+                  ws, corpus, receipt_cache=receipt_cache,
+                  disclosure_validated=disclosure_validated)
+              + fidelity_coverage_issues(
+                  ws, corpus, receipt_cache=receipt_cache,
+                  disclosure_validated=disclosure_validated))
     diagnostics, seen, count = [], set(), 0
     for session in sessions:
         sid = session.get("session_id")
         if type(sid) is not int or not 0 <= sid < ws.n_sessions:
             issues.append({"code": "invalid_session", "session": sid})
             continue
-        context_hash = fingerprint(canonical_context(ws, sid))
+        context_hash = fingerprint(canonical_context(
+            ws, sid, disclosure_validated=disclosure_validated))
         # These helpers are deterministic renderers, not API calls. Exact
         # template equality prevents a metadata flag from bypassing review.
         from pipeline.render import (_render_conflict_docs, _render_sensitive_docs,
                                      _render_rule_docs, _tracked_blocklist)
-        date_text = canonical_context(ws, sid)["document_date"]
+        date_text = canonical_context(
+            ws, sid, disclosure_validated=disclosure_validated)["document_date"]
         # Legacy corpus objects may omit the session date. When one is supplied,
         # it is public metadata and must describe the same reviewed as-of period.
         if "date" in session and session["date"] != date_text:
@@ -1195,7 +1304,9 @@ def validate_corpus(ws, corpus: dict) -> dict:
             count += 1
             hints = explicit_future_claims(ws, sid, doc.get("content", ""))
             diagnostics.extend({"doc_id": doc_id, **hint} for hint in hints)
-            if not _review_receipt_matches(ws, sid, doc, context_hash):
+            if not _cached_receipt_match(
+                    receipt_cache, ws, sid, doc, context_hash,
+                    disclosure_validated=disclosure_validated):
                 issues.append({"code": "missing_or_stale_document_review", "doc_id": doc_id})
     if {s.get("session_id") for s in sessions} != set(range(ws.n_sessions)):
         issues.append({"code": "incomplete_corpus_sessions"})

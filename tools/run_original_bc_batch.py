@@ -57,6 +57,8 @@ def parser():
     ap.add_argument("--seeds", nargs="+", default=["insurance", "legal", "finance"],
                     help="Repository seed names or JSON paths; relative paths resolve from the repository")
     ap.add_argument("--repeats", type=int, default=1)
+    ap.add_argument("--source-run", type=Path,
+                    help="Single-world production: reuse this stopped run's completed world construction checkpoint")
     quantities = ap.add_mutually_exclusive_group()
     quantities.add_argument("--question-budget", type=int)
     quantities.add_argument("--min-questions", type=int)
@@ -125,6 +127,17 @@ def prepare(args):
     if args.timeout_seconds is not None and (not math.isfinite(args.timeout_seconds) or args.timeout_seconds <= 0):
         raise ValueError("timeout_seconds must be positive and finite")
     count = len(args.seeds) * args.repeats
+    source = getattr(args, "source_run", None)
+    reuse_source = None
+    if source:
+        source = source.resolve()
+        if count != 1 or args.min_questions is None:
+            raise ValueError("World checkpoint reuse requires one seed/world and a quantity target")
+        previous = read(source / "manifest.json")
+        if previous.get("status") == "running" or not previous.get("stages", {}).get("whitepaper", {}).get("done"):
+            raise ValueError("World source must be stopped with completed whitepaper")
+        reuse_source = {"directory": str(source),
+                        "files": {p.name: digest(p) for p in source.glob("*.json")}}
     reserved = Decimal(str(args.max_cny_per_run)) * count
     if reserved > Decimal(str(args.max_total_cny)):
         raise ValueError("Planned run caps exceed max-total-cny before any child is launched")
@@ -143,6 +156,8 @@ def prepare(args):
                       "copy": str(directory / "inputs" / f"seed_{index:03d}.json")})
     if len({s["path"] for s in seeds}) != len(seeds):
         raise ValueError("Duplicate seed paths; use repeats for deliberate repetition")
+    if source and read(source / "00_seed_pack.json").get("seed_id") != seeds[0]["seed_id"]:
+        raise ValueError("Selected seed differs from the source world")
     runs = []
     # Cover every seed once before starting another repetition of any seed.
     for repeat in range(1, args.repeats + 1):
@@ -159,6 +174,9 @@ def prepare(args):
                 "--call-timeout-seconds", str(args.call_timeout_seconds),
                 "--json-attempts", str(args.json_attempts),
                 "--disclosure-format-attempts", str(args.disclosure_format_attempts)]
+            if source:
+                index = command.index("--seed-pack")
+                command[index:index + 2] = ["--source-run", str(source), "--reuse-through", "whitepaper", "--reuse-world-checkpoint"]
             if args.min_questions is None:
                 command += ["--question-budget", str(args.question_budget)]
             else:
@@ -193,6 +211,8 @@ def prepare(args):
             "max_total_cny": args.max_total_cny, "reserved_all_run_caps_cny": float(reserved),
             "budget_basis": "Sum of per-run caps. Each request reserves its maximum; optional valid provider usage settlement releases unused reservation. Estimates are not invoices.",
             "scope": "Original factory generation through quality; no solver/scoring/context experiment or automatic release claim."}
+    if reuse_source:
+        plan["reuse_source"] = reuse_source
     if directory.exists():
         if read(directory / "plan.json") != plan:
             raise ValueError("Prepared settings/inputs/source changed; use a fresh batch")
@@ -223,6 +243,9 @@ def validate(directory):
     for seed in plan["seeds"]:
         if digest(seed["path"]) != seed["sha256"] or digest(seed["copy"]) != seed["sha256"]:
             raise ValueError("Frozen seed changed: " + seed["seed_id"])
+    for name, expected in plan.get("reuse_source", {}).get("files", {}).items():
+        if digest(Path(plan["reuse_source"]["directory"]) / name) != expected:
+            raise ValueError("World source artifact changed: " + name)
     return plan
 
 

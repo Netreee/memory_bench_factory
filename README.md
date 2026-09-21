@@ -27,6 +27,35 @@ cp .env.example .env    # 填 OPENAI_API_KEY / OPENAI_BASE_URL / MODEL / LLM_CON
 
 `--help` 看全部参数,`--list-runs` 看历史。产物落在 `output/runs/<run_id>/`(逐 stage 落盘,`output/` 不进 git)。
 
+## 真实任务种子 → 白皮书
+
+现有 `input → whitepaper` 支持策展种子 JSON。种子的实体、字段、关系、事件、业务对象绑定和因果要求先通过机械审查，再冻结世界蓝图和映射能力；后续世界实例化、扩量、续跑继续校验同一合同。
+
+```bash
+# 离线检查三个种子；不读取 .env、不调用模型
+python tools/validate_seed_packs.py
+# 本地持有原件时可同时验证来源散列
+python tools/validate_seed_packs.py --verify-sources
+
+# 调用已配置的模型，先审阅白皮书
+python -m pipeline.factory --seed-pack seeds/insurance.json --to whitepaper
+# 也可替换成 seeds/legal.json 或 seeds/finance.json
+# 继续同一 run，无需再次提供原种子路径
+python -m pipeline.factory --run <run_id> --from world
+```
+
+`--seed-pack` 与 `--scenario` 二选一。每个 run 将种子冻结为 `00_seed_pack.json`，记录来源身份并输出 `01_seed_audit.json`、`02_seed_audit.json`；已有 run 不允许换种子版本，更新包后应启动新 run。白皮书的 `seed_contract` 排除评分侧来源，结构丢失或世界实例不符合合同会明确失败。
+
+当前实现保证种子的**可执行结构承接**；新增公式执行器、资料发布/获知的多时间语义和知识状态评分尚未实现。原任务与合成示例的边界、合同格式和三包来源见 [seeds/README.md](seeds/README.md)。
+
+种子融合程度的分层指标、保险场景实测结果，以及后续对照实验方案见 [真实任务 Seed 的融合程度与评估方法](SEED_INTEGRATION_EVALUATION.md)。本轮结构与流程检查通过，业务机制题覆盖和数据质量尚未通过验收。
+
+```bash
+python tests/seed_contract_selftest.py
+python tests/seed_world_selftest.py
+python tests/seed_run_selftest.py
+```
+
 ## World-first 白皮书
 
 新场景先由领域架构师定义并经反方换皮评审冻结 `world_blueprint`：实体类型与字段归属、关系拓扑、领域事件及效果、因果链、时间制度、证据渠道。之后才把 L1–L10 映射到世界自然存在的结构；能力线在 typed world 中只读，不得补字段或改写时间线。显式蓝图不合法会在白皮书阶段直接失败，历史无蓝图产物才使用 legacy 适配。

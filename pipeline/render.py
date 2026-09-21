@@ -137,14 +137,21 @@ def _corpus_system(profile, blueprint=None, style_spec=None, *, semantic=False) 
                   style_spec=style_text)
 
 
-def _filler_system(profile, blueprint=None) -> str:
+def _filler_system(profile, blueprint=None, corpus_plan=None) -> str:
     """构造同领域、同世界但不承载真值的 filler 提示词。
 
     输入来自已经冻结的领域画像与世界蓝图；输出只影响草堆文档的风格，
     不允许 filler 接触被追踪实体或字段，因此不会改变 benchmark gold。
     """
     noun = profile.get("entity_noun", "实体")
-    genres = "/".join(profile.get("doc_genres", ["通知", "纪要", "公告"]))
+    corpus_plan = corpus_plan if isinstance(corpus_plan, dict) else {}
+    planned_genres = corpus_plan.get("filler_genres")
+    planned_genres = planned_genres if isinstance(planned_genres, list) else []
+    genres = "/".join(list(dict.fromkeys(
+        [item for item in planned_genres + profile.get("doc_genres", ["通知", "纪要", "公告"])
+         if isinstance(item, str) and item.strip()])))
+    topics = corpus_plan.get("filler_topics")
+    topics = topics if isinstance(topics, list) else []
     blueprint = blueprint or {}
     context = {
         "entity_types": [
@@ -159,7 +166,19 @@ def _filler_system(profile, blueprint=None) -> str:
         "evidence_channels": list(blueprint.get("evidence_channels", [])),
     }
     return render("filler.system", noun=noun, genres=genres,
+                  filler_topics=json.dumps(topics, ensure_ascii=False),
                   world_context=json.dumps(context, ensure_ascii=False))
+
+
+def _filler_documents_per_session(wp, target_tokens: int, n_sessions: int) -> int:
+    """Keep the historical token floor and add a bounded whitepaper floor."""
+    if target_tokens <= 0:
+        return 0
+    token_floor = max(1, ceil(target_tokens / max(1, n_sessions) / 800))
+    plan = wp.get("corpus_plan") if isinstance(wp, dict) else None
+    requested = plan.get("filler_documents_per_session") if isinstance(plan, dict) else None
+    planned_floor = min(12, max(0, requested)) if type(requested) is int else 0
+    return max(token_floor, planned_floor)
 
 
 def _session_facts(ws, s):
@@ -544,6 +563,7 @@ class _CorpusReviewCallGuard:
 
     def __init__(self, tracer):
         self._tracer = tracer
+        self.pfile = getattr(tracer, "pfile", None)
         self._lock = threading.Lock()
         self._failure = None
 
@@ -608,12 +628,11 @@ def render_corpus(wp, ws, target_tokens, tracer, corpus, done_weeks, save_cb, lo
                     "依据各 disclosure_id 的 channel/acquisition_context 安排行文；这些载体说明不改变业务真值。"
                     "可以自然回顾旧事实或对比多个版本，但不得把旧值写成本期新发生的状态变化；"
                     "只使用本组公开目标和 CANON 已公开历史，不能补入其他私有事实。")
-    sys_fil = _filler_system(profile, blueprint)
+    sys_fil = _filler_system(profile, blueprint, wp.get("corpus_plan"))
     blocked = _tracked_blocklist(ws, profile)
     # 估算 filler/周 以达目标 token(~1字≈1token)。周并行后不再 early-stop;filler_per_week 已按目标分摊。
     n_sessions = ws.n_sessions
-    filler_per_week = (max(1, ceil(target_tokens / max(1, n_sessions) / 800))
-                       if target_tokens > 0 else 0)  # 每篇约800字；小样本不强制每期8篇草堆
+    filler_per_week = _filler_documents_per_session(wp, target_tokens, n_sessions)
     by_id = {x["session_id"]: x for x in corpus["sessions"]}
     delta_mode = only_entities is not None or only_entity_sessions is not None
     only_entities = set(only_entities or [])
@@ -875,7 +894,7 @@ def render_corpus(wp, ws, target_tokens, tracer, corpus, done_weeks, save_cb, lo
             out = tracer.chat_text("render.filler",
                 [{"role": "system", "content": sys_fil},
                  {"role": "user", "content": render("filler.user", s=week_label(s), time_unit=time_unit,
-                                                      date=date)}],
+                                                      date=date, slot=_ci + 1)}],
                 temperature=0.9, max_tokens=FILLER_TEXT_MAX_TOKENS)
             try:
                 return _accept_filler_text(out, blocked)
@@ -885,7 +904,32 @@ def render_corpus(wp, ws, target_tokens, tracer, corpus, done_weeks, save_cb, lo
                 filler_failures.append(str(error))
                 return []
 
-        sig_lists = config.pmap(_render_sig, sig_groups, workers=8)              # 周内并发(全局信号量才是真上限)
+        def render_signal_with_checkpoint(group):
+            from pathlib import Path
+            from pipeline.semantic_review import fingerprint
+            from pipeline.run import _atomic_write_json
+            from pipeline import corpus_contract
+            pfile = getattr(tracer, "pfile", None)
+            cache_path = None
+            if isinstance(pfile, Path):
+                key = fingerprint({"wp": wp, "world": ws.to_dict(), "session": s, "group": group,
+                    "model": config.MODEL, "reviewer": config.REVIEWER_MODEL,
+                    "discriminator": config.DISCRIMINATOR_MODEL,
+                    "render": Path(__file__).read_text(encoding="utf-8"),
+                    "review": Path(corpus_contract.__file__).read_text(encoding="utf-8")})
+                cache_path = pfile.parent / "05_signal_checkpoints" / (key + ".json")
+                if cache_path.exists():
+                    cached = json.loads(cache_path.read_text(encoding="utf-8"))
+                    if cached.get("key") != key or cached.get("hash") != fingerprint(cached.get("documents")):
+                        raise ValueError("Corpus signal checkpoint changed")
+                    return cached["documents"]
+            documents = _render_sig(group)
+            if cache_path:
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                _atomic_write_json(cache_path, {"key": key, "documents": documents, "hash": fingerprint(documents)})
+            return documents
+
+        sig_lists = config.pmap(render_signal_with_checkpoint, sig_groups, workers=4)
         review_guard.check()
         with lock:                                         # 周乱序完成 → 锁内更新+逐周存盘(断点续渲不丢)
             if delta_mode:                                 # ★delta:追加结构变化 signal,接着编号;不灌 filler/conflict
@@ -922,7 +966,7 @@ def render_corpus(wp, ws, target_tokens, tracer, corpus, done_weeks, save_cb, lo
             log(f"  [{time_unit} {week_label(s)} ✓{tag} {len(done_weeks)}/{n_sessions}] 累计 {sum(len(x['docs']) for x in corpus['sessions'])} 篇 / {ch/1e6:.2f}M 字")
         return s
 
-    config.pmap(_render_week, weeks, workers=max(1, len(weeks)))   # ★周并行;在飞 API 由全局 LLM_CONCURRENCY 兜住
+    config.pmap(_render_week, weeks, workers=max(1, min(4, len(weeks))))  # Bound queued week/group memory too.
     review_guard.check()
     if _render_public_stage_material(wp, ws, tracer, corpus):
         save_cb()
@@ -976,13 +1020,38 @@ def render_corpus(wp, ws, target_tokens, tracer, corpus, done_weeks, save_cb, lo
 PHRASE_SYS = render("phrase.system")
 
 
-def phrase_questions(orders, wp, tracer, log=print, *, audit=None) -> list[dict]:
+def phrase_questions(orders, wp, tracer, log=print, *, audit=None, checkpoint_path=None) -> list[dict]:
     from copy import deepcopy
     from pipeline.question_contract import attach_question_contract, validate_question
 
     if audit is not None and not isinstance(audit, dict):
         raise TypeError("Question wording audit must be a dictionary")
     orders = list(orders)
+    # Production uses an item checkpoint. The compatibility path without a
+    # checkpoint retains its historical fail-fast call contract.
+    from pathlib import Path
+    from pipeline.semantic_review import fingerprint
+    from pipeline import question_wording
+    from pipeline.run import _atomic_write_json
+    persistent = checkpoint_path is not None
+    checkpoint = Path(checkpoint_path) if persistent else None
+    saved_items, progress_lock = {}, threading.Lock()
+    execution_binding = fingerprint({"whitepaper": wp, "author": config.MODEL,
+        "reviewer": config.REVIEWER_MODEL, "render": Path(__file__).read_text(encoding="utf-8"),
+        "wording": Path(question_wording.__file__).read_text(encoding="utf-8")})
+    if checkpoint and checkpoint.exists():
+        saved = json.loads(checkpoint.read_text(encoding="utf-8"))
+        if saved.get("binding") == execution_binding:
+            if saved.get("hash") != fingerprint({k:v for k,v in saved.items() if k != "hash"}):
+                raise ValueError("Question progress checkpoint changed")
+            saved_items = saved["items"]
+    def remember(order, row, result):
+        if checkpoint:
+            with progress_lock:
+                saved_items[fingerprint(order)] = {"row": deepcopy(row), "result": deepcopy(result)}
+                value = {"binding": execution_binding, "items": deepcopy(saved_items)}
+                value["hash"] = fingerprint(value)
+                _atomic_write_json(checkpoint, value)
     report = audit if audit is not None else {}
     report.clear()
     report.update(version="original-question-wording-batch/v2", execution_status="running",
@@ -999,20 +1068,22 @@ def phrase_questions(orders, wp, tracer, log=print, *, audit=None) -> list[dict]
 
     def _phrase_one(o, row):                              # 每条订单独立 → 并发出题
         def call_json(*args, **kwargs):
+            if persistent:
+                kwargs["retries"] = 3
             with failure_lock:
-                if semantic_mode and failures:
+                if semantic_mode and failures and not persistent:
                     raise RuntimeError("Previous question wording execution failed; no new calls")
                 row["calls_admitted"] += 1
             try:
                 output = tracer.chat_json(*args, **kwargs)
             except Exception as exc:
                 with failure_lock:
-                    if semantic_mode and not failures:
+                    if semantic_mode and not failures and not persistent:
                         failures.append(exc)
                 raise
             if semantic_mode and isinstance(output, dict) and "__error__" in output:
                 with failure_lock:
-                    if not failures:
+                    if not failures and not persistent:
                         failures.append(RuntimeError("Question wording provider returned an execution error"))
             return output
 
@@ -1103,20 +1174,31 @@ def phrase_questions(orders, wp, tracer, log=print, *, audit=None) -> list[dict]
     def _ph(indexed):
         index, order = indexed
         row = report["items"][index]
+        previous = deepcopy(saved_items.get(fingerprint(order))) if persistent else None
+        if previous and previous.get("result") is not None:
+            result = previous["result"]
+            if (not result.get("question") or not semantic_mode or not question_wording.validate_wording(result)):
+                row.update(previous["row"], input_index=index, resumed=True, calls_admitted=0)
+                return deepcopy(result)
+        if previous and previous["row"].get("failure"):
+            row["previous_execution_failure"] = previous["row"]["failure"]
         try:
             result = _phrase_one(order, row)
         except Exception as exc:
             with failure_lock:
                 previously_failed = bool(failures)
-                if semantic_mode and not failures:
+                if semantic_mode and not failures and not persistent:
                     failures.append(exc)
             row["status"] = ("not_run_after_execution_failure"
-                             if previously_failed and not row["calls_admitted"] else "execution_error")
+                             if not persistent and previously_failed and not row["calls_admitted"] else "execution_error")
             row["failure"] = {"type": type(exc).__name__, "message": str(exc)}
             if isinstance(getattr(exc, "report", None), dict):
                 row["failed_review"] = deepcopy(exc.report)
                 if row["attempts"] and row["attempts"][-1]["review"] is None:
                     row["attempts"][-1]["review"] = deepcopy(exc.report)
+            remember(order, row, None)
+            if persistent:
+                return {**order, "question": "", "_phrase_fallback": False}
             raise
         row["selected"] = bool(result.get("question", "").strip())
         if row["status"] == "not_started":
@@ -1126,6 +1208,7 @@ def phrase_questions(orders, wp, tracer, log=print, *, audit=None) -> list[dict]
         actual_text = (row["candidate"] or {}).get("question", result.get("question", ""))
         row["candidate"] = {**deepcopy(result), "question": actual_text}
         row["candidate"].pop("_phrase_fallback", None)
+        remember(order, row, result)
         return result
 
     def update_counts():
@@ -1142,9 +1225,13 @@ def phrase_questions(orders, wp, tracer, log=print, *, audit=None) -> list[dict]
     fallback_count = sum(bool(q.pop("_phrase_fallback", False)) for q in raw)
     qs = [q for q in raw if q.get("question", "").strip()]    # 丢并发下偶发的空题面
     dropped = len(raw) - len(qs)
-    report["execution_status"] = "completed"
+    errors = [row for row in report["items"] if row["status"] == "execution_error"]
+    report["execution_status"] = "completed_with_errors" if errors else "completed"
     report["returned_qids"] = [q.get("qid") for q in qs]
     update_counts()
+    if errors and not qs:
+        report["execution_status"] = "failed"
+        raise RuntimeError("No question wording completed; per-item progress retained")
     by_line = {}
     for q in qs:
         by_line[q.get("line", "?")] = by_line.get(q.get("line", "?"), 0) + 1

@@ -107,7 +107,9 @@ class AgentFactoryTests(unittest.TestCase):
              patch.object(factory, "validate_seed_identity"), \
              patch.object(factory, "central_office", return_value=original):
             factory.stage_whitepaper(run)
-        self.assertEqual(run.read("01_whitepaper.json")["world_generation"], {"strategy": "agentic", "version": 1})
+        self.assertEqual(run.read("01_whitepaper.json")["world_generation"],
+                         {"strategy": "agentic", "version": 2, "blueprint_repair_attempts": 1,
+                          "disclosure_strategy": "direct_batches_v1"})
 
     def test_factory_uses_checkpoint_and_preserves_existing_final_gates(self):
         wp = deepcopy(self.wp)
@@ -128,16 +130,16 @@ class AgentFactoryTests(unittest.TestCase):
         self.assertEqual(review_call.call_count, 1)
         self.assertTrue(run.has("02_world.json"))
 
-    def test_failed_final_review_keeps_candidate_unpublished(self):
+    def test_failed_final_review_publishes_candidate_with_warning(self):
         wp = deepcopy(self.wp); wp["quality_contract"] = {"world_semantic_review": True}
         run = LocalRun(self.temp.name, wp)
         with self.generator(), patch.object(factory, "validate_seed_identity"), \
              patch.object(factory, "_prepare_lines"), \
              patch.object(world_semantics, "review_world", return_value={"status": "unresolved", "repair_targets": {}}):
-            with self.assertRaises(WorldBlueprintError):
-                factory.stage_world(run)
-        self.assertFalse(run.has("02_world.json"))
+            factory.stage_world(run)
+        self.assertTrue(run.has("02_world.json"))
         self.assertTrue(run.has("02_world_candidate.json"))
+        self.assertTrue(run.has(world_semantics.WARNING_ARTIFACT))
 
     def full_tracer(self, reject=False):
         from world_agent_selftest import ScriptedTracer, PLAN, WRITE, FINISH, write, table_part
@@ -173,16 +175,40 @@ class AgentFactoryTests(unittest.TestCase):
         self.assertGreater(len(reviewer.calls), 4)
         self.assertEqual(len(list(run.dir.glob("02_world_agent_*.json"))), 1)
 
-    def test_real_final_negative_review_keeps_agent_world_unpublished(self):
+    def test_real_final_negative_review_continues_with_warning(self):
         wp = deepcopy(self.wp)
         wp["quality_contract"] = {"world_semantic_review": True, "public_disclosure": True}
         run = LocalRun(self.temp.name, wp)
         run.tracer, _, _ = self.full_tracer(reject=True)
         with patch.object(factory, "validate_seed_identity"):
-            with self.assertRaises(WorldBlueprintError):
-                factory.stage_world(run)
-        self.assertFalse(run.has("02_world.json"))
+            factory.stage_world(run)
+        self.assertTrue(run.has("02_world.json"))
+        self.assertTrue(run.has(world_semantics.WARNING_ARTIFACT))
         self.assertEqual(run.read("02_world_review_attempts.json")["attempts"][-1]["status"], "unresolved")
+
+    def test_direct_disclosure_runs_through_real_original_world_and_order_gates(self):
+        from disclosure_batches_selftest import DirectFixture
+        wp = deepcopy(self.wp)
+        wp["world_generation"]["disclosure_strategy"] = "direct_batches_v1"
+        wp["active_lines"] = [{"line": "L7_consolidation", "weight": 1}]
+        wp["quality_contract"] = {"world_semantic_review": True, "public_disclosure": True}
+        run = LocalRun(self.temp.name, wp)
+        run.manifest["config"]["question_budget"] = 4
+        original, generator, reviewer = self.full_tracer()
+        direct = DirectFixture()
+        class Combined:
+            def chat_json(inner, step, messages, **params):
+                return (direct if step == disclosure.STEP else original).chat_json(step, messages, **params)
+        run.tracer = Combined()
+        with patch.object(factory, "validate_seed_identity"):
+            factory.stage_world(run)
+            factory.stage_orders(run)
+            factory.stage_well_posed(run)
+        self.assertTrue(run.has("02_world.json"))
+        self.assertEqual(run.read(world_semantics.REVIEW_ARTIFACT)["status"], "passed")
+        self.assertTrue(run.has("03_well_posed_report.json"))
+        self.assertEqual(run.read("02_world.json")["disclosure"]["strategy"], "direct-disclosure/v2")
+        self.assertTrue(list(run.dir.glob("02_disclosure_checkpoint_*.json")))
 
 
 if __name__ == "__main__":

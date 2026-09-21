@@ -170,7 +170,7 @@ $docs
 
     # ── §7 草堆渲染(system;$noun)─────────────────────────────────────────
     "filler.system": """你为记忆评测生成一篇【与目标场景同一领域、同一叙事世界】的背景干扰文档。草堆必须像这个世界自然产生的旁支记录,不能突然切换成另一个行业或时代。
-【领域画像】主体类别:$noun；优先体裁:$genres；冻结世界语境:$world_context
+【领域画像】主体类别:$noun；优先体裁:$genres；外围主题池:$filler_topics；冻结世界语境:$world_context
 【硬约束】
 1. ★绝不碰任何被追踪的 $noun 专名或人物专名(连名字都不出现),只使用全新虚构的外围专名与无关旁支事件,不得承载可用于回答 benchmark 问题的事实。允许使用“状态/工具/负责人”等同领域通用词，但不得把它们与被追踪专名组合成可回答事实。
 2. 文体、术语、时间制度必须服从上述领域画像。例如 RPG 应写世界内告示、传闻、游记、货单等,不得出现公司员工、OA、办公区、食堂培训等现代办公内容；只有目标场景本来就是企业办公时才允许办公题材。
@@ -180,7 +180,7 @@ $docs
     # ── 草堆 user($s $date)─────────────────────────────────────────────────
     # 受保护专名只留在代码端验收，绝不放进提示词。把禁词逐项展示给模型会反而
     # 提高复述概率；system 已声明只用全新外围专名，输出再由代码逐字 fail-closed。
-    "filler.user": """【第 $s $time_unit / $date】写一篇与主线无关的外围干扰文档。
+    "filler.user": """【第 $s $time_unit / $date；本期草堆槽位 $slot】从外围主题池中选择适合该槽位的一类，写一篇与主线无关的外围干扰文档。不同槽位应改变体裁、外围主体和事项，避免复述同一模板。
 只输出正文。""",
 
     # ── §7 敏感注入渲染(L10;★确定性模板,绕开 LLM 那一跳 → 保证 X 逐字就近落地,G3 反退化L6）─────
@@ -230,7 +230,8 @@ $inst_id 本次登记的「$trigger_field」为 $x$unit。值班据此对该 $in
 只输出 JSON:{"per_line":[{"line":"L1_timeline","applicable":true,"instantiation":"本场景用..落地","gt_feasible":true,"weight_hint":0.4}],"preference_axis":{"entity_type":"...","field":"...","options":["...","..."]}}(L1–L7 每条都判一次;preference_axis 可省)""",
 
     "council.medium": """发散本场景【所有可能的文档/记录形式】。先穷尽【常见】形式(力求大而全),再补【反常但合理】的(人类一下子想不到、但此领域确实可能存在的)——每个反常项必须给"为何此场景合理"。不是猎奇,是覆盖完整。最后给主媒介组合建议。
-只输出 JSON:{"common_media":[".."],"unconventional_media":[{"form":"..","why_plausible":".."}],"recommended_mix":["..",".."]}""",
+另外规划 benchmark 的【草堆语料】。草堆是在同一领域、同一世界里自然出现的外围记录，用全新外围专名和与主任务无关的旁支事项增加阅读总量；它不能承载被追踪实体的答案、世界真值、规则答案或未来信息。请给出每期 8–12 篇的建议、至少 4 种适合该领域的外围体裁、至少 6 类可轮换的外围主题。规模建议要考虑真实记录密度和体裁篇幅，不能靠重复同一模板灌水。
+只输出 JSON:{"common_media":[".."],"unconventional_media":[{"form":"..","why_plausible":".."}],"recommended_mix":["..",".."],"haystack_plan":{"filler_documents_per_session":10,"filler_genres":[".."],"filler_topics":[".."],"why":".."}}""",
 
     "council.style": """从 few-shot 原文抽【风格 DNA】,供后续渲染【照着仿写】:语气、格式(连续段落?条目?表格?)、典型篇幅、术语/黑话密度、什么明说·什么默认。
 只输出 JSON:{"style_spec":{"tone":"..","format":"..","length":"..","jargon":"..","stated_vs_assumed":".."},"use_fewshot_as_exemplar":true}""",

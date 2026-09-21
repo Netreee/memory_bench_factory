@@ -25,8 +25,8 @@ from pipeline.world_state import Op, SET, Timeline, WorldState
 ACCEPT = {"decision": "accept", "reason": "Offline transaction fixture.", "issues": [],
           "mechanism_coverage": [], "repair_targets": {"intrinsic": [], "structure": False},
           "limitations": "Does not establish business correctness."}
-PUBLISHED = ("01_whitepaper.json", "02_world.json", world_semantics.REVIEW_ARTIFACT,
-             "02_seed_audit.json", factory.CORPUS_CKPT)
+PUBLISHED = ("01_whitepaper.json", "01_seed_audit.json", "02_world.json", world_semantics.REVIEW_ARTIFACT,
+             world_semantics.WARNING_ARTIFACT, "02_seed_audit.json", factory.CORPUS_CKPT)
 
 
 class StopAfterWorld(Exception):
@@ -133,6 +133,26 @@ class ClosedLoopWorldTransactionTests(unittest.TestCase):
         self.orders.assert_not_called()
         self.assert_rollback(before, algo, expected_calls=2)
 
+    def test_accepted_upstream_definition_reaches_later_supply_round(self):
+        from pipeline.closed_loop import _run_world_attempt
+        wp = deepcopy(self.wp)
+        def revised_stage(run):
+            changed = run.read("01_whitepaper.json")
+            changed["blueprint_revisions"] = [{"reason": "Reviewed cyclic state"}]
+            run.write("01_whitepaper.json", changed)
+            run.write("01_seed_audit.json", {"passed": True, "revised": True})
+            run.write("02_world.json", self.world("revised").to_dict())
+        _run_world_attempt(self.run, wp, revised_stage, factory.ART, factory.CORPUS_CKPT)
+        self.assertEqual(wp, self.run.read("01_whitepaper.json"))
+        self.assertEqual(wp["blueprint_revisions"][0]["reason"], "Reviewed cyclic state")
+        before = self.snapshot()
+        def failed_later_stage(run):
+            run.write("01_seed_audit.json", {"passed": False, "injected": True})
+            raise WorldBlueprintError("Later attempt rejected")
+        with self.assertRaises(WorldBlueprintError):
+            _run_world_attempt(self.run, wp, failed_later_stage, factory.ART, factory.CORPUS_CKPT)
+        self.assertEqual(self.snapshot(), before)
+
     def test_interrupt_after_successful_mark_restores_old_world_and_failed_status(self):
         self.old_publication()
         before, algo = self.snapshot(), deepcopy(self.run.manifest["algo"])
@@ -161,14 +181,17 @@ class ClosedLoopWorldTransactionTests(unittest.TestCase):
         self.assert_rollback(before, algo, expected_calls=1)
         self.assertEqual(self.run.read("02_world_review_attempts.json")["attempts"][0]["status"], "passed")
 
-    def test_real_world_semantic_failure_preserves_old_bundle_and_negative_attempt(self):
+    def test_real_world_semantic_negative_commits_candidate_then_reaches_orders(self):
         self.old_publication()
-        before, algo = self.snapshot(), deepcopy(self.run.manifest["algo"])
+        before = self.snapshot()
         self.provider.return_value = {**ACCEPT, "decision": "unresolved", "reason": "Offline negative fixture."}
-        with self.assertRaises(WorldBlueprintError):
+        with self.assertRaises(StopAfterWorld):
             self.invoke()
-        self.orders.assert_not_called()
-        self.assert_rollback(before, algo, expected_calls=2)
+        self.orders.assert_called_once()
+        self.assertNotEqual(self.snapshot(), before)
+        self.assertEqual(self.run.manifest["stages"]["world"]["status"], "succeeded")
+        self.assertTrue(self.run.has(world_semantics.WARNING_ARTIFACT))
+        self.assertEqual(self.run.read(world_semantics.REVIEW_ARTIFACT)["status"], "unresolved")
         self.assertEqual(self.run.read("02_world_review_attempts.json")["attempts"][0]["status"], "unresolved")
 
     def test_second_attempt_rolls_back_to_first_committed_world(self):
