@@ -50,6 +50,7 @@ class RunPlan:
     run_stamp: str
     model: dict[str, Any] | None = None
     answering_model: dict[str, Any] | None = None
+    memory_config: dict[str, Any] | None = None
     runtime: dict[str, Any] | None = None
     runtime_fingerprint: str | None = None
     run_fingerprint: str | None = None
@@ -153,6 +154,7 @@ def make_plans(
                 },
                 "model": model,
                 "answering_model": dict(experiment.answering_model or {}),
+                "memory_config": dict(target.memory_config or {}),
                 "protocol": dict(experiment.protocol),
                 "execution": {
                     key: value
@@ -197,6 +199,7 @@ def make_plans(
                     run_stamp=run_stamp,
                     model=model,
                     answering_model=dict(experiment.answering_model or {}) or None,
+                    memory_config=dict(target.memory_config or {}) or None,
                 )
             )
     return plans

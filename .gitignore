@@ -6,6 +6,10 @@ venv*/
 
 # Credentials and local configuration
 .env
+# secrets.env holds real provider keys (see configs/env/secrets.env.example);
+# README states it must never enter git. The rule was lost on this branch, so
+# `git status` was showing it as untracked -> one `git add -A` from leaking keys.
+configs/env/*.env
 
 # Generated runs, logs and local research material
 output/

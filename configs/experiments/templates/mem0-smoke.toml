@@ -1,5 +1,5 @@
 schema_version = 2
-experiment_id = "memory-office-smoke-proposal"
+experiment_id = "memory-mem0-office-smoke"
 track = "memory"
 output_root = "output/eval"
 
@@ -8,24 +8,11 @@ label = "deepseek-v4-flash"
 model_id = "deepseek-v4-flash"
 endpoint_profile = "DEEPSEEK"
 
-# benchmark 数据不在本仓库内；这里指向工作区里保留的历史候选快照（UNMET，仅供 smoke）。
-# 正式实验请改成 factory 的生成产物 output/runs/<run_id>/，或任意相对/绝对路径。
+# 仓内 UNMET 历史夹具，只用于接入 smoke，不作为正式 benchmark 或横评结论。
 [[benchmarks]]
-path = "../agent-harnesses/input/office__20260902-121616"
-corpus_variant = "full"
+path = "tests/harness/fixtures/office__20260902-121616"
+corpus_variant = "filtered"
 allow_unmet = true
-
-[[targets]]
-id = "simplemem"
-system = "memory.simplemem"
-
-[[targets]]
-id = "iterative"
-system = "memory.iterative"
-
-[[targets]]
-id = "fullcontext"
-system = "memory.fullcontext"
 
 [[targets]]
 id = "mem0-oss"
@@ -49,21 +36,16 @@ host = "127.0.0.1"
 port = 6333
 service_version = "1.19.1"
 
-[[targets]]
-id = "graphiti-oss"
-system = "memory.graphiti-oss"
-
-[[targets]]
-id = "memos"
-system = "memory.memos"
-
 [protocol]
-version = "TBD"
+version = "memory-track-mem0-smoke-v1"
 answering_model_policy = "fixed"
-filler_policy = "include"
-context_token_budget = "TBD"
+filler_policy = "as_provided"
+context_token_budget = 0
+witness_policy = "recorded_not_enforced"
+scoring = "disabled_for_chain_smoke"
 
 [execution]
 mode = "smoke"
 limit = 6
 seed = 0
+questions_in_parallel = 1

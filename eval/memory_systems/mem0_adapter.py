@@ -8,7 +8,9 @@ Embedding 用本地 BAAI/bge-small-zh-v1.5 (512维,huggingface provider,不走 A
 LLM 事实抽取走 INGEST_LLM_BASE_URL(若设了),否则走 OPENAI_BASE_URL (DMXAPI)。
 """
 from __future__ import annotations
-import os, sys, time, uuid
+import importlib.metadata
+import importlib.util
+import os, sys, uuid
 from pathlib import Path
 
 import httpx
@@ -19,16 +21,143 @@ sys.path.insert(0, str(ROOT))
 from eval.memory_systems.base import (MemorySystem, execution_stage, ingest_receipt,
                                       require_response, configuration_fingerprint)
 from eval.memory_systems.execution import SDKGuard, validate_json_completion
-from eval.multi_system import header
+from eval.public_context import header
+
+
+MEM0_ADAPTER_VERSION = "mem0-oss-v1"
+DEFAULT_EMBEDDING_MODEL = "BAAI/bge-small-zh-v1.5"
+EMBEDDING_DIMENSIONS = 512
+REQUIRED_PACKAGE_VERSIONS = {
+    "mem0ai": "2.0.7",
+    "qdrant-client": "1.18.0",
+    "sentence-transformers": "6.1.0",
+}
 
 
 class Mem0Adapter(MemorySystem):
 
-    def __init__(self, top_k: int = 20, **kwargs):
+    @classmethod
+    def preflight(cls, **kwargs) -> dict:
+        """Validate pinned dependencies, explicit model identity, and Qdrant."""
+        errors: list[str] = []
+        warnings: list[str] = []
+        packages: dict[str, str] = {}
+        for module, distribution in (
+            ("mem0", "mem0ai"),
+            ("qdrant_client", "qdrant-client"),
+            ("sentence_transformers", "sentence-transformers"),
+        ):
+            if importlib.util.find_spec(module) is None:
+                errors.append(f"缺少 Python 依赖 {distribution}")
+                continue
+            try:
+                packages[distribution] = importlib.metadata.version(distribution)
+            except importlib.metadata.PackageNotFoundError:
+                errors.append(f"无法确定 Python 依赖版本 {distribution}")
+                continue
+            expected = REQUIRED_PACKAGE_VERSIONS[distribution]
+            if packages[distribution] != expected:
+                errors.append(
+                    f"{distribution} 版本必须是 {expected}，当前 {packages[distribution]}"
+                )
+
+        top_k = kwargs.get("top_k")
+        if isinstance(top_k, bool) or not isinstance(top_k, int) or top_k <= 0:
+            errors.append("Mem0 top_k 必须是正整数")
+        embedding_model = str(kwargs.get("embedding_model") or "").strip()
+        if embedding_model != DEFAULT_EMBEDDING_MODEL:
+            errors.append(
+                f"Mem0 v1 embedding_model 必须固定为 {DEFAULT_EMBEDDING_MODEL}"
+            )
+        llm_model = str(kwargs.get("llm_model") or "").strip()
+        llm_base_url = str(kwargs.get("llm_base_url") or "").strip()
+        llm_api_key = str(kwargs.get("llm_api_key") or "").strip()
+        if not llm_model:
+            errors.append("Mem0 internal_model.model_id 不能为空")
+        if not llm_base_url or not llm_api_key:
+            errors.append("Mem0 internal_model.endpoint_profile 缺少 endpoint 或凭证")
+
+        host = str(kwargs.get("qdrant_host") or "").strip()
+        port = kwargs.get("qdrant_port")
+        expected_service_version = str(
+            kwargs.get("qdrant_expected_version") or ""
+        ).strip()
+        service_version = None
+        if not host or isinstance(port, bool) or not isinstance(port, int) or port <= 0:
+            errors.append("Mem0 Qdrant host/port 配置无效")
+        elif "qdrant-client" in packages:
+            try:
+                response = httpx.get(f"http://{host}:{port}/", timeout=3.0)
+                response.raise_for_status()
+                payload = response.json()
+                if not isinstance(payload, dict):
+                    raise ValueError("invalid Qdrant metadata")
+                raw_version = payload.get("version")
+                if isinstance(raw_version, str) and raw_version.strip():
+                    service_version = raw_version.strip()
+                    if (
+                        expected_service_version
+                        and service_version != expected_service_version
+                    ):
+                        errors.append(
+                            "Qdrant 服务版本必须是 "
+                            f"{expected_service_version}，当前 {service_version}"
+                        )
+                else:
+                    warnings.append("Qdrant 可达，但服务版本未暴露")
+            except Exception as exc:  # no provider body or endpoint is persisted
+                errors.append(f"Qdrant 不可达或响应无效（{type(exc).__name__}）")
+
+        return {
+            "ok": not errors,
+            "errors": errors,
+            "warnings": warnings,
+            "memory_runtime": {
+                "adapter": "mem0",
+                "adapter_version": MEM0_ADAPTER_VERSION,
+                "package_versions": packages,
+                "internal_model": {
+                    "model_id": llm_model or None,
+                    "endpoint_fingerprint": configuration_fingerprint(llm_base_url),
+                },
+                "embedding_model": embedding_model or None,
+                "vector_store": {
+                    "provider": "qdrant",
+                    "endpoint_fingerprint": configuration_fingerprint(
+                        f"{host}:{port}" if host and isinstance(port, int) else None
+                    ),
+                    "service_version": service_version,
+                    "expected_service_version": expected_service_version or None,
+                },
+            },
+        }
+
+    def __init__(
+        self,
+        top_k: int = 20,
+        *,
+        qdrant_host: str | None = None,
+        qdrant_port: int | None = None,
+        llm_model: str | None = None,
+        llm_base_url: str | None = None,
+        llm_api_key: str | None = None,
+        embedding_model: str = DEFAULT_EMBEDDING_MODEL,
+        collection_prefix: str = "mem0_eval",
+        **kwargs,
+    ):
         self.top_k = top_k
-        self._qdrant_host = os.getenv("QDRANT_HOST", "localhost")
-        self._qdrant_port = int(os.getenv("QDRANT_PORT", "6333"))
-        self._collection = f"mem0_{uuid.uuid4().hex[:8]}"
+        self._qdrant_host = qdrant_host or os.getenv("QDRANT_HOST", "localhost")
+        self._qdrant_port = int(qdrant_port or os.getenv("QDRANT_PORT", "6333"))
+        self._llm_model = llm_model or os.getenv("INGEST_LLM_MODEL") or os.getenv("MODEL")
+        self._llm_base_url = (
+            llm_base_url
+            or os.getenv("INGEST_LLM_BASE_URL")
+            or os.getenv("OPENAI_BASE_URL")
+        )
+        self._llm_api_key = llm_api_key or os.getenv("OPENAI_API_KEY")
+        self._embedding_model = embedding_model
+        self._collection_prefix = collection_prefix
+        self._collection = f"{collection_prefix}_{uuid.uuid4().hex[:8]}"
         self._user_id = f"eval_{uuid.uuid4().hex[:8]}"
         self._last_context = ""
         self._guard = SDKGuard()
@@ -38,32 +167,28 @@ class Mem0Adapter(MemorySystem):
     def _rebuild_memory(self):
         from mem0 import Memory
 
-        api_key = os.getenv("OPENAI_API_KEY")
-        llm_base = os.getenv("INGEST_LLM_BASE_URL") or os.getenv("OPENAI_BASE_URL")
-        llm_model = os.getenv("INGEST_LLM_MODEL") or os.getenv("MODEL")
-
         cfg = {
             "vector_store": {
                 "provider": "qdrant",
                 "config": {
                     "host": self._qdrant_host, "port": self._qdrant_port,
                     "collection_name": self._collection,
-                    "embedding_model_dims": 512,
+                    "embedding_model_dims": EMBEDDING_DIMENSIONS,
                 },
             },
             "embedder": {
                 "provider": "huggingface",
-                "config": {"model": "BAAI/bge-small-zh-v1.5"},
+                "config": {"model": self._embedding_model},
             },
         }
 
-        if api_key and llm_base and llm_model:
+        if self._llm_api_key and self._llm_base_url and self._llm_model:
             cfg["llm"] = {
                 "provider": "openai",
                 "config": {
-                    "model": llm_model,
-                    "api_key": api_key,
-                    "openai_base_url": llm_base,
+                    "model": self._llm_model,
+                    "api_key": self._llm_api_key,
+                    "openai_base_url": self._llm_base_url,
                 },
             }
 
@@ -107,8 +232,9 @@ class Mem0Adapter(MemorySystem):
     def evaluation_config(self) -> dict:
         return {"configuration_status": "declared", "top_k": self.top_k,
                 "llm": dict(self._evaluation_llm),
-                "embedding_provider": "huggingface", "embedding_model": "BAAI/bge-small-zh-v1.5",
-                "embedding_dimensions": 512, "vector_provider": "qdrant",
+                "adapter_version": MEM0_ADAPTER_VERSION,
+                "embedding_provider": "huggingface", "embedding_model": self._embedding_model,
+                "embedding_dimensions": EMBEDDING_DIMENSIONS, "vector_provider": "qdrant",
                 "vector_endpoint_fingerprint": configuration_fingerprint(
                     f"{self._qdrant_host}:{self._qdrant_port}"),
                 "sdk_operations": "serialized"}
@@ -151,12 +277,28 @@ class Mem0Adapter(MemorySystem):
             text = "\n".join(m["memory"] for m in memories)
             return {"text": text or "(empty)", "n_memories": len(memories)}
 
+    def _delete_collection(self, stage: str) -> dict:
+        from qdrant_client import QdrantClient
+        qc = QdrantClient(host=self._qdrant_host, port=self._qdrant_port)
+        try:
+            qc.delete_collection(self._collection)
+        finally:
+            close = getattr(qc, "close", None)
+            if callable(close):
+                close()
+        return {"status": "ok", "completion": "deleted", "scope": "qdrant_collection"}
+
+    def cleanup(self) -> dict:
+        """Delete this run's collection without allocating a replacement."""
+        with execution_stage("cleanup"):
+            receipt = self._delete_collection("cleanup")
+            self._last_context = ""
+            return receipt
+
     def reset(self) -> None:
         with execution_stage("reset"):
-            from qdrant_client import QdrantClient
-            qc = QdrantClient(host=self._qdrant_host, port=self._qdrant_port)
-            qc.delete_collection(self._collection)
-            self._collection = f"mem0_{uuid.uuid4().hex[:8]}"
+            self._delete_collection("reset")
+            self._collection = f"{self._collection_prefix}_{uuid.uuid4().hex[:8]}"
             self._user_id = f"eval_{uuid.uuid4().hex[:8]}"
             self._last_context = ""
             self._rebuild_memory()

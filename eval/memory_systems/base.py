@@ -62,6 +62,21 @@ def require_response(condition: bool, stage: str, **details) -> None:
 
 class MemorySystem(ABC):
 
+    @classmethod
+    def preflight(cls, **kwargs) -> dict:
+        """Side-effect-free dependency/service check for the control plane.
+
+        External adapters override this method. Returned values must be safe to
+        persist in ``run_plan.json``: versions and endpoint fingerprints are
+        allowed; credentials, provider payloads, and random namespace IDs are not.
+        """
+        return {
+            "ok": True,
+            "errors": [],
+            "warnings": [],
+            "memory_runtime": {"adapter": cls.__name__, "configuration": "repository"},
+        }
+
     def evaluation_config(self) -> dict:
         """Stable instance settings for cache identity; never return secrets/IDs.
 
@@ -98,6 +113,16 @@ class MemorySystem(ABC):
         """所有 session ingest 完后调用一次。
         on_progress(done, total): 可选进度回调。默认 no-op。
         可返回限定验证范围的完成凭据；runner 应保留该 dict。"""
+
+    def cleanup(self) -> dict:
+        """Release run-scoped resources without creating a replacement namespace.
+
+        ``reset()`` prepares an instance for reuse and some external adapters
+        therefore allocate a fresh store. The runner needs a different end-of-run
+        operation that only removes the current namespace. In-process baselines
+        have no persistent resources, so the default is an explicit no-op receipt.
+        """
+        return {"status": "ok", "completion": "not_applicable"}
 
     def get_diagnostics(self) -> dict:
         """最近一次 retrieve 的诊断信息(如 bridge 实体)。默认空。"""

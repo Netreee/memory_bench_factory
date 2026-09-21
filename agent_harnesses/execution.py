@@ -35,6 +35,7 @@ RUNTIME_KEYS = (
     "runtime_options",
     "binary",
     "binary_version",
+    "memory_runtime",
 )
 
 # run 目录分配 + run_plan.json 落盘必须互斥：两个 target 可能解析出完全相同的
@@ -64,6 +65,12 @@ def preflight(
 def runtime_identity(report: Mapping[str, Any]) -> dict[str, Any]:
     """把 preflight 报告收敛成可入 fingerprint 的 runtime 身份。"""
     runtime = {key: report.get(key) for key in RUNTIME_KEYS}
+    # ingest LLM 的实际路由（直连 vs no-think 网关）是 runtime 身份的一部分：换路由
+    # 会改变抽取行为，两次 run 不该长得一样。只在报告确实声明了它时加入，因此
+    # 不声明该字段的赛道（如 native）fingerprint 保持不变。
+    ingest_llm = report.get("ingest_llm")
+    if isinstance(ingest_llm, dict) and ingest_llm:
+        runtime["ingest_llm"] = ingest_llm
     # 归一器/检测器版本进入 fingerprint：启发式变了必须换输出目录，
     # 而不是静默重新解释旧 run 的事件流。
     runtime["event_normalizer_version"] = NORMALIZER_VERSION
@@ -77,7 +84,7 @@ def planned_run_dir(plan: RunPlan, report: Mapping[str, Any] | None = None) -> P
     同一秒内重复运行同一配置时，execute 会给目录追加 `-2`、`-3` 后缀；
     这里给出的是首选名。
     """
-    has_runtime = report is not None and plan.runner == "native_cli"
+    has_runtime = report is not None and plan.runner in {"native_cli", "memory"}
     runtime = runtime_identity(report) if has_runtime else None
     run_fp = run_fingerprint(plan.config_fingerprint, runtime)
     return Path(plan.output_dir) / run_dir_name(plan.run_stamp, run_fp)
@@ -109,7 +116,7 @@ def _execute_one(
     """
     runtime = None
     runtime_fp = None
-    if system.runner == "native_cli":
+    if system.runner in {"native_cli", "memory"}:
         runtime = runtime_identity(report)
         runtime_fp = fingerprint(runtime)
     run_fp = run_fingerprint(plan.config_fingerprint, runtime)
@@ -254,7 +261,7 @@ def _reject_colliding_plans(
         system = systems_by_id[plan.system_id]
         runtime = (
             runtime_identity(reports[plan.target_id])
-            if system.runner == "native_cli"
+            if system.runner in {"native_cli", "memory"}
             else None
         )
         key = (plan.output_dir, run_fingerprint(plan.config_fingerprint, runtime))

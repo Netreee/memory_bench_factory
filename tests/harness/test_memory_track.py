@@ -9,17 +9,23 @@ results.jsonl / summary.json 的字段与 native 赛道对齐、以及并发下 
 from __future__ import annotations
 
 import json
+import hashlib
+import os
+import sys
 import tempfile
 import threading
 import time
+import types
 import unittest
 import unittest.mock
 from pathlib import Path
 
+from agent_harnesses import execution
 from agent_harnesses.config import ConfigurationError, SystemConfig
 from agent_harnesses.planning import RunPlan
 from agent_harnesses.runners import memory as memory_runner
 from agent_harnesses.tracks.memory import MemoryTrackAdapter
+from eval.memory_systems import mem0_adapter
 
 
 def _write_json(path: Path, payload) -> None:
@@ -47,6 +53,7 @@ class _FakeSystem:
         self.slow_retrieve_s = slow_retrieve_s
         self.sessions: list[dict] = []
         self.finalized = False
+        self.cleaned = False
         self.retrieve_calls: list[str] = []
         self._lock = threading.Lock()
 
@@ -70,6 +77,13 @@ class _FakeSystem:
 
     def get_diagnostics(self) -> dict:
         return {"top_k": self.top_k}
+
+    def evaluation_config(self) -> dict:
+        return {"configuration_status": "declared", "top_k": self.top_k}
+
+    def cleanup(self) -> dict:
+        self.cleaned = True
+        return {"status": "ok", "completion": "not_applicable"}
 
 
 def _fake_factory(system: _FakeSystem, *, answers: dict[str, str] | None = None,
@@ -104,6 +118,10 @@ def _fake_factory(system: _FakeSystem, *, answers: dict[str, str] | None = None,
         "make_system": make_system,
         "unified_answer": unified_answer,
         "MemoryExecutionError": _FakeMemoryError,
+        # 与真实 _load_factory 的契约一致：ingest 路由的 lineage 指纹由它计算。
+        "configuration_fingerprint": lambda value: (
+            hashlib.sha256(value.encode()).hexdigest() if value else None
+        ),
         "load_public_protocol": lambda about_path: "【答题约定】只给最终值",
         "load_visible_corpus": lambda corpus_path: [
             (0, "2025-01-06", "docs-a"),
@@ -204,9 +222,12 @@ class MemoryRunnerTests(unittest.TestCase):
             {"session_id": 1, "date": "2025-01-13", "docs": ["docs-b"]},
         ])
         self.assertTrue(system.finalized)
+        self.assertTrue(system.cleaned)
         self.assertEqual(summary["n_questions"], 4)
         self.assertEqual(summary["n_docs"], 2)
         self.assertEqual(summary["ingest"]["n_sessions"], 2)
+        self.assertEqual(summary["cleanup"]["receipt"]["status"], "ok")
+        self.assertEqual(summary["effective_memory_config"]["top_k"], 3)
         rows = self._rows()
         self.assertEqual([r["question_index"] for r in rows], [0, 1, 2, 3])
         self.assertTrue(all(r["status"] == "completed" for r in rows))
@@ -313,6 +334,36 @@ class MemoryRunnerTests(unittest.TestCase):
         fullctx = _plan_dict(self.tmp, system_id="memory.fullcontext", memory_id="fullcontext")["system"]["spec"]
         self.assertEqual(memory_runner._system_kwargs(fullctx),
                          ("fullcontext", {"budget": 120_000}))
+        mem0_spec = {
+            "memory_system": {"id": "mem0"},
+            "retrieval": {"mode": "native", "top_k": 3},
+        }
+        mem0_config = {
+            "top_k": 3,
+            "namespace_prefix": "mem0_eval",
+            "internal_model": {"model_id": "extractor", "endpoint_profile": "INGEST"},
+            "embedder": {"provider": "huggingface", "model_id": "BAAI/bge-small-zh-v1.5"},
+            "vector_store": {"provider": "qdrant", "host": "127.0.0.1", "port": 6333},
+        }
+        name, public = memory_runner._system_kwargs(mem0_spec, mem0_config)
+        self.assertEqual(name, "mem0")
+        self.assertEqual(public["top_k"], 3)
+        self.assertEqual(public["llm_endpoint_profile"], "INGEST")
+        runtime = memory_runner._runtime_system_kwargs(
+            name,
+            public,
+            {"INGEST_API_KEY": "secret", "INGEST_BASE_URL": "http://ingest.invalid/v1"},
+        )
+        self.assertNotIn("llm_endpoint_profile", runtime)
+        self.assertEqual(runtime["llm_model"], "extractor")
+        self.assertEqual(runtime["llm_api_key"], "secret")
+
+    def test_mem0_runtime_state_is_pinned_and_telemetry_disabled(self):
+        with unittest.mock.patch.dict("os.environ", {}, clear=True):
+            memory_runner._prepare_external_runtime("mem0")
+            import os
+            self.assertTrue(os.environ["MEM0_DIR"].endswith("output/eval/_mem0_state"))
+            self.assertEqual(os.environ["MEM0_TELEMETRY"], "False")
 
 
 class MemoryTrackAdapterTests(unittest.TestCase):
@@ -344,6 +395,165 @@ class MemoryTrackAdapterTests(unittest.TestCase):
 
         with self.assertRaises(ConfigurationError):
             _system_kwargs({"memory_system": {}})
+
+
+class Mem0AdapterContractTests(unittest.TestCase):
+    def test_preflight_records_versions_and_fingerprints_without_secret(self):
+        response = unittest.mock.Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"version": "1.15.5"}
+        versions = {
+            "mem0ai": "2.0.7",
+            "qdrant-client": "1.18.0",
+            "sentence-transformers": "6.1.0",
+        }
+        with (
+            unittest.mock.patch.object(mem0_adapter.importlib.util, "find_spec", return_value=object()),
+            unittest.mock.patch.object(
+                mem0_adapter.importlib.metadata,
+                "version",
+                side_effect=lambda name: versions[name],
+            ),
+            unittest.mock.patch.object(mem0_adapter.httpx, "get", return_value=response),
+        ):
+            report = mem0_adapter.Mem0Adapter.preflight(
+                top_k=3,
+                llm_model="extractor",
+                llm_base_url="https://user:private@model.invalid/v1",
+                llm_api_key="super-secret",
+                qdrant_host="127.0.0.1",
+                qdrant_port=6333,
+                qdrant_expected_version="1.15.5",
+                embedding_model="BAAI/bge-small-zh-v1.5",
+            )
+        self.assertTrue(report["ok"])
+        self.assertEqual(report["memory_runtime"]["package_versions"], versions)
+        self.assertEqual(
+            report["memory_runtime"]["vector_store"]["service_version"], "1.15.5"
+        )
+        encoded = json.dumps(report)
+        self.assertNotIn("super-secret", encoded)
+        self.assertNotIn("private", encoded)
+
+    def test_cleanup_deletes_current_collection_without_rebuilding(self):
+        client = unittest.mock.Mock()
+        qdrant = types.SimpleNamespace(QdrantClient=unittest.mock.Mock(return_value=client))
+        instance = mem0_adapter.Mem0Adapter.__new__(mem0_adapter.Mem0Adapter)
+        instance._qdrant_host = "127.0.0.1"
+        instance._qdrant_port = 6333
+        instance._collection = "mem0_eval_private"
+        instance._last_context = "old"
+        instance._rebuild_memory = unittest.mock.Mock()
+        with unittest.mock.patch.dict(sys.modules, {"qdrant_client": qdrant}):
+            receipt = instance.cleanup()
+        self.assertEqual(receipt["completion"], "deleted")
+        client.delete_collection.assert_called_once_with("mem0_eval_private")
+        client.close.assert_called_once()
+        instance._rebuild_memory.assert_not_called()
+
+
+class IngestGatewayRoutingTest(unittest.TestCase):
+    """ingest LLM 的 no-think 网关路由（正式链路）与 lineage 记录。
+
+    背景：推理模型的 reasoning_content 会吃掉补全预算，直连时抽取结果被截断成非法
+    JSON，触发 adapter 的 json 守卫 fail-closed —— 长语料必然中途全盘中止，且调大
+    max_tokens 只能把失败点往后推。网关统一关 thinking 是唯一确定性修法，
+    见 output/local_services/mem0_smoke_report.md 的三次 run 对照。
+    """
+
+    PROFILE_ENV = {
+        "DEEPSEEK_API_KEY": "profile-key",
+        "DEEPSEEK_BASE_URL": "https://upstream.invalid/v1",
+    }
+    PUBLIC = {
+        "llm_model": "deepseek-v4-flash",
+        "llm_endpoint_profile": "DEEPSEEK",
+        "top_k": 3,
+    }
+
+    def setUp(self):
+        # 测试必须对宿主机环境免疫：只由用例自己决定网关是否配置。
+        patcher = unittest.mock.patch.dict(os.environ, {}, clear=False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for name in ("INGEST_LLM_BASE_URL", "INGEST_LLM_API_KEY", "INGEST_LLM_MODEL"):
+            os.environ.pop(name, None)
+
+    def _kwargs(self, extra):
+        env = dict(self.PROFILE_ENV)
+        env.update(extra)
+        return memory_runner._runtime_system_kwargs("mem0", dict(self.PUBLIC), env)
+
+    def test_direct_when_gateway_not_configured(self):
+        runtime = self._kwargs({})
+        self.assertEqual(runtime["llm_base_url"], "https://upstream.invalid/v1")
+        self.assertEqual(runtime["llm_api_key"], "profile-key")
+
+    def test_gateway_overrides_declared_profile(self):
+        runtime = self._kwargs({"INGEST_LLM_BASE_URL": "http://127.0.0.1:9800/v1"})
+        self.assertEqual(runtime["llm_base_url"], "http://127.0.0.1:9800/v1")
+        # 网关不校验 key，但 mem0 的 OpenAIConfig 要求 api_key 非空 → 回退 profile key。
+        self.assertEqual(runtime["llm_api_key"], "profile-key")
+
+    def test_gateway_key_and_model_override(self):
+        runtime = self._kwargs({
+            "INGEST_LLM_BASE_URL": "http://127.0.0.1:9800/v1",
+            "INGEST_LLM_API_KEY": "gateway-key",
+            "INGEST_LLM_MODEL": "Qwen3-8B",
+        })
+        self.assertEqual(runtime["llm_api_key"], "gateway-key")
+        self.assertEqual(runtime["llm_model"], "Qwen3-8B")
+
+    def test_gateway_falls_back_to_process_env(self):
+        """services/run_eval.sh 用 export 注入网关地址，不走 secrets.env。"""
+        with unittest.mock.patch.dict(
+            os.environ, {"INGEST_LLM_BASE_URL": "http://127.0.0.1:9999/v1"}
+        ):
+            runtime = self._kwargs({})
+        self.assertEqual(runtime["llm_base_url"], "http://127.0.0.1:9999/v1")
+
+    def test_route_records_both_fingerprints(self):
+        env = dict(self.PROFILE_ENV, INGEST_LLM_BASE_URL="http://127.0.0.1:9800/v1")
+        route = memory_runner._ingest_route(
+            "mem0", dict(self.PUBLIC), env, lambda v: f"fp:{v}" if v else None
+        )
+        self.assertEqual(route["route"], "gateway")
+        self.assertEqual(route["declared_profile"], "DEEPSEEK")
+        # 网关是本地地址，真实上游必须单独可见：否则「同网关不同上游」的两次 run
+        # 会长得一模一样（与 max_tokens 不入 fingerprint 是同一类 lineage 缺口）。
+        self.assertEqual(
+            route["declared_upstream_fingerprint"], "fp:https://upstream.invalid/v1"
+        )
+        self.assertEqual(route["gateway_fingerprint"], "fp:http://127.0.0.1:9800/v1")
+
+    def test_route_is_direct_without_gateway(self):
+        route = memory_runner._ingest_route(
+            "mem0", dict(self.PUBLIC), dict(self.PROFILE_ENV),
+            lambda v: f"fp:{v}" if v else None,
+        )
+        self.assertEqual(route["route"], "direct")
+        self.assertIsNone(route["gateway_fingerprint"])
+
+    def test_non_mem0_system_has_no_route(self):
+        self.assertIsNone(memory_runner._ingest_route("simplemem", {}, {}, lambda v: v))
+
+
+class RuntimeIdentityTest(unittest.TestCase):
+    """ingest 路由必须进 fingerprint：换路由会改变抽取行为，两次 run 不该同名。"""
+
+    def test_ingest_llm_enters_fingerprint_when_declared(self):
+        identity = execution.runtime_identity({"ingest_llm": {"route": "gateway"}})
+        self.assertEqual(identity["ingest_llm"], {"route": "gateway"})
+
+    def test_native_report_fingerprint_unchanged(self):
+        """不声明 ingest_llm 的赛道（native）fingerprint 不应被这次改动影响。"""
+        identity = execution.runtime_identity({"adapter": "native_cli", "model": "m"})
+        self.assertNotIn("ingest_llm", identity)
+
+    def test_route_change_changes_fingerprint(self):
+        direct = execution.runtime_identity({"ingest_llm": {"route": "direct"}})
+        gateway = execution.runtime_identity({"ingest_llm": {"route": "gateway"}})
+        self.assertNotEqual(direct, gateway)
 
 
 if __name__ == "__main__":

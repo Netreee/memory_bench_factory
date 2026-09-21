@@ -35,6 +35,23 @@ def _memory_system_id(system: SystemConfig) -> str:
     return name
 
 
+def _probe_gateway(base_url: str, timeout: float = 3.0) -> str | None:
+    """探测 no-think 网关可达性。返回 None 表示可达，否则返回简短的异常类型。
+
+    显式绕过 HTTP(S)_PROXY：沙箱里代理会劫持 localhost 请求，本地网关会被误判不可达。
+    只回传异常类型，不带 URL 细节、响应体或任何凭证。
+    """
+    import urllib.request  # noqa: PLC0415
+
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(f"{base_url.rstrip('/')}/models", timeout=timeout) as response:
+            response.read(1)
+    except Exception as exc:  # noqa: BLE001 - 任何失败都等价于「网关不可用」
+        return type(exc).__name__
+    return None
+
+
 class MemoryTrackAdapter(TrackAdapter):
     def preflight(
         self,
@@ -67,6 +84,7 @@ class MemoryTrackAdapter(TrackAdapter):
         if not benchmark.is_dir():
             errors.append(f"benchmark 目录不存在: {benchmark}")
         endpoint = {}
+        env: dict[str, str] = {}
         if answering:
             profile = str(answering.get("endpoint_profile") or "")
             from ..runners.native_cli import _profile_names, load_env_file
@@ -99,11 +117,65 @@ class MemoryTrackAdapter(TrackAdapter):
             if importlib.util.find_spec("transformers") is None:
                 warnings.append("transformers 未安装；sentence-transformers 首次加载会自行解析")
 
+        # 4) adapter-owned preflight。公共控制面只负责解析公开配置与 endpoint
+        # profile；SDK/服务版本和健康检查由具体 adapter 声明，结果进入 runtime
+        # fingerprint，但不得包含凭证或随机 namespace ID。
+        memory_runtime: dict = {}
+        adapter_version = None
+        ingest_llm: dict = {}
+        if name and not errors:
+            try:
+                from ..runners.memory import (
+                    _ingest_llm_gateway,
+                    _ingest_route,
+                    _runtime_system_kwargs,
+                    _system_kwargs,
+                )
+                from eval.memory_systems import preflight_system
+                from eval.memory_systems.base import configuration_fingerprint
+
+                _, public_kwargs = _system_kwargs(
+                    system.spec if isinstance(system.spec, dict) else {},
+                    plan.memory_config or {},
+                )
+                runtime_kwargs = _runtime_system_kwargs(name, public_kwargs, env)
+                route = _ingest_route(name, public_kwargs, env, configuration_fingerprint) or {}
+                ingest_llm = route
+
+                # ingest LLM 走 no-think 网关时必须确认网关已在跑：否则要到 ingest 中途
+                # 才炸（长语料几十分钟），成本极高。这里提前 fail-fast。
+                gateway = _ingest_llm_gateway(env)
+                if gateway["base_url"]:
+                    failure = _probe_gateway(gateway["base_url"])
+                    if failure:
+                        errors.append(
+                            f"{system.system_id}: INGEST_LLM_BASE_URL="
+                            f"{gateway['base_url']} 不可达（{failure}）；"
+                            "请先启动 no-think 网关（services/no_think_proxy.py 或 "
+                            "services/embed_server.py），或清空 INGEST_LLM_BASE_URL 走直连"
+                        )
+                    else:
+                        fingerprint = str(route.get("gateway_fingerprint") or "")
+                        warnings.append(
+                            f"{system.system_id}: ingest LLM 经 no-think 网关 "
+                            f"{gateway['base_url']}（指纹 {fingerprint[:12]}）"
+                        )
+                adapter_report = preflight_system(name, **runtime_kwargs)
+                errors.extend(str(item) for item in adapter_report.get("errors") or [])
+                warnings.extend(str(item) for item in adapter_report.get("warnings") or [])
+                runtime_value = adapter_report.get("memory_runtime") or {}
+                if isinstance(runtime_value, dict):
+                    memory_runtime = runtime_value
+                    adapter_version = runtime_value.get("adapter_version")
+            except Exception as exc:  # fail closed, never expose provider payloads
+                errors.append(f"{system.system_id} adapter preflight 失败（{type(exc).__name__}）")
+
         spec = system.spec if isinstance(system.spec, dict) else {}
         retrieval = spec.get("retrieval") or {}
         return {
             "system_id": system.system_id,
             "adapter": "memory",
+            "adapter_version": adapter_version,
             "ok": not errors,
             "memory_system": name,
             "track": "memory",
@@ -111,6 +183,8 @@ class MemoryTrackAdapter(TrackAdapter):
             "answering_model": dict(answering),
             **endpoint,
             "retrieval": dict(retrieval),
+            "memory_runtime": memory_runtime,
+            "ingest_llm": ingest_llm,
             "python": sys.executable,
             "warnings": warnings,
             "errors": errors,
