@@ -5,37 +5,28 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 from pathlib import Path
 
-
-def _read_json(path: Path):
-    return json.loads(path.read_text(encoding="utf-8"))
+from ..artifacts import load_benchmark_questions, load_benchmark_sessions, question_id
 
 
 def run(run_dir: Path, out_dir: Path, limit: int = 0) -> dict:
     run_dir = Path(run_dir)
     out_dir = Path(out_dir)
-    corpus_obj = _read_json(run_dir / "05_corpus.json")
-    corpus = corpus_obj.get("corpus", corpus_obj)
-    sessions = corpus["sessions"]
-    question_obj = _read_json(run_dir / "06_grounded_questions.json")
-    questions = question_obj if isinstance(question_obj, list) else question_obj["questions"]
+    sessions = load_benchmark_sessions(run_dir)
+    questions = load_benchmark_questions(run_dir)
     selected = questions[:limit] if limit else questions
 
     out_dir.mkdir(parents=True, exist_ok=True)
     results_path = out_dir / "results.jsonl"
     with results_path.open("w", encoding="utf-8") as fh:
         for index, question in enumerate(selected):
-            text = question["question"]
-            question_id = question.get("question_id") or hashlib.sha256(
-                text.encode("utf-8")
-            ).hexdigest()[:16]
             record = {
                 "schema": "agent-harnesses.result/v1",
-                "question_id": question_id,
+                "question_id": question_id(question),
                 "question_index": index,
+                "quality_status": question.get("quality_status"),
                 "status": "diagnostic_only",
                 "answer": None,
                 "judgeable": False,

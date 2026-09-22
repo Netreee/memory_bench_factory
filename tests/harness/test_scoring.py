@@ -6,6 +6,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from agent_harnesses.config import REPOSITORY_ROOT, ConfigurationError
 from agent_harnesses.judging import (
@@ -14,6 +15,7 @@ from agent_harnesses.judging import (
     resolve_factory_root,
 )
 from agent_harnesses.scoring import aggregate, read_results, score_run
+from standard_light_fixture import build_standard_light
 
 
 def _qid(text: str) -> str:
@@ -111,6 +113,63 @@ def _build_out_dir(root: Path) -> Path:
 
 
 class ScoringTests(unittest.TestCase):
+    def test_standard_light_scores_all_quality_statuses_from_raw_truth(self):
+        questions = [
+            {"qid": "q-release", "question": "状态？", "line": "L1", "capability": "IE", "quality_status": "released"},
+            {"qid": "q-reject", "question": "未知项？", "line": "L6", "capability": "L6_refusal", "quality_status": "rejected"},
+            {"qid": "q-pending", "question": "下一状态？", "line": "L8", "capability": "L8_next", "quality_status": "pending_review"},
+        ]
+        references = [
+            {"qid": "q-release", "answer": "进行中", "answer_raw": {"value": "进行中", "at_week": 1}, "answer_projection": "gt/value", "quality_status": "released"},
+            {"qid": "q-reject", "answer": "查无此记录", "answer_raw": "INSUFFICIENT_EVIDENCE", "answer_projection": "abstention:never_known", "quality_status": "rejected"},
+            {"qid": "q-pending", "answer": "已完成", "answer_raw": "已完成", "answer_projection": "raw_gt", "quality_status": "pending_review"},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            benchmark = build_standard_light(root / "benchmark", questions, references)
+            out = root / "out"
+            out.mkdir()
+            plan = {
+                "experiment_id": "standard-test",
+                "system_id": "fake",
+                "runner": "native_cli",
+                "system": {"implementation": {"adapter": "claude"}},
+                "runtime": {"adapter": "claude", "model": "fake-model"},
+                "benchmark": {"path": str(benchmark)},
+                "protocol": {"scoring": "enabled"},
+            }
+            (out / "run_plan.json").write_text(json.dumps(plan), encoding="utf-8")
+            answers = ["进行中", "查无此记录", "已完成"]
+            rows = [
+                {
+                    "schema": "agent-harnesses.result/v1",
+                    "question_id": question["qid"],
+                    "question_index": index,
+                    "quality_status": question["quality_status"],
+                    "status": "completed",
+                    "answer": answers[index],
+                    "judgeable": False,
+                    "correct": None,
+                    "error_type": None,
+                }
+                for index, question in enumerate(questions)
+            ]
+            (out / "results.jsonl").write_text(
+                "\n".join(json.dumps(row, ensure_ascii=False) for row in rows) + "\n",
+                encoding="utf-8",
+            )
+            with mock.patch.dict(
+                os.environ, {"OPENAI_API_KEY": "test-key", "MODEL": "test-model"}
+            ):
+                judge = load_judge(REPOSITORY_ROOT)
+                summary = score_run(out, judge, use_llm=False)
+            self.assertEqual(summary["aggregate"]["overall"]["n_total"], 3)
+            self.assertEqual(summary["aggregate"]["overall"]["n_correct"], 3)
+            self.assertEqual(
+                set(summary["aggregate"]["by_quality_status"]),
+                {"released", "rejected", "pending_review"},
+            )
+
     def test_score_run_end_to_end_offline(self):
         with tempfile.TemporaryDirectory() as tmp:
             out = _build_out_dir(Path(tmp))

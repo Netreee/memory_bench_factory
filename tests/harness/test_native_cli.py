@@ -24,11 +24,13 @@ from agent_harnesses.runners.native_cli import (
     _parse_answer,
     _prepare_dsh_home,
     _prompt,
+    _render_protocol,
     preflight_system,
     run,
 )
 from agent_harnesses.planning import make_plans
 from agent_harnesses.execution import execute
+from standard_light_fixture import build_standard_light
 
 
 # 测试夹具：office 历史候选快照(filtered, UNMET)，见 fixtures/README.md。
@@ -92,6 +94,26 @@ class NativeCliTests(unittest.TestCase):
                 sorted(p.name for p in workspace.iterdir()),
                 ["INDEX.md", "sessions"],
             )
+
+    def test_standard_light_workspace_and_protocol_use_public_exports(self):
+        questions = [
+            {"qid": "q1", "question": "状态？", "line": "L1", "capability": "KU", "quality_status": "rejected"}
+        ]
+        references = [
+            {"qid": "q1", "answer": "进行中", "answer_raw": "进行中", "answer_projection": "raw_gt", "quality_status": "rejected"}
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = build_standard_light(Path(tmp) / "benchmark", questions, references)
+            workspace = Path(tmp) / "workspace"
+            sessions, docs = _materialize_workspace(root, workspace)
+            self.assertEqual((sessions, docs), (1, 1))
+            self.assertIn("第一周，项目状态为进行中。", next((workspace / "sessions").rglob("*.md")).read_text())
+            self.assertEqual(
+                _render_protocol(root),
+                (root / "public" / "protocol.txt").read_text(encoding="utf-8"),
+            )
+            self.assertFalse((workspace / "references").exists())
+            self.assertFalse((workspace / "private").exists())
 
     def test_prompt_carries_all_run_rules(self):
         prompt = _prompt("Answer protocol:\n- rule", "谁向谁汇报？")

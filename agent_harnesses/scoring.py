@@ -5,11 +5,18 @@
 """
 from __future__ import annotations
 
-import hashlib
 import json
 from pathlib import Path
 from typing import Any, Mapping
 
+from .artifacts import (
+    ANSWER_PROJECTIONS,
+    STANDARD_LIGHT_SCHEMA,
+    benchmark_schema,
+    load_benchmark_questions,
+    load_benchmark_references,
+    question_id,
+)
 from .config import ConfigurationError
 from .costing import attach_cost, extract_usage, summarize_costs
 from .judging import Judge
@@ -29,8 +36,77 @@ def _read_json(path: Path) -> Any:
 
 
 def load_questions(run_dir: Path) -> list[dict]:
-    obj = _read_json(run_dir / "06_grounded_questions.json")
-    return obj if isinstance(obj, list) else obj["questions"]
+    questions = load_benchmark_questions(run_dir)
+    if benchmark_schema(run_dir) != STANDARD_LIGHT_SCHEMA:
+        return questions
+
+    references = load_benchmark_references(run_dir)
+    if len(references) != len(questions):
+        raise ConfigurationError("public/references 题目数量或 qid 唯一性不一致")
+    adapted = []
+    for public in questions:
+        qid = question_id(public)
+        try:
+            reference = references[qid]
+        except KeyError as exc:
+            raise ConfigurationError(f"qid={qid!r} 缺少判分真值") from exc
+        if reference.get("quality_status") != public.get("quality_status"):
+            raise ConfigurationError(f"qid={qid!r} 的 public/reference quality_status 不一致")
+        question = dict(public)
+        question.update(_standard_scoring_fields(question, reference))
+        adapted.append(question)
+    return adapted
+
+
+def _standard_scoring_fields(public: dict, reference: dict) -> dict[str, Any]:
+    """Map standard-light references onto the current factory judge contract.
+
+    This is deliberately evaluator-side: the exported public question remains
+    untouched, while `answer_raw` is the scoring truth and `answer_projection`
+    tells us how to interpret it.  The generated contract is provisional until
+    the factory ships an explicit grading contract in its export.
+    """
+    capability = public.get("capability")
+    projection = reference.get("answer_projection")
+    raw = reference.get("answer_raw")
+    if projection not in ANSWER_PROJECTIONS:
+        raise ConfigurationError(f"不支持的 answer_projection: {projection!r}")
+    if projection == "gt/value" and not isinstance(raw, dict):
+        raise ConfigurationError("gt/value 的 answer_raw 必须是 object")
+    if projection == "abstention:never_known" and raw != "INSUFFICIENT_EVIDENCE":
+        raise ConfigurationError(
+            "abstention:never_known 的 answer_raw 必须是 INSUFFICIENT_EVIDENCE"
+        )
+    answer_kind = "value"
+    contract: dict[str, Any] = {
+        "version": 1,
+        "answer_kind": answer_kind,
+        "value_schema": {},
+        "allowed_aliases": [],
+        "scoring_scope": "primary_answer",
+    }
+    aux: dict[str, Any] = {}
+    if projection == "abstention:never_known":
+        contract.update(answer_kind="abstention", abstention_kind="never_known")
+    elif capability == "L3_order":
+        contract["answer_kind"] = "order"
+    elif capability == "TR":
+        contract["answer_kind"] = "time"
+    elif capability == "L8_next":
+        # The legacy judge requires a declared state vocabulary.  The standard
+        # export only carries the canonical answer, so use an explicit sentinel
+        # as the second closed-set member without inventing another valid label.
+        contract["answer_kind"] = "enum"
+        aux["states"] = [raw, "__STANDARD_LIGHT_OTHER__"]
+
+    return {
+        "gt": raw,
+        "aux": aux,
+        "question_contract": contract,
+        "answer_projection": projection,
+        "reference_answer": reference.get("answer"),
+        "_benchmark_schema": STANDARD_LIGHT_SCHEMA,
+    }
 
 
 def read_results(out_dir: Path) -> list[dict]:
@@ -60,6 +136,8 @@ def _score_record(
     out["capability"] = question.get("capability")
     out["entity"] = question.get("entity")
     out["field"] = question.get("field")
+    out["quality_status"] = question.get("quality_status")
+    out["answer_projection"] = question.get("answer_projection")
     out["gold"] = judge.gold_display(question)
     judge_info: dict[str, Any] = {
         "version": judge.version,
@@ -139,6 +217,12 @@ def aggregate(records: list[dict]) -> dict[str, Any]:
             cap: bucket([r for r in records if r.get("capability") == cap])
             for cap in sorted({r.get("capability") for r in records if r.get("capability")})
         },
+        "by_quality_status": {
+            status: bucket([r for r in records if r.get("quality_status") == status])
+            for status in sorted(
+                {r.get("quality_status") for r in records if r.get("quality_status")}
+            )
+        },
     }
 
 
@@ -161,7 +245,11 @@ def _summary_md(summary: dict[str, Any]) -> str:
         f"- usage 缺失: {summary['costs']['n_usage_missing']}",
         "",
     ]
-    for title, key in (("按能力线", "by_line"), ("按能力", "by_capability")):
+    for title, key in (
+        ("按能力线", "by_line"),
+        ("按能力", "by_capability"),
+        ("按质量标签（仅诊断，不过滤）", "by_quality_status"),
+    ):
         lines += [f"## {title}", "", "| 组 | n | judged | correct | acc | infra |", "|---|---|---|---|---|---|"]
         for name, b in summary["aggregate"][key].items():
             acc_cell = "n/a" if b["accuracy"] is None else f"{b['accuracy']:.1%}"
@@ -209,9 +297,7 @@ def score_run(
         if index >= len(questions):
             raise ConfigurationError(f"question_index={index} 超出题库范围 ({len(questions)})")
         question = questions[index]
-        expected_id = question.get("question_id") or hashlib.sha256(
-            question["question"].encode("utf-8")
-        ).hexdigest()[:16]
+        expected_id = question_id(question)
         if record.get("question_id") != expected_id:
             raise ConfigurationError(
                 f"question_index={index}: question_id 不一致（结果 {record.get('question_id')!r} "

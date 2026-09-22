@@ -1,6 +1,6 @@
 """Memory System Track runner。
 
-一个世界：把 `05_corpus.json` 按 session 顺序 ingest 进被测记忆系统，再对全部题目
+一个世界：把 benchmark 的公开材料按 session 顺序 ingest 进被测记忆系统，再对全部题目
 逐题 `retrieve()` → 统一答题 prompt 合成答案，逐题落 `results.jsonl`。
 
 职责边界（与 native 赛道一致）：
@@ -22,7 +22,6 @@
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import os
 import sys
@@ -34,6 +33,14 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from ..config import REPOSITORY_ROOT, ConfigurationError
+from ..artifacts import (
+    STANDARD_LIGHT_SCHEMA,
+    benchmark_schema,
+    load_benchmark_protocol,
+    load_benchmark_questions,
+    load_visible_documents,
+    question_id as benchmark_question_id,
+)
 from .native_cli import _profile_names, load_env_file
 
 RESULT_SCHEMA = "agent-harnesses.result/v1"
@@ -60,10 +67,7 @@ def _now_iso() -> str:
 
 
 def _question_id(question: Mapping[str, Any]) -> str:
-    return str(
-        question.get("question_id")
-        or hashlib.sha256(question["question"].encode("utf-8")).hexdigest()[:16]
-    )
+    return benchmark_question_id(dict(question))
 
 
 def _load_json(path: Path) -> Any:
@@ -360,6 +364,7 @@ def _base_record(index: int, question: Mapping[str, Any], system_id: str) -> dic
         "system_id": system_id,
         "question_id": _question_id(question),
         "question_index": index,
+        "quality_status": question.get("quality_status"),
         "status": "completed",
         "answer": None,
         "judgeable": False,
@@ -442,11 +447,18 @@ def run(
     factory["config"].BASE_URL = os.environ["OPENAI_BASE_URL"]
 
     benchmark_dir = Path(plan["benchmark"]["path"])
-    questions = _load_json(benchmark_dir / "06_grounded_questions.json")
-    if isinstance(questions, dict):
-        questions = questions.get("questions") or []
-    docs = factory["load_visible_corpus"](benchmark_dir / "05_corpus.json")
-    protocol = factory["load_public_protocol"](benchmark_dir / "00_about.json")
+    # Both tracks consume the same public benchmark view.  Standard-light
+    # deliberately exposes every labeled question; quality_status is metadata,
+    # never a selection filter.
+    questions = load_benchmark_questions(benchmark_dir)
+    if benchmark_schema(benchmark_dir) == STANDARD_LIGHT_SCHEMA:
+        docs = load_visible_documents(benchmark_dir)
+        protocol = load_benchmark_protocol(benchmark_dir)
+    else:
+        # Preserve the factory-native adapter seam for existing systems/tests;
+        # standard-light has no legacy factory loader and uses the shared view.
+        docs = factory["load_visible_corpus"](benchmark_dir / "05_corpus.json")
+        protocol = factory["load_public_protocol"](benchmark_dir / "00_about.json")
     sessions = _sessions_from_docs(docs)
     evaluation_context = factory["make_evaluation_context"](docs, protocol)
 

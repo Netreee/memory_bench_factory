@@ -83,6 +83,7 @@ Linux/macOS 将解释器路径改为 `./venv/bin/python`，复制命令改为 `c
 
 - `pipeline/`：唯一生产流水线及 L1–L10 能力线。
 - `eval/`：用发布子集评测记忆系统。
+- `agent_harnesses/`：Native Agent Track 与 Memory System Track 的活动评测控制面。
 - `seeds/`：结构化 seed。
 - `tools/`：校验、批量运行、恢复、监控和导出工具。
 - `tests/`：离线回归与故障注入。
