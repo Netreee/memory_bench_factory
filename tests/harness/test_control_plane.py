@@ -23,6 +23,8 @@ from agent_harnesses.planning import (
     run_fingerprint,
 )
 from agent_harnesses.execution import execute
+from agent_harnesses.runners.diagnostic import run as run_diagnostic
+from standard_light_fixture import build_standard_light
 
 
 # 测试夹具：office 历史候选快照(filtered, UNMET)。benchmark 数据不随仓库整体分发，
@@ -34,6 +36,42 @@ DIAGNOSTIC_TEMPLATE = (
 
 
 class ArtifactTests(unittest.TestCase):
+    def test_standard_light_validates_manifest_and_keeps_all_statuses(self):
+        questions = [
+            {"qid": "q-release", "question": "状态？", "line": "L1", "capability": "KU", "quality_status": "released"},
+            {"qid": "q-reject", "question": "未知项？", "line": "L6", "capability": "L6_refusal", "quality_status": "rejected"},
+        ]
+        references = [
+            {"qid": "q-release", "answer": "进行中", "answer_raw": "进行中", "answer_projection": "raw_gt", "quality_status": "released"},
+            {"qid": "q-reject", "answer": "查无此记录", "answer_raw": "INSUFFICIENT_EVIDENCE", "answer_projection": "abstention:never_known", "quality_status": "rejected"},
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = build_standard_light(Path(tmp), questions, references)
+            inspection = inspect_benchmark(BenchmarkRef(root, False, "as_provided"))
+            self.assertEqual(inspection.schema, "memory-bench-standard-light/v1")
+            self.assertEqual(inspection.n_questions, 2)
+            self.assertEqual(len(inspection.files), 6)
+
+            out = Path(tmp) / "diagnostic"
+            summary = run_diagnostic(root, out)
+            self.assertEqual(summary["n_questions_checked"], 2)
+            rows = [json.loads(line) for line in (out / "results.jsonl").read_text().splitlines()]
+            self.assertEqual([row["question_id"] for row in rows], ["q-release", "q-reject"])
+            self.assertEqual([row["quality_status"] for row in rows], ["released", "rejected"])
+
+    def test_standard_light_rejects_tampered_declared_file(self):
+        questions = [
+            {"qid": "q1", "question": "状态？", "line": "L1", "capability": "KU", "quality_status": "released"}
+        ]
+        references = [
+            {"qid": "q1", "answer": "进行中", "answer_raw": "进行中", "answer_projection": "raw_gt", "quality_status": "released"}
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = build_standard_light(Path(tmp), questions, references)
+            (root / "public" / "protocol.txt").write_text("tampered\n", encoding="utf-8")
+            with self.assertRaisesRegex(ConfigurationError, "身份不匹配"):
+                inspect_benchmark(BenchmarkRef(root, False, "as_provided"))
+
     def test_benchmark_can_live_outside_repository_input(self):
         with tempfile.TemporaryDirectory() as tmp:
             external = Path(tmp) / "factory-output" / "benchmark-a"

@@ -21,10 +21,16 @@ from typing import Any, Mapping
 from urllib.parse import urlsplit
 
 from .. import boundaries, events
+from ..artifacts import (
+    load_benchmark_protocol,
+    load_benchmark_questions,
+    load_benchmark_sessions,
+    question_id as benchmark_question_id,
+)
 from ..config import CONFIG_ROOT, REPOSITORY_ROOT, ConfigurationError, SystemConfig
 
 
-NATIVE_CLI_ADAPTER_VERSION = "native-cli-smoke-v9"
+NATIVE_CLI_ADAPTER_VERSION = "native-cli-smoke-v10"
 SECRETS_ENV_FILE = REPOSITORY_ROOT / "configs" / "env" / "secrets.env"
 # dsh 的 profile 是仓库钉住的配置（不是 Python 包数据）：它声明该 harness 启动哪些
 # dsh bundle，跟着根 package.json 的 @deepseek-ai/dsh pin 解析。每次 run 复制进
@@ -269,13 +275,11 @@ def _safe_name(value: str, fallback: str) -> str:
 
 
 def _corpus_sessions(run_dir: Path) -> list[Mapping[str, Any]]:
-    corpus_obj = json.loads((run_dir / "05_corpus.json").read_text(encoding="utf-8"))
-    corpus = corpus_obj.get("corpus", corpus_obj)
-    return corpus["sessions"]
+    return load_benchmark_sessions(run_dir)
 
 
 def _materialize_workspace(run_dir: Path, workspace: Path) -> tuple[int, int]:
-    """把 05_corpus.json 物化成 agent 唯一可见的工作区。
+    """把 benchmark 的公开材料物化成 agent 唯一可见的工作区。
 
     工作区根目录**只有** `INDEX.md` 与 `sessions/`：不写 `AGENTS.md`/`CLAUDE.md`。
     这两类文件名会被 codex/dsh（以及 dsh 的候选列表）当作项目指令自动加载，
@@ -313,11 +317,7 @@ def _materialize_workspace(run_dir: Path, workspace: Path) -> tuple[int, int]:
 
 
 def _render_protocol(run_dir: Path) -> str:
-    about = json.loads((run_dir / "00_about.json").read_text(encoding="utf-8"))
-    protocol = about["answer_protocol"]
-    lines = ["Answer protocol:"]
-    lines.extend(f"- {rule}" for rule in protocol.get("rules", []))
-    return "\n".join(lines)
+    return load_benchmark_protocol(run_dir)
 
 
 def _prompt(protocol: str, question: str) -> str:
@@ -678,10 +678,7 @@ def _load_done(results_path: Path) -> dict[str, dict]:
 
 
 def _question_id(question: Mapping[str, Any]) -> str:
-    return str(
-        question.get("question_id")
-        or hashlib.sha256(question["question"].encode("utf-8")).hexdigest()[:16]
-    )
+    return benchmark_question_id(dict(question))
 
 
 def _now_iso() -> str:
@@ -838,10 +835,7 @@ def _run_questions(
         for question_id, record in done.items()
         if record.get("status") == "completed"
     }
-    question_obj = json.loads(
-        (run_dir / "06_grounded_questions.json").read_text(encoding="utf-8")
-    )
-    questions = question_obj if isinstance(question_obj, list) else question_obj["questions"]
+    questions = load_benchmark_questions(run_dir)
     limited = questions[:limit] if limit else questions
     indexed_all = [(index, question) for index, question in enumerate(limited)]
     remaining = [
@@ -951,6 +945,7 @@ def _run_questions(
                     "schema": "agent-harnesses.result/v1",
                     "question_id": question_id,
                     "question_index": index,
+                    "quality_status": question.get("quality_status"),
                     "status": "completed" if not error_type else "failed",
                     "answer": answer or None,
                     "judgeable": False,
@@ -995,6 +990,7 @@ def _run_questions(
                     out_dir=out_dir,
                     raw_dir=raw_dir,
                     events_path=events_path,
+                    extra={"quality_status": question.get("quality_status")},
                 )
                 with results_path.open("a", encoding="utf-8") as results:
                     results.write(json.dumps(record, ensure_ascii=False) + "\n")
@@ -1092,7 +1088,7 @@ def run(
 ) -> dict[str, Any]:
     """跑完一次 smoke，并把 output 目录收敛成「只留实验结果」。
 
-    `workspace/`（由 05_corpus.json 确定性物化）与 `runtime/`（各 CLI 的 home、sqlite
+    `workspace/`（由公开 material 确定性物化）与 `runtime/`（各 CLI 的 home、sqlite
     日志、session 缓存、node_modules 链接等）只是运行期临时区：既不是实验结果，也
     能从 benchmark + adapter 版本重建。默认在 run 结束后删除，`keep_scratch=True`
     时保留用于排障。

@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping
 from urllib.parse import urlsplit
 
-DETECTOR_VERSION = "native-boundary-v1"
+DETECTOR_VERSION = "native-boundary-v2"
 
 # 写类工具名（小写比较）。只列确定的，不在列表里的一律 neutral。
 WRITE_TOOLS = frozenset(
@@ -91,6 +91,7 @@ _SYSTEM_BIN_PREFIXES = (
 
 _SENSITIVE_NAME = re.compile(
     r"0[0-9]_[a-z_]*questions|grounded_questions|grounding|00_about|manifest\.json|"
+    r"references[/\\]questions|private[/\\]world|public[/\\]questions|"
     r"judge|gold|witness|secrets?\.env",
     re.IGNORECASE,
 )
