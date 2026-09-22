@@ -19,6 +19,7 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Mapping
+from urllib.parse import urlsplit
 
 from .config import REPOSITORY_ROOT, ConfigurationError
 
@@ -42,7 +43,7 @@ def resolve_factory_root(judge_cfg: Mapping[str, Any] | None = None) -> Path:
     return root
 
 
-def judge_version(root: Path) -> dict[str, Any]:
+def judge_version(root: Path, module: Any | None = None) -> dict[str, Any]:
     judge_file = root / _JUDGE_RELPATH
     sha = hashlib.sha256(judge_file.read_bytes()).hexdigest()[:16]
     commit = None
@@ -57,7 +58,26 @@ def judge_version(root: Path) -> dict[str, Any]:
         commit = result.stdout.strip() or None
     except (OSError, subprocess.TimeoutExpired):
         pass
-    return {"factory_root": str(root), "factory_commit": commit, "judge_sha256": sha}
+    model = None
+    endpoint_host = None
+    endpoint_fingerprint = None
+    config = getattr(module, "config", None) if module is not None else None
+    if config is not None:
+        model = str(getattr(config, "JUDGE_MODEL", "") or "") or None
+        base_url = str(getattr(config, "BASE_URL", "") or "").strip()
+        if base_url:
+            endpoint_host = urlsplit(base_url).hostname
+            endpoint_fingerprint = hashlib.sha256(
+                base_url.rstrip("/").encode("utf-8")
+            ).hexdigest()[:16]
+    return {
+        "factory_root": str(root),
+        "factory_commit": commit,
+        "judge_sha256": sha,
+        "judge_model": model,
+        "judge_endpoint_host": endpoint_host,
+        "judge_endpoint_fingerprint": endpoint_fingerprint,
+    }
 
 
 class Judge:
@@ -104,4 +124,4 @@ def load_judge(root: Path) -> Judge:
     except Exception as exc:
         sys.modules.pop(spec.name, None)
         raise ConfigurationError(f"工厂 judge 模块加载失败: {judge_file}: {exc}") from exc
-    return Judge(module, judge_version(root))
+    return Judge(module, judge_version(root, module))

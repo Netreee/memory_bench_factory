@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from .artifacts import (
-    ANSWER_PROJECTIONS,
     STANDARD_LIGHT_SCHEMA,
     benchmark_schema,
     load_benchmark_questions,
@@ -62,21 +61,15 @@ def _standard_scoring_fields(public: dict, reference: dict) -> dict[str, Any]:
     """Map standard-light references onto the current factory judge contract.
 
     This is deliberately evaluator-side: the exported public question remains
-    untouched, while `answer_raw` is the scoring truth and `answer_projection`
-    tells us how to interpret it.  The generated contract is provisional until
-    the factory ships an explicit grading contract in its export.
+    untouched.  Per the evaluation protocol, `answer` is the sole scoring truth;
+    `answer_raw` and `answer_projection` are not consulted.  The generated
+    contract only adapts that public reference value to the existing
+    capability-aware factory judge's expected shape.
     """
     capability = public.get("capability")
-    projection = reference.get("answer_projection")
-    raw = reference.get("answer_raw")
-    if projection not in ANSWER_PROJECTIONS:
-        raise ConfigurationError(f"不支持的 answer_projection: {projection!r}")
-    if projection == "gt/value" and not isinstance(raw, dict):
-        raise ConfigurationError("gt/value 的 answer_raw 必须是 object")
-    if projection == "abstention:never_known" and raw != "INSUFFICIENT_EVIDENCE":
-        raise ConfigurationError(
-            "abstention:never_known 的 answer_raw 必须是 INSUFFICIENT_EVIDENCE"
-        )
+    answer = reference.get("answer")
+    if answer is None:
+        raise ConfigurationError("references/questions.json.answer 不能为空")
     answer_kind = "value"
     contract: dict[str, Any] = {
         "version": 1,
@@ -86,8 +79,8 @@ def _standard_scoring_fields(public: dict, reference: dict) -> dict[str, Any]:
         "scoring_scope": "primary_answer",
     }
     aux: dict[str, Any] = {}
-    if projection == "abstention:never_known":
-        contract.update(answer_kind="abstention", abstention_kind="never_known")
+    if capability in {"L6_refusal", "FORGET", "ABS"}:
+        contract["answer_kind"] = "abstention"
     elif capability == "L3_order":
         contract["answer_kind"] = "order"
     elif capability == "TR":
@@ -97,14 +90,19 @@ def _standard_scoring_fields(public: dict, reference: dict) -> dict[str, Any]:
         # export only carries the canonical answer, so use an explicit sentinel
         # as the second closed-set member without inventing another valid label.
         contract["answer_kind"] = "enum"
-        aux["states"] = [raw, "__STANDARD_LIGHT_OTHER__"]
+        aux["states"] = [answer, "__STANDARD_LIGHT_OTHER__"]
+
+    # IE/MR are represented as {value: ...} by the legacy capability judge.
+    # Wrapping is an evaluator adapter detail; the source of truth remains the
+    # exported `answer` value and no field from `answer_raw` is copied.
+    gt = {"value": answer} if capability in {"IE", "MR"} else answer
 
     return {
-        "gt": raw,
+        "gt": gt,
         "aux": aux,
         "question_contract": contract,
-        "answer_projection": projection,
-        "reference_answer": reference.get("answer"),
+        "reference_answer": answer,
+        "truth_source": "references/questions.json.answer",
         "_benchmark_schema": STANDARD_LIGHT_SCHEMA,
     }
 
@@ -137,7 +135,8 @@ def _score_record(
     out["entity"] = question.get("entity")
     out["field"] = question.get("field")
     out["quality_status"] = question.get("quality_status")
-    out["answer_projection"] = question.get("answer_projection")
+    out["truth_source"] = question.get("truth_source")
+    out["reference_answer"] = question.get("reference_answer")
     out["gold"] = judge.gold_display(question)
     judge_info: dict[str, Any] = {
         "version": judge.version,
