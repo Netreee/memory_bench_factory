@@ -113,7 +113,7 @@ def _build_out_dir(root: Path) -> Path:
 
 
 class ScoringTests(unittest.TestCase):
-    def test_standard_light_scores_all_quality_statuses_from_raw_truth(self):
+    def test_standard_light_scores_all_quality_statuses_from_answer_truth(self):
         questions = [
             {"qid": "q-release", "question": "状态？", "line": "L1", "capability": "IE", "quality_status": "released"},
             {"qid": "q-reject", "question": "未知项？", "line": "L6", "capability": "L6_refusal", "quality_status": "rejected"},
@@ -169,6 +169,17 @@ class ScoringTests(unittest.TestCase):
                 set(summary["aggregate"]["by_quality_status"]),
                 {"released", "rejected", "pending_review"},
             )
+            judged = [
+                json.loads(line)
+                for line in (out / "judged.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            self.assertTrue(
+                all(
+                    row["truth_source"] == "references/questions.json.answer"
+                    for row in judged
+                )
+            )
+            self.assertEqual(judged[0]["reference_answer"], "进行中")
 
     def test_score_run_end_to_end_offline(self):
         with tempfile.TemporaryDirectory() as tmp:
