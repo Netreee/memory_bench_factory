@@ -73,6 +73,7 @@ def _env_snapshot() -> dict:
                 "reviewer_model": config.REVIEWER_MODEL,
                 "judge_model": config.JUDGE_MODEL,
                 "llm_concurrency": config.LLM_CONCURRENCY,
+                "reasoning_effort": config.REASONING_EFFORT,
                 "base_url": config.BASE_URL or ""}
     except Exception:
         return {}

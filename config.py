@@ -58,6 +58,8 @@ LLM_CONCURRENCY = int(os.getenv("LLM_CONCURRENCY", "8"))
 _LLM_SEM = threading.BoundedSemaphore(LLM_CONCURRENCY)
 DEADLINE_S = int(os.getenv("LLM_DEADLINE_S", "600"))
 MIN_COMPLETION_TOKENS = int(os.getenv("LLM_MIN_COMPLETION_TOKENS", "0"))
+# Optional ordinary-call override; explicit transport profiles retain precedence.
+REASONING_EFFORT = os.getenv("LLM_REASONING_EFFORT", "").strip()
 
 
 class CompletionOutputError(ValueError):
@@ -290,6 +292,14 @@ def chat(messages, temperature=0.7, top_p=1.0, max_tokens=4096, model=None, *, r
             request_parameters["top_p"] = top_p
         if response_format is not None:
             request_parameters["response_format"] = response_format
+        if REASONING_EFFORT:
+            from llm_transport import RUN_MODEL_CAPABILITIES
+            capability = RUN_MODEL_CAPABILITIES.get(effective_model)
+            allowed = capability["reasoning_efforts"] if capability is not None else ()
+            if REASONING_EFFORT not in allowed:
+                raise ValueError(f"LLM_REASONING_EFFORT={REASONING_EFFORT!r} is unsupported for "
+                                 f"model {effective_model!r}; supported values: {allowed}")
+            request_parameters["reasoning_effort"] = REASONING_EFFORT
     else:
         from llm_transport import validate_transport, resolve_profile, build_request_parameters
         transport = validate_transport(transport)

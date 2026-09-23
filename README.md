@@ -47,6 +47,8 @@ cp configs/env/secrets.env.example configs/env/secrets.env
 `DEEPSEEK_API_KEY`、`DEEPSEEK_BASE_URL`。示例值需要替换，所选接口须支持
 `examples/release_four.json` 中的模型和协议。真实配置文件和运行输出均被 Git 忽略。
 
+普通生成调用可设置 `LLM_REASONING_EFFORT=low`（如 `glm-5.3-flash`）；仅接受 `llm_transport.RUN_MODEL_CAPABILITIES` 声明的模型与强度，保留原 token 和超时参数，逐调用显式 transport 优先。
+
 安装仓库固定版本的两个原生 CLI（两种系统使用同一 npm 命令）：
 
 ```text
