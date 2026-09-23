@@ -44,6 +44,8 @@ class NativeTrackAdapter(TrackAdapter):
         if system.runner == "native_cli":
             command = [
                 sys.executable,
+                "-X",
+                "utf8",
                 "-m",
                 "agent_harnesses.runners.native_cli",
                 "--plan",

@@ -114,6 +114,21 @@ def _digest(value) -> str:
                                      allow_nan=False).encode()).hexdigest()
 
 
+def preflight_release(settings: dict, log=print) -> dict:
+    """Read-only local checks for the release tail before costly generation.
+
+    Imported results are validated against the actual generated inputs in the
+    existing importer. They require neither local athlete CLIs nor judge keys.
+    """
+    if settings.get("backend") != "native_four":
+        return {"ok": True, "mode": "legacy"}
+    if "result_dirs" in settings:
+        log("  ⓘ 发布评测使用已有结果，跳过本地选手及裁判运行环境检查")
+        return {"ok": True, "mode": "import", "remote_access_verified": False}
+    from pipeline.native_evaluation import preflight_native_runtime
+    return preflight_native_runtime(settings, log=log)
+
+
 def _file_hash(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:

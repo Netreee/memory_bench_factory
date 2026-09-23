@@ -137,6 +137,15 @@ class ReleasePipelineTest(TestCase):
             drive(self.run, self.tail(), only="selection")
         self.assertEqual(len(self.calls), 40)
 
+    def test_expanded_corpus_invalidates_scores_from_old_material(self):
+        drive(self.run, self.tail())
+        corpus = self.run.read("05_corpus.json")
+        body = corpus.get("corpus", corpus)
+        body["sessions"][0]["docs"].append({"doc_id": "extra-haystack", "content": "新增周边材料", "is_filler": True})
+        self.run.write("05_corpus.json", corpus)
+        self.assertFalse(c.calibration_is_current(self.run))
+        self.assertFalse(c.selection_is_current(self.run))
+
 
 if __name__ == "__main__":
     main()

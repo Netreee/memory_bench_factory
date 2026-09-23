@@ -212,6 +212,30 @@ class CorpusReviewExecutionTests(unittest.TestCase):
         self.assertEqual(steps[-1], "render.signal")  # preserved in-flight response
         self.assertEqual(self.corpus, {"sessions": []})
 
+    def test_failed_period_is_checkpointed_as_missing_while_other_periods_finish(self):
+        ws = WorldState(entities={"测试报告": {"状态": Timeline([
+            Op(0, _date_of(0), SET, "待接收")])}}, n_sessions=2)
+
+        def provider(messages, **kwargs):
+            system = messages[0]["content"]
+            if system in (REVIEW_SYSTEM, LOCATOR_REPAIR_SYSTEM):
+                payload = json.loads(messages[-1]["content"])
+                if payload["CANON"]["as_of"]["session"] == 0:
+                    raise TimeoutError("period-local offline provider deadline")
+                return opinion(payload)
+            if system == render("discriminate.quality_system"):
+                return {"answers": [{"key": "q0", "answer": "待接收"}]}
+            return {"docs": [{"title": "当期记录", "type": "纪要",
+                              "content": "测试报告的状态为待接收。"}]}
+
+        with patch.object(config, "chat_json", side_effect=provider):
+            with self.assertRaises(CorpusReviewExecutionError):
+                self.run_render(ws)
+
+        self.assertEqual(self.done, {1})
+        self.assertEqual([item["session_id"] for item in self.corpus["sessions"]], [1])
+        self.assertTrue(self.saved)
+
     def test_as_of_world_change_invalidates_previous_receipt(self):
         ws = world()
         docs = [{"doc_id": "d1", "content": "测试报告状态为待接收。"}]

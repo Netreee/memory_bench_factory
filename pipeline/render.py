@@ -4,7 +4,7 @@ pipeline.render —— 文本渲染层(从 run_factory_v2 拆出,行为不变)�
 """
 from __future__ import annotations
 import json, re, threading, sys
-from math import ceil
+from math import ceil, isfinite
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))   # 允许 `python pipeline/render.py` 直跑(找到根目录 config)
@@ -179,6 +179,98 @@ def _filler_documents_per_session(wp, target_tokens: int, n_sessions: int) -> in
     requested = plan.get("filler_documents_per_session") if isinstance(plan, dict) else None
     planned_floor = min(12, max(0, requested)) if type(requested) is int else 0
     return max(token_floor, planned_floor)
+
+
+def corpus_scale(corpus, target_chars=0, haystack_ratio=None):
+    """Measure accepted body characters; this is not a tokenizer estimate."""
+    if haystack_ratio is not None and (not isfinite(haystack_ratio) or haystack_ratio < 0):
+        raise ValueError("haystack_ratio must be finite and nonnegative")
+    docs = [d for s in corpus.get("sessions", []) for d in s.get("docs", [])]
+    total = sum(len(d.get("content", "")) for d in docs)
+    filler = sum(len(d.get("content", "")) for d in docs if d.get("is_filler") is True)
+    rest = total - filler
+    required = max(ceil((haystack_ratio or 0) * rest), target_chars - rest, 0)
+    return {"unit": "characters", "target_chars": target_chars,
+            "haystack_ratio": haystack_ratio, "documents": len(docs),
+            "filler_documents": sum(d.get("is_filler") is True for d in docs),
+            "total_chars": total, "filler_chars": filler, "other_chars": rest,
+            "filler_share": filler / total if total else 0,
+            "required_filler_chars": required, "deficit_chars": max(0, required - filler),
+            "target_met": filler >= required}
+
+
+def _top_up_haystack(corpus, target_chars, ratio, tracer, system, blocked,
+                    time_unit, save_cb, log=print):
+    """Append bounded batches; preserve every accepted sibling before errors."""
+    stats = corpus_scale(corpus, target_chars, ratio)
+    sessions = corpus.get("sessions", [])
+    if stats["target_met"] or not sessions:
+        return
+    # Initial estimate gives a finite call allowance even for very short output.
+    average = stats["filler_chars"] / max(1, stats["filler_documents"])
+    estimate = max(400, min(1200, average or 800))
+    allowance = 2 * ceil(stats["deficit_chars"] / estimate) + 8
+    used, cursor = 0, 0
+    known = {str(d.get("doc_id")) for s in sessions for d in s.get("docs", [])}
+    while not stats["target_met"] and used < allowance:
+        count = min(8, allowance - used, max(1, ceil(stats["deficit_chars"] / estimate)))
+        jobs = []
+        for _ in range(count):
+            session = sessions[cursor % len(sessions)]
+            cursor += 1
+            sid = session["session_id"]
+            slot = len(session.get("docs", [])) + cursor
+            jobs.append((session, slot))
+
+        def write_one(job):
+            session, slot = job
+            try:
+                out = tracer.chat_text("render.filler",
+                    [{"role": "system", "content": system},
+                     {"role": "user", "content": render("filler.user", s=week_label(session["session_id"]),
+                                time_unit=time_unit, date=session.get("date", ""), slot=slot)}],
+                    temperature=0.9, max_tokens=FILLER_TEXT_MAX_TOKENS)
+                # The tracer represents transport/budget failures as records.
+                # Stop this pass after saving siblings; retry belongs to resume.
+                if isinstance(out, dict) and "__error__" in out:
+                    return session, [], RuntimeError(str(out["__error__"]))
+                try:
+                    return session, _accept_filler_text(out, blocked), None
+                except RuntimeError:
+                    return session, [], None
+            except Exception as exc:
+                return session, [], exc
+
+        rows = config.pmap(write_one, jobs, workers=8)
+        used += count
+        accepted, errors = 0, []
+        for session, docs, error in rows:
+            if error is not None:
+                errors.append(error)
+            for doc in docs:
+                index = len(session["docs"])
+                doc_id = f"s{session['session_id']}_fil_topup_{index}"
+                while doc_id in known:
+                    index += 1
+                    doc_id = f"s{session['session_id']}_fil_topup_{index}"
+                known.add(doc_id)
+                doc.update(doc_id=doc_id, is_filler=True, fact_refs=[])
+                session["docs"].append(doc)
+                accepted += 1
+        if accepted:
+            save_cb()
+        stats = corpus_scale(corpus, target_chars, ratio)
+        log(f"  草堆补量:本批接受 {accepted}/{count} 篇，总字符 {stats['total_chars']}，"
+            f"草堆占比 {stats['filler_share']:.1%}，尚缺 {stats['deficit_chars']} 字")
+        if errors:
+            raise errors[0]
+        if not accepted:
+            break
+        average = stats["filler_chars"] / max(1, stats["filler_documents"])
+        estimate = max(400, min(1200, average or 800))
+    if not stats["target_met"]:
+        log(f"  ⚠ 语料规模目标未达成，保留已生成正文；欠额 {stats['deficit_chars']} 字，"
+            f"本次补量调用 {used}/{allowance}")
 
 
 def _session_facts(ws, s):
@@ -589,12 +681,14 @@ class _CorpusReviewCallGuard:
 
 
 def render_corpus(wp, ws, target_tokens, tracer, corpus, done_weeks, save_cb, log=print,
-                  only_entities=None, only_entity_sessions=None):
+                  only_entities=None, only_entity_sessions=None, haystack_ratio=None):
     """only_entities=None:全量渲(每周全实体+filler)。
     only_entities=set:★增量 delta(§10.1)——【只渲这些新实体的 signal】并【追加】到已有周 docs,
-    ``only_entity_sessions`` 精确补渲被新关系/事件改变的旧实体周；不重灌 filler。"""
+    ``only_entity_sessions`` 精确补渲被新关系/事件改变的旧实体周；haystack_ratio
+    显式设置时，所有正文验收后只追加尚缺的 filler。"""
     if target_tokens < 0:
         raise ValueError("语料规模不能为负数")
+    corpus_scale(corpus, target_tokens, haystack_ratio)
     story_ledger = getattr(ws, "narrative", None) or {}
     quality_enabled = bool((wp.get("quality_contract") or {}).get("corpus_review"))
     from pipeline.corpus_contract import (canonical_context, review_documents, attach_receipts,
@@ -611,8 +705,11 @@ def render_corpus(wp, ws, target_tokens, tracer, corpus, done_weeks, save_cb, lo
             raise ValueError(f"Public disclosure plan is invalid: {issues}")
         if not quality_enabled:
             raise ValueError("Public disclosure rendering requires the original semantic corpus review")
-    review_guard = _CorpusReviewCallGuard(tracer)
-    tracer = review_guard
+    # A review execution failure belongs to one independently rendered period.
+    # Keep the existing guard inside that period so already-admitted sibling
+    # calls can finish without dispatching follow-ups, but do not let one bad
+    # period cancel every other period in the same corpus pass.
+    base_tracer = tracer
     story_scenes = replay_story_ledger(ws, story_ledger) if story_ledger else []
     profile = wp.get("domain_profile", {})
     blueprint = getattr(ws, "world_blueprint", None) or wp.get("world_blueprint") or {}
@@ -642,6 +739,8 @@ def render_corpus(wp, ws, target_tokens, tracer, corpus, done_weeks, save_cb, lo
     fallback_count: list[int] = []                        # 耗尽兜底计数(list.append 线程安全;验收要求趋零)
 
     def _render_week(s):                                  # ★一周的全部渲染 = 一个并行单元
+        review_guard = _CorpusReviewCallGuard(base_tracer)
+        tracer = review_guard
         date = _date_of(s, step_days=step_days)
         review_context = canonical_context(ws, s)
         facts = _session_facts(ws, s)
@@ -931,6 +1030,10 @@ def render_corpus(wp, ws, target_tokens, tracer, corpus, done_weeks, save_cb, lo
 
         sig_lists = config.pmap(render_signal_with_checkpoint, sig_groups, workers=4)
         review_guard.check()
+        # Never hold the corpus commit lock across network calls. Four periods
+        # may render concurrently; two filler workers per period bound fan-out.
+        fil_lists = config.pmap(_render_fil, list(range(n_batches)), workers=2) if not delta_mode else []
+        conflict_docs = _render_conflict_docs(ws, s, date, tracer) if not delta_mode else []
         with lock:                                         # 周乱序完成 → 锁内更新+逐周存盘(断点续渲不丢)
             if delta_mode:                                 # ★delta:追加结构变化 signal,接着编号;不灌 filler/conflict
                 docs = list(by_id.get(s, {}).get("docs", []))
@@ -940,7 +1043,6 @@ def render_corpus(wp, ws, target_tokens, tracer, corpus, done_weeks, save_cb, lo
                         d["doc_id"] = f"s{s}_sig_{base}"; base += 1; docs.append(d)
                 by_id[s] = {"session_id": s, "date": date, "docs": docs}   # 旧 docs 原样保留,只增量
             else:                                          # 全量:本周 signal + filler + 小道矛盾,整周写入
-                fil_lists = config.pmap(_render_fil, list(range(n_batches)), workers=8)
                 if filler_failures:
                     log(f"  ⚠{time_unit}{week_label(s)} filler 缺失 {len(filler_failures)}/{n_batches}:"
                         f"{filler_failures[:2]}")
@@ -951,7 +1053,7 @@ def render_corpus(wp, ws, target_tokens, tracer, corpus, done_weeks, save_cb, lo
                 for fl in fil_lists:
                     for d in fl:
                         d.update({"doc_id": f"s{s}_fil_{len(docs)}", "is_filler": True, "fact_refs": []}); docs.append(d)
-                for d in _render_conflict_docs(ws, s, date, tracer):      # ★L5:本周小道矛盾文档(非 L5 场景为空)
+                for d in conflict_docs:                                # ★L5:本周小道矛盾文档(非 L5 场景为空)
                     d.update({"doc_id": f"s{s}_conf_{len(docs)}", "is_conflict": True, "fact_refs": []}); docs.append(d)
                 for d in _render_sensitive_docs(ws, s, date):             # ★L10:本周敏感写入文档(确定性模板,X 逐字就近;非 L10 场景为空)
                     d.update({"doc_id": f"s{s}_sens_{len(docs)}", "is_sensitive": True, "fact_refs": []}); docs.append(d)
@@ -966,8 +1068,26 @@ def render_corpus(wp, ws, target_tokens, tracer, corpus, done_weeks, save_cb, lo
             log(f"  [{time_unit} {week_label(s)} ✓{tag} {len(done_weeks)}/{n_sessions}] 累计 {sum(len(x['docs']) for x in corpus['sessions'])} 篇 / {ch/1e6:.2f}M 字")
         return s
 
-    config.pmap(_render_week, weeks, workers=max(1, min(4, len(weeks))))  # Bound queued week/group memory too.
-    review_guard.check()
+    period_failures = []
+    period_failure_lock = threading.Lock()
+
+    def _render_week_isolated(s):
+        try:
+            return _render_week(s)
+        except CorpusReviewExecutionError as exc:
+            # The exact failed review is already present in the tracer.  Keep
+            # the period absent from done_weeks, allow the remaining periods to
+            # finish and checkpoint, then fail the stage once with the original
+            # typed error so the normal partial-corpus recovery path is used.
+            with period_failure_lock:
+                period_failures.append((s, exc))
+            log(f"  ⚠{time_unit}{week_label(s)}语料审阅执行失败；本期保持待补，其他期继续")
+            return None
+
+    config.pmap(_render_week_isolated, weeks, workers=max(1, min(4, len(weeks))))  # Bound queued week/group memory too.
+    if period_failures:
+        period_failures.sort(key=lambda item: item[0])
+        raise period_failures[0][1]
     if _render_public_stage_material(wp, ws, tracer, corpus):
         save_cb()
     sanitized = _sanitize_corpus(corpus, ws, profile, semantic=quality_enabled)
@@ -1008,8 +1128,11 @@ def render_corpus(wp, ws, target_tokens, tracer, corpus, done_weeks, save_cb, lo
             f"弃无引用信号 {sanitized['dropped_unref']} 篇 / "
             f"清理扩容后撞词 filler {sanitized['dropped_filler_leaks']} 篇 / "
             f"清理凭据形态 filler {sanitized['dropped_filler_credentials']} 篇")
+    if haystack_ratio is not None:
+        _top_up_haystack(corpus, target_tokens, haystack_ratio, base_tracer,
+                        sys_fil, blocked, time_unit, save_cb, log)
     ch = sum(len(dd.get("content", "")) for x in corpus["sessions"] for dd in x["docs"])
-    if ch < target_tokens:
+    if ch < target_tokens and haystack_ratio is None:
         save_cb()
         raise RuntimeError(
             f"语料字符不足:{ch}/{target_tokens}；filler 可单篇缺失，但总规模合同不允许欠账")

@@ -8,11 +8,12 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
-from types import FunctionType
+from types import FunctionType, SimpleNamespace
 from typing import Any
+from urllib.parse import urlsplit
 
 from agent_harnesses.artifacts import inspect_benchmark
-from agent_harnesses.config import CONFIG_ROOT, REPOSITORY_ROOT, ConfigurationError, load_experiment, load_registry, resolve_systems
+from agent_harnesses.config import CONFIG_ROOT, REPOSITORY_ROOT, ConfigurationError, load_experiment, load_registry, resolve_systems, _targets_for
 from agent_harnesses.execution import command_for, execute_many, preflight_all
 from agent_harnesses.judging import load_judge
 from agent_harnesses.planning import fingerprint, make_plans
@@ -39,6 +40,71 @@ def _positive(settings: dict, name: str, default: int) -> int:
     if type(value) is not int or value < 1:
         raise ValueError(f"native evaluation {name} must be a positive integer")
     return value
+
+
+def preflight_native_runtime(settings: dict, log=print) -> dict:
+    """Check local CLI/profile/judge configuration before generation, with no API calls.
+
+    The ordinary benchmark-dependent preflight still runs after generation.
+    Native CLI --version and the existing judge loader only inspect local state;
+    successful checks do not establish remote connectivity or model access.
+    """
+    from agent_harnesses.runners.native_cli import preflight_system
+
+    targets = _targets_for(settings.get("targets"))
+    if len(targets) != 4 or len({(t.system_id, t.model_id) for t in targets}) != 4:
+        raise ConfigurationError("native_four requires four distinct system/model targets")
+    model = settings.get("judge_model")
+    if not isinstance(model, str) or not model.strip():
+        raise ConfigurationError("native_four requires an explicit judge_model")
+    for key, default in (("max_judge_calls", 2000), ("workers", 4),
+                         ("parallel_targets", 2), ("timeout_s", 600)):
+        _positive(settings, key, default)
+    systems = resolve_systems(SimpleNamespace(track="native", targets=targets, answering_model=None),
+        load_registry(Path(settings.get("config_root") or CONFIG_ROOT)))
+    reports = {}
+    for target, system in zip(targets, systems):
+        if system.runner != "native_cli" or system.role != "benchmark" or not system.executable:
+            raise ConfigurationError(f"{target.target_id}: release requires an executable benchmark native_cli system")
+        report = preflight_system(system, target.model_dict())
+        report.setdefault("runtime_options", {})["timeout_s"] = settings.get("timeout_s", 600)
+        reports[target.target_id] = report
+
+    judge_report = {"model": model, "ok": False, "errors": []}
+    try:
+        judge = load_judge(REPOSITORY_ROOT)
+        source = judge._module.config
+        if not str(getattr(source, "API_KEY", "") or "").strip():
+            judge_report["errors"].append("裁判缺少 OPENAI_API_KEY，请配置项目 .env 或环境变量")
+        endpoint = str(getattr(source, "BASE_URL", "") or "").strip()
+        if endpoint:
+            parsed = urlsplit(endpoint)
+            if parsed.scheme not in {"http", "https"} or not parsed.hostname or parsed.username or parsed.password:
+                judge_report["errors"].append("裁判 OPENAI_BASE_URL 必须是未内嵌凭据的 http(s) URL")
+            else:
+                judge_report["endpoint_host"] = parsed.hostname
+        else:
+            judge_report["endpoint_host"] = "api.openai.com"
+        if not callable(getattr(source, "chat", None)) or not callable(getattr(source, "chat_json", None)):
+            judge_report["errors"].append("裁判调用接口不可用，请检查项目依赖安装")
+        judge_report["ok"] = not judge_report["errors"]
+    except (Exception, SystemExit) as exc:
+        # Never include configuration values or an arbitrary import exception
+        # message in diagnostics; those may contain credentials.
+        judge_report["errors"].append(
+            f"裁判配置读取失败 ({type(exc).__name__})，请检查项目 .env 的 OPENAI_API_KEY、MODEL 和 Python 依赖")
+    failures = [f"{target}: {'; '.join(map(str, report.get('errors') or []))}"
+                for target, report in reports.items() if not report.get("ok")]
+    if not judge_report["ok"]:
+        failures.append("judge: " + "; ".join(judge_report["errors"]))
+    if failures:
+        raise ConfigurationError("发布前环境检查未通过，尚未开始生成或模型调用：" + " | ".join(failures))
+    for target, report in reports.items():
+        for warning in report.get("warnings") or []:
+            log(f"  ⚠ {target}: {warning}")
+    log("  ✓ 发布前环境检查：四选手 CLI、接口配置与裁判配置可读取；远程可用性尚未调用验证")
+    return {"ok": True, "mode": "native_four", "targets": reports, "judge": judge_report,
+            "remote_access_verified": False}
 
 
 def _experiment(benchmark: Path, directory: Path, settings: dict):

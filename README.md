@@ -20,32 +20,64 @@
 
 ## 安装
 
-Python 3.10 以上：
+使用 Python 3.10 以上。完整四选手发布流程还需要 Node.js 22.19.0 以上及 npm。
+在仓库根目录执行以下对应系统的命令。最小依赖已包含生成、原生选手评测和发布所需的 Python 包；
+`requirements.txt` 用于额外的记忆系统集成。
 
-```bash
+Windows PowerShell：
+
+```powershell
 python -m venv venv
-./venv/Scripts/python -m pip install -r requirements-minimal.txt
-copy .env.example .env
+.\venv\Scripts\python.exe -X utf8 -m pip install -r requirements-minimal.txt
+Copy-Item .env.example .env
+Copy-Item configs/env/secrets.env.example configs/env/secrets.env
 ```
 
-Linux/macOS 将解释器路径改为 `./venv/bin/python`，复制命令改为 `cp`。在 `.env` 中配置模型接口；密钥、运行输出和虚拟环境均不会进入 Git。
+Linux/macOS：
+
+```bash
+python3 -m venv venv
+./venv/bin/python -X utf8 -m pip install -r requirements-minimal.txt
+cp .env.example .env
+cp configs/env/secrets.env.example configs/env/secrets.env
+```
+
+在 `.env` 中填写生成与裁判使用的 OpenAI 兼容接口、密钥和模型名；
+在 `configs/env/secrets.env` 中填写四选手的 `GPT_API_KEY`、`GPT_BASE_URL`、
+`DEEPSEEK_API_KEY`、`DEEPSEEK_BASE_URL`。示例值需要替换，所选接口须支持
+`examples/release_four.json` 中的模型和协议。真实配置文件和运行输出均被 Git 忽略。
+
+安装仓库固定版本的两个原生 CLI（两种系统使用同一 npm 命令）：
+
+```text
+node --version
+npm install --global @openai/codex@0.153.2 @deepseek-ai/dsh@0.1.2-rc.1
+codex --version
+dsh --version
+```
+
+运行器默认从当前进程的 `PATH` 查找 `codex` 和 `dsh`。如果安装目录未在 `PATH` 中，
+在 `configs/env/secrets.env` 中填写 `CODEX_BIN`、`DSH_BIN` 的绝对路径。
+Windows 可用 `Get-Command codex.cmd,dsh.cmd` 找到 npm 启动器，填写类似
+`C:/Users/your-name/AppData/Roaming/npm/codex.cmd` 的路径；Linux/macOS 可用
+`command -v codex` 和 `command -v dsh`。路径使用 `/`，无需额外添加引号。
+DSH 的固定 profile 由运行器配置，详见 [configs/dsh/README.md](configs/dsh/README.md)。
 
 ## Seed 校验与运行
 
 离线校验仓库内 seed：
 
-```bash
-./venv/Scripts/python tools/validate_seed_packs.py
+```powershell
+.\venv\Scripts\python.exe -X utf8 tools/validate_seed_packs.py
 ```
 
 完整发布流程：原有生成 → 四选手评测 → 删除全员答对题 → 标准导出。
 
-```bash
-./venv/Scripts/python -m pipeline.factory \
-  --seed-pack seeds/insurance.json \
-  --min-questions 200 \
-  --target-mtokens 0.1 --release
+```powershell
+.\venv\Scripts\python.exe -X utf8 -m pipeline.factory --seed-pack seeds/legal.json --min-questions 200 --target-mchars 1 --haystack-ratio 9 --semantic-workers 4 --release
 ```
+
+Linux/macOS 将解释器替换为 `./venv/bin/python`。以下命令均从仓库根目录运行。
 
 `--release` 使用 [examples/release_four.json](examples/release_four.json)：
 
@@ -59,7 +91,8 @@ Linux/macOS 将解释器路径改为 `./venv/bin/python`，复制命令改为 `c
 新作答需要安装原生 Codex / DSH，并按 `configs/env/secrets.env.example` 配置 GPT / DEEPSEEK
 接口；DSH 安装见 `configs/dsh/README.md`。生成与裁判接口使用 `.env`。
 默认裁判 `glm-5.3-flash`；4题并行、2选手并行、每题600秒、裁判最多2000次物理调用。
-裁判额度跨恢复累计，原生选手内部调用由各 CLI 管理。环境预检失败时不开始四选手调用。
+裁判额度跨恢复累计，原生选手内部调用由各 CLI 管理。完整发布启动前先检查 CLI、接口配置和裁判配置；
+缺少本地配置时在生成前退出。远程连通性、模型访问权限仍须实测。`--only input` 等生成分步命令可独立运行。
 这些配置可以通过 `--calibration-config <json>` 显式替换；四选手发布模式固定删除全部共同答对题。
 当前原生评分支持既有值／关系／时间等题，`L3_process_trace` 的过程语义评分尚未接入，
 该模式在新作答前会明确报错；本发布配置沿用默认关闭的过程题开关。
@@ -67,9 +100,8 @@ Linux/macOS 将解释器路径改为 `./venv/bin/python`，复制命令改为 `c
 
 已有完整 run 可以直接补做生成末尾两个阶段：
 
-```bash
-./venv/Scripts/python -m pipeline.factory --run <run_id> \
-  --release --from quality
+```powershell
+.\venv\Scripts\python.exe -X utf8 -m pipeline.factory --run <run_id> --release --from quality
 ```
 
 这里的 `quality` 只从已有逐题结果刷新轻量汇总，兼容旧版汇总文件；不会重跑世界、语料或逐题审阅。
@@ -78,6 +110,20 @@ Linux/macOS 将解释器路径改为 `./venv/bin/python`，复制命令改为 `c
 补做未完成校准时使用 `--run <run_id> --from calibration`，已完成的作答和有效判分继续复用。
 `--to quality` 可以主动停在校准之前。
 题量目标衡量筛选前的合格题供给；筛选会减少交付题数，不触发新一轮生成来补足容易题。
+
+### 语料规模与草堆
+
+`--target-mchars 1` 表示正文总量目标为 **100 万字符**；旧参数名 `--target-mtokens` 仍可使用，
+其历史实现也按字符计数。这里不宣称任何特定模型的 tokenizer token 数。
+`--haystack-ratio 9` 表示草堆字符数至少为其余正文的 9 倍，对应约 90% 的草堆占比；新运行默认 9。
+白皮书继续安排草堆主题、文体与每期篇数，语料阶段在清理无效文档后计算实际欠额，仅追加缺少的草堆。
+总量和比例共同约束补量，每批最多 8 篇、每批保存，并设有限调用轮数；接口失败保留已完成文档。
+实际总字符、草堆字符、占比与欠额写入 `05_corpus_scale.json`。规模不足记录 warning，逐题质量标准沿用原流程。
+
+已有本版本运行调高总量或比例时，从 `--run <run_id> --from corpus` 继续，复用已验收正文、补齐差额。
+旧运行未显式设置比例时沿用原行为。扩容改变了评测输入，后续校准会重新评测；同学原有成绩只能用于对应的原语料。
+补量执行异常时保留独立 checkpoint，并用 warning 收口；需要补完时执行 `--run <run_id> --force --from corpus`。
+普通续跑沿用本次已完成的有限补量结果，避免接口持续失败时自动反复调用。
 
 ### 复用已有四选手成绩
 
@@ -103,15 +149,15 @@ Linux/macOS 将解释器路径改为 `./venv/bin/python`，复制命令改为 `c
 
 查看参数和已有运行：
 
-```bash
-./venv/Scripts/python -m pipeline.factory --help
-./venv/Scripts/python -m pipeline.factory --list-runs
+```powershell
+.\venv\Scripts\python.exe -X utf8 -m pipeline.factory --help
+.\venv\Scripts\python.exe -X utf8 -m pipeline.factory --list-runs
 ```
 
 中断后使用同一个 run 继续，已完成阶段和逐题检查点会被复用：
 
-```bash
-./venv/Scripts/python -m pipeline.factory --run <run_id>
+```powershell
+.\venv\Scripts\python.exe -X utf8 -m pipeline.factory --run <run_id>
 ```
 
 批量运行入口为 `tools/run_original_bc_batch.py`，小规模端到端检查入口为 `tools/run_original_bc_smoke.py`。两个入口都调用同一条生产流水线。
@@ -128,6 +174,7 @@ Linux/macOS 将解释器路径改为 `./venv/bin/python`，复制命令改为 `c
 | `02_disclosure.json` | 信息公开安排 |
 | `04_questions.json` | 全部候选题与答案 |
 | `05_corpus.json` | 分期语料 |
+| `05_corpus_scale.json` | 真实字符数、草堆占比与规模欠额 |
 | `06_semantic_review.json` | 逐题 Agent 审阅证据 |
 | `06_grounding_report.json` | 通过、淘汰、待审和范围排除的分区 |
 | `06_grounded_questions.json` | 当前可直接用于评测的题目子集 |

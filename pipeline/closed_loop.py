@@ -452,6 +452,7 @@ def build_to_target(run: Run, spec: TargetSpec, max_rounds: int = 2, order_subro
     last = {"kept": [], "report": {}, "growable": [], "permanent": []}
     met = False
     run_cfg = run.manifest["config"]
+    run_cfg["haystack_ratio"] = spec.haystack_ratio
     prev_entities = None                                                         # round1 已渲世界快照，作 ②环 delta 基线
     prev_relations: set = set()
     prev_events: set = set()

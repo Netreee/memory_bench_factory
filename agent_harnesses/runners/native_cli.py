@@ -12,6 +12,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -30,7 +31,7 @@ from ..artifacts import (
 from ..config import CONFIG_ROOT, REPOSITORY_ROOT, ConfigurationError, SystemConfig
 
 
-NATIVE_CLI_ADAPTER_VERSION = "native-cli-smoke-v10"
+NATIVE_CLI_ADAPTER_VERSION = "native-cli-smoke-v11"
 SECRETS_ENV_FILE = REPOSITORY_ROOT / "configs" / "env" / "secrets.env"
 # dsh 的 profile 是仓库钉住的配置（不是 Python 包数据）：它声明该 harness 启动哪些
 # dsh bundle，跟着根 package.json 的 @deepseek-ai/dsh pin 解析。每次 run 复制进
@@ -112,17 +113,43 @@ def _binary_path(value: str, env: Mapping[str, str]) -> str | None:
     return shutil.which(value, path=env.get("PATH"))
 
 
+def _run_cli_process(command, *, timeout, cwd=None, env=None):
+    """Bound the CLI process tree and read UTF-8 without pipe-reader threads.
+
+    npm launchers create children. Killing just the launcher leaves those
+    children running and can leave communicate() waiting for inherited pipes.
+    Reuse the batch runner's platform tree termination and capture to files so
+    collecting partial output never waits for a descendant to close a pipe.
+    """
+    from tools.run_original_bc_batch import terminate_tree
+
+    options = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {"start_new_session": True}
+    with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+        child = subprocess.Popen(command, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+                                 stdout=stdout, stderr=stderr, **options)
+        timed_out = False
+        try:
+            child.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            terminate_tree(child)
+        except BaseException:
+            if child.poll() is None:
+                terminate_tree(child)
+            raise
+        stdout.seek(0)
+        stderr.seek(0)
+        output = stdout.read().decode("utf-8", errors="replace" if timed_out else "strict")
+        error = stderr.read().decode("utf-8", errors="replace")
+        if timed_out:
+            raise subprocess.TimeoutExpired(command, timeout, output=output, stderr=error)
+        return subprocess.CompletedProcess(command, child.returncode, output, error)
+
+
 def _version(binary: str) -> str | None:
     try:
-        result = subprocess.run(
-            [binary, "--version"],
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
+        result = _run_cli_process([binary, "--version"], timeout=10)
+    except (OSError, UnicodeError, subprocess.TimeoutExpired):
         return None
     text = (result.stdout or result.stderr or "").strip().splitlines()
     return text[0][:200] if text else None
@@ -896,15 +923,11 @@ def _run_questions(
             )
             timed_out = False
             try:
-                completed = subprocess.run(
+                completed = _run_cli_process(
                     command,
                     cwd=workspace,
                     env=question_env,
-                    stdin=subprocess.DEVNULL,
-                    capture_output=True,
-                    text=True,
                     timeout=timeout_s,
-                    check=False,
                 )
                 stdout = completed.stdout or ""
                 stderr = completed.stderr or ""

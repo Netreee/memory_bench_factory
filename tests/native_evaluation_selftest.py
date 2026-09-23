@@ -176,7 +176,7 @@ class NativeEvaluationTest(unittest.TestCase):
         outputs = n.execute_native_evaluation(self.benchmark, self.directory, self.settings)
         run = outputs["athlete-0"]
         # Run the real question scheduler, replacing the process creation edge.
-        # The timeout value must reach subprocess.run, not just the saved plan.
+        # The timeout must reach the process-tree runner, not just the saved plan.
         seen = []
         def question_process(command, **kwargs):
             if "--version" in command:
@@ -187,7 +187,7 @@ class NativeEvaluationTest(unittest.TestCase):
                  "NATIVE_TIMEOUT_S": "11", "CODEX_BIN": "offline-cli"}
         with patch.object(native_cli, "load_env_file", return_value=local), \
                 patch.object(native_cli, "_binary_path", return_value="offline-cli"), \
-                patch.object(native_cli.subprocess, "run", side_effect=question_process):
+                patch.object(native_cli, "_run_cli_process", side_effect=question_process):
             native_cli.run(run / "run_plan.json", self.benchmark, run, limit=1, resume=False)
         self.assertEqual(seen, [77])
 

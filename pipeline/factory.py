@@ -15,7 +15,7 @@ closed_loop);此处只放:场景输入 + stage 薄包装 + STAGES 注册 + CLI�
 from __future__ import annotations
 from copy import deepcopy
 from pathlib import Path
-import argparse, hashlib, json, sys, time
+import argparse, hashlib, json, math, sys, time
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from pipeline.world_state import WorldState
@@ -23,7 +23,7 @@ from pipeline.lines import run_lines, prepare_lines as _prepare_lines
 from pipeline.central_office import central_office
 from pipeline.world_gen import build_world
 from pipeline.world_blueprint import WorldBlueprintError, normalize_world_blueprint, relation_capacity
-from pipeline.render import render_corpus, phrase_questions
+from pipeline.render import render_corpus, phrase_questions, corpus_scale
 from pipeline.run import Run, Stage, drive, list_runs, latest_run_for, new_run_id, RUNS_DIR
 from pipeline.targetspec import TargetSpec
 from pipeline.closed_loop import build_to_target
@@ -818,9 +818,22 @@ def _require_current_corpus_review(run: Run, wp: dict, corpus_obj=None):
 def _corpus_is_current(run: Run) -> bool:
     try:
         _require_current_corpus_review(run, run.read(ART["whitepaper"]))
+        cfg = run.manifest.get("config", {})
+        if cfg.get("haystack_ratio") is not None:
+            report = run.read("05_corpus_scale.json")
+            if (report.get("target_chars") != cfg.get("target_tokens", 1_000_000)
+                    or report.get("haystack_ratio") != cfg["haystack_ratio"]
+                    or report.get("binding") != _corpus_scale_binding(run)):
+                return False
         return True
     except (ValueError, OSError, TypeError, KeyError, AttributeError):
         return False
+
+
+def _corpus_scale_binding(run):
+    return {"whitepaper_hash": _canonical_hash(run.read(ART["whitepaper"])),
+            "world_hash": _canonical_hash(run.read(ART["world"])),
+            "corpus_hash": _canonical_hash(run.read(ART["corpus"]))}
 
 
 def _require_current_question_wording(run: Run, wp: dict, questions=None):
@@ -1069,6 +1082,7 @@ def stage_corpus(run: Run):
     pairs = ({(item[0], int(item[1])) for item in (cfg.get("render_only_pairs") or [])
               if isinstance(item, (list, tuple)) and len(item) == 2} if delta_mode else None)
     identity = _corpus_checkpoint_identity(wp, world, target, delta_mode, only, pairs)
+    material_identity = _corpus_checkpoint_identity(wp, world, 0, delta_mode, only, pairs)
     ckpt = run.dir / CORPUS_CKPT
     if ckpt.exists():                                       # 中断续渲只读独立 checkpoint
         try:
@@ -1087,7 +1101,7 @@ def stage_corpus(run: Run):
             else:
                 corpus, done = {"sessions": []}, set()
         else:
-            if st.get("identity") == identity:
+            if st.get("identity") == identity or st.get("material_identity") == material_identity:
                 corpus, done = st["corpus"], set(st["done_weeks"])
                 run.log(f"  ↻ 续渲:已完成 {len(done)} 周")
             elif delta_mode and run.has(ART["corpus"]):
@@ -1134,14 +1148,27 @@ def stage_corpus(run: Run):
     else:
         corpus, done = {"sessions": []}, set()
 
+    # A size-only change reuses accepted prose. Validate against this exact
+    # world before extending it; normal material changes still regenerate.
+    if not corpus.get("sessions") and not delta_mode and prior_published_corpus and cfg.get("haystack_ratio") is not None:
+        from pipeline.corpus_contract import validate_corpus
+        scale_binding = run.read("05_corpus_scale.json").get("binding") if run.has("05_corpus_scale.json") else None
+        if ((scale_binding == _corpus_scale_binding(run)
+                or (not run.has("05_corpus_scale.json") and not run.has(CORPUS_WARNING)))
+                and validate_corpus(ws, prior_published_corpus).get("status") == "passed"):
+            corpus = deepcopy(prior_published_corpus["corpus"])
+            done = set(prior_published_corpus["done_weeks"])
+            run.log("  ↻ 仅补语料规模差额，复用已有正文")
+
     def save():
-        run.write(CORPUS_CKPT, {"identity": identity, "corpus": corpus,
+        run.write(CORPUS_CKPT, {"identity": identity, "material_identity": material_identity, "corpus": corpus,
                                 "done_weeks": sorted(done)})
 
     corpus_error = None
     try:
         render_corpus(wp, ws, target, run.tracer, corpus, done, save, run.log,
-                      only_entities=only, only_entity_sessions=pairs)
+                      only_entities=only, only_entity_sessions=pairs,
+                      **({"haystack_ratio": cfg["haystack_ratio"]} if cfg.get("haystack_ratio") is not None else {}))
     except Exception as exc:
         corpus_error = exc
     # A partial corpus is still a useful candidate for downstream diagnostics.
@@ -1169,6 +1196,14 @@ def stage_corpus(run: Run):
                 "保存现有正文并继续接地与最终质量报告")
     ch = sum(len(dd.get("content", "")) for x in corpus["sessions"] for dd in x["docs"])
     run.set_algo(docs=sum(len(x["docs"]) for x in corpus["sessions"]), chars=ch)
+    if cfg.get("haystack_ratio") is not None:
+        scale = corpus_scale(run.read(ART["corpus"])["corpus"], target, cfg["haystack_ratio"])
+        scale.update(binding=_corpus_scale_binding(run),
+                     warning=None if scale["target_met"] else "corpus_scale_target_unmet",
+                     attempt_complete=corpus_error is None,
+                     retry_from_checkpoint="--force --from corpus" if corpus_error is not None else None)
+        run.write("05_corpus_scale.json", scale)
+        run.set_algo(corpus_scale={k: v for k, v in scale.items() if k != "binding"})
 
     # ★多样性硬指标(诊断附加项,非主链):测本次 corpus 全部文档正文,写进 manifest.algo.diversity。
     #   失败绝不拖垮整个 run —— 只 log 一句警告 + 跳过。
@@ -1374,7 +1409,8 @@ def main():
     ap.add_argument("--seed-pack", help="策展种子 JSON；增强 input→whitepaper，后续阶段保持同一合同")
     ap.add_argument("--world-semantic-review", action="store_true", default=None,
                     help="为旧白皮书显式启用原 world 阶段的业务语义审阅；新白皮书自动启用")
-    ap.add_argument("--target-mtokens", type=float, default=None, help="目标 token(M);新 run 缺省 1.0,续 run 沿用")
+    ap.add_argument("--target-mchars", "--target-mtokens", dest="target_mtokens", type=float, default=None,
+                    help="目标正文百万字符数；新 run 缺省 1.0，续 run 沿用；旧名称 target-mtokens 兼容保留")
     ap.add_argument("--question-budget", type=int, default=None,
                     help="普通流程总订单上限；新 run 缺省 30，续 run 沿用；不承诺最终存活题数")
     ap.add_argument("--semantic-workers", type=int, default=None,
@@ -1395,7 +1431,8 @@ def main():
     ap.add_argument("--min-questions", type=int, default=None, help="出厂题库总下限;给了即启用闭环旋钮(否则按原 drive 跑)")
     ap.add_argument("--per-line", action="append", default=None,
                     help="每线 floor,可重复:--per-line L1_timeline=30 --per-line L2_relational=15(缺省按白皮书 weight 派生)")
-    ap.add_argument("--haystack-ratio", type=float, default=4.0, help="针:草比(v0 仅留痕,精配是 v2)")
+    ap.add_argument("--haystack-ratio", type=float, default=None,
+                    help="草堆字符/其余正文字符的目标下限；新 run 缺省9(约90%%草堆)，旧 run 沿用")
     ap.add_argument("--time-span-weeks", type=int, default=None, help="时间跨度周数(None=反推/默认)")
     ap.add_argument("--max-rounds", type=int, default=2, help="②实测纠偏环最多整轮重渲次数(bounded)")
     ap.add_argument("--total-only", action="store_true", help="总题量为硬下限；白皮书逐线权重用于生产配额，显式 --per-line 仍为硬下限")
@@ -1406,6 +1443,10 @@ def main():
 
     if a.list_runs:
         _print_runs(); return
+    if a.haystack_ratio is not None and (not math.isfinite(a.haystack_ratio) or a.haystack_ratio < 0):
+        ap.error("--haystack-ratio 必须为有限非负数")
+    if a.target_mtokens is not None and (not math.isfinite(a.target_mtokens) or a.target_mtokens < 0):
+        ap.error("--target-mchars 必须为有限非负数")
     if a.question_budget is not None and a.question_budget < 1:
         ap.error("--question-budget 必须为正整数")
     if a.question_budget is not None and a.min_questions is not None:
@@ -1449,6 +1490,10 @@ def main():
     if a.world_semantic_review:
         cfg["world_semantic_review"] = True
     manifest_path = RUNS_DIR / run_id / "manifest.json"
+    if a.haystack_ratio is not None:
+        cfg["haystack_ratio"] = a.haystack_ratio
+    elif not manifest_path.exists():
+        cfg["haystack_ratio"] = 9.0
     if a.process_questions:
         previous = json.loads(manifest_path.read_text(encoding="utf-8")) if manifest_path.exists() else {}
         if (previous.get("stages", {}).get("orders", {}).get("done")
@@ -1486,9 +1531,19 @@ def main():
     if any(name in ("calibration", "selection") for name in (a.from_stage, a.to_stage, a.only)) and len(stages) == len(STAGES):
         ap.error("calibration/selection requires --calibration-config or a frozen run configuration")
 
+    calibration = run.manifest["config"].get("calibration")
+    reaches_calibration = (a.only == "calibration" or
+        (a.only is None and a.from_stage != "selection" and a.to_stage in (None, "calibration", "selection")))
+    if calibration and reaches_calibration:
+        from pipeline.calibration import preflight_release
+        try:
+            preflight_release(calibration, log=run.log)
+        except ValueError as exc:
+            ap.error(str(exc))
+
     t0 = time.time()
     tgt = run.manifest["config"].get("target_tokens", 1_000_000)
-    run.log(f"=== run {run_id}(scenario={scenario},目标 {tgt/1e6:.1f}M token)===")
+    run.log(f"=== run {run_id}(scenario={scenario},目标 {tgt/1e6:.1f}M 字符)===")
 
     if a.min_questions is not None and not finalize_only:   # 显式末尾续跑优先，避免复用命令时再次进入供给闭环。
         drive(run, STAGES, None, "whitepaper", None, a.force)
@@ -1498,7 +1553,7 @@ def main():
             if v.strip().isdigit():
                 plm[k.strip()] = int(v)
         spec = TargetSpec(min_questions=a.min_questions, per_line_min=plm,
-                          haystack_ratio=a.haystack_ratio, time_span_weeks=a.time_span_weeks,
+                          haystack_ratio=run.manifest["config"].get("haystack_ratio", 4.0), time_span_weeks=a.time_span_weeks,
                           total_only=a.total_only, max_world_entities=a.max_world_entities)
         _, status = build_to_target(run, spec, max_rounds=a.max_rounds)
         finish_generation(run, a.to_stage, a.force)

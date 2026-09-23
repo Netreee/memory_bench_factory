@@ -29,7 +29,7 @@ class TargetSpec:
     per_line_min: dict = field(default_factory=dict)        # {line_id: 下限};Σ ≤ min_questions
     per_line_max: dict = field(default_factory=dict)        # 可选上限(防某线爆)
     difficulty_dist: dict = field(default_factory=dict)     # v1:{easy,med,hard};v0 不用
-    haystack_ratio: float = 4.0                             # corpus_chars ≈ needle·(1+ratio)
+    haystack_ratio: float = 9.0                             # filler_chars / other_body_chars
     time_span_weeks: int | None = None                      # None = 用默认/反推
     total_only: bool = False                               # weighted line targets remain soft; explicit floors still apply
     max_world_entities: int = 80                           # resource bound for each independent world
@@ -41,7 +41,7 @@ class TargetSpec:
                    per_line_min=dict(d.get("per_line_min", {})),
                    per_line_max=dict(d.get("per_line_max", {})),
                    difficulty_dist=dict(d.get("difficulty_dist", {})),
-                   haystack_ratio=float(d.get("haystack_ratio", 4.0)),
+                   haystack_ratio=float(d.get("haystack_ratio", 9.0)),
                    time_span_weeks=d.get("time_span_weeks"),
                    total_only=bool(d.get("total_only", False)),
                    max_world_entities=int(d.get("max_world_entities", 80)))

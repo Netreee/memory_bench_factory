@@ -1,5 +1,23 @@
 # dsh profile（仓库钉住的 dsh 启动配置）
 
+## 安装 CLI
+
+先安装 Node.js 22.19.0 以上与 npm，再安装与根目录 `package.json` 一致的固定版本：
+
+```text
+npm install --global @deepseek-ai/dsh@0.1.2-rc.1
+dsh --version
+```
+
+将 `configs/env/secrets.env.example` 复制为 `configs/env/secrets.env`，填写
+`DEEPSEEK_API_KEY`、`DEEPSEEK_BASE_URL`。模型名与接口协议从发布配置或 experiment 读取。
+运行器从 `PATH` 查找 `dsh`；需要指定位置时填写 `DSH_BIN`。
+Windows 用 `Get-Command dsh.cmd` 获取 npm 启动器，路径写成
+`C:/Users/your-name/AppData/Roaming/npm/dsh.cmd`；Linux/macOS 用 `command -v dsh`。
+CLI 安装完成后，运行器会为每次评测准备下述 profile，无需手动复制生成文件。
+
+## Profile 的作用
+
 `profiles/headless/` 是 DeepSeek Harness（dsh）的启动 profile：它声明**这个 harness
 启动哪些 dsh bundle**。native CLI runner 在每次 run 时把它复制到该 run 的
 `$DSH_HOME/profiles/`，再用 `dsh --profile headless` 启动，因此 profile 是「被测
@@ -8,8 +26,7 @@ harness 的一部分」，改动会改变 agent 实际能用的工具和插件�
 放在 `configs/` 而不是 `agent_harnesses/` 里的原因：
 
 - 它和 `systems.toml`、experiment TOML 一样是**仓库钉住的配置**，不是 Python 包数据；
-- 里面的 bundle 名不带版本，跟随仓库根 `package.json` 的 `@deepseek-ai/dsh` pin 解析
-  （CLI 本体装在 gitignore 的 `.npm-global/`）；
+- 里面的 bundle 名不带版本，跟随仓库根 `package.json` 的 `@deepseek-ai/dsh` pin 解析；
 - 控制面只支持源码 checkout 运行（`configs/`、`input/` 都按 `REPOSITORY_ROOT` 解析），
   所以不需要把它打进 Python 包。
 
