@@ -27,6 +27,26 @@ def _local_execution_failure(raw):
         "paged_invalid_action", "paged_allowance_exhausted"}
 
 
+def _global_execution_failure(exc):
+    """Return true only when later provider calls must not be admitted.
+
+    Question-bound transport, JSON, paging, context and model-output failures
+    remain local to the current review stage.  The outer bounded runner already
+    owns the hard call/cost fuse; authentication failures cannot recover on a
+    later question either.  Keeping this list narrow prevents one malformed
+    candidate response from suppressing the rest of a large review.
+    """
+    message = str(exc)
+    if "Original experiment model/call/estimated budget limit; no provider dispatch" in message:
+        return True
+    try:
+        import config
+        kind = config.chat_error_kind(exc)
+    except Exception:
+        kind = None
+    return kind in {"http_status_401", "http_status_402", "http_status_403"}
+
+
 def enabled(wp):
     return (wp.get("quality_contract") or {}).get("public_semantic_review") is True
 
@@ -363,8 +383,9 @@ def review_grounding(questions, corpus, protocol, *, chat_json, model,
         except paged_read.PagedReadExecutionError as exc:
             if cache and _local_execution_failure(exc.response):
                 return exc.response
-            with state_lock:
-                stopped = True
+            if _global_execution_failure(exc):
+                with state_lock:
+                    stopped = True
             raise
         except paged_read.PagedReadProtocolError as exc:
             # A model that repeatedly emits an invalid paging action makes only
@@ -373,9 +394,10 @@ def review_grounding(questions, corpus, protocol, *, chat_json, model,
             return {"__error__": str(exc),
                     "__error_metadata__": {"kind": exc.kind,
                                              "candidate_id": candidate}}
-        except Exception:
-            with state_lock:
-                stopped = True
+        except Exception as exc:
+            if _global_execution_failure(exc):
+                with state_lock:
+                    stopped = True
             raise
 
     try:
@@ -425,9 +447,8 @@ def review_grounding(questions, corpus, protocol, *, chat_json, model,
                   "suppressed_after_failure": suppressed_after_failure,
                   "logical_calls_used": review["calls_used"],
                   "paid_provider_calls": None,
+                  "unit_failure_isolation": "bounded-units/v1",
                   "scope": "Forwarded callable invocations; actual provider attempts and charges require the provider trace/bill."}
-    if cache:
-        accounting["unit_failure_isolation"] = "bounded-units/v1"
     report.update(accounting)
     review["execution_accounting"] = deepcopy(accounting)
     delivery = validate_delivery(candidates, corpus, protocol, review)
