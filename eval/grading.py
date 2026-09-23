@@ -3,7 +3,7 @@ import hashlib
 import json
 from eval.provenance import (digest, question_hash, reference_hash, valid_context, CONTEXT_FIELDS,
                              make_evaluation_context)
-JUDGE_VERSION = "typed-primary-v3"
+JUDGE_VERSION = "typed-primary-v4"
 SEMANTIC_JUDGE_VERSION = "semantic-primary-v6"
 ANSWER_TASK_JUDGE_VERSION = "semantic-task-support/v1"
 DIRECT_METHOD = "direct/v1"

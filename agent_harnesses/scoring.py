@@ -85,6 +85,12 @@ def _standard_scoring_fields(public: dict, reference: dict) -> dict[str, Any]:
         contract["answer_kind"] = "order"
     elif capability == "TR":
         contract["answer_kind"] = "time"
+        # The standard-light public protocol uses 第N周/期 for the same
+        # one-based period.  The factory judge already accepts 周 and dates;
+        # preserve those answers and supply the missing 期 spellings here.
+        week = answer.get("week") if isinstance(answer, dict) else None
+        if type(week) is int and week > 0:
+            contract["allowed_aliases"] = [f"第{week}期", f"{week}期"]
     elif capability == "L8_next":
         # The legacy judge requires a declared state vocabulary.  The standard
         # export only carries the canonical answer, so use an explicit sentinel

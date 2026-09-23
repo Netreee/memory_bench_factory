@@ -80,7 +80,8 @@ def _invalid_reason(record: dict) -> str | None:
 def filter_questions(questions: list[dict], results: dict[str, list[dict]], *,
                       keep_easy_ratio: float = 0.0, seed: int = 0,
                       preserve_capabilities: tuple[str, ...] | list[str] = (),
-                      expected_context: dict | None = None) -> tuple[list[dict], dict]:
+                      expected_context: dict | None = None,
+                      stratify_by: tuple[str, ...] = ()) -> tuple[list[dict], dict]:
     """筛选全员答对题并返回审计报告；输入不变，缺测或异常题一律保留。"""
     systems = sorted(results)
     validate_options(systems, keep_easy_ratio, seed)
@@ -133,10 +134,21 @@ def filter_questions(questions: list[dict], results: dict[str, list[dict]], *,
                       "question": q["question"], "correct": grades,
                       "issues": issues, "disposition": disposition})
 
-    # 哈希排序抽样使保留集合不受输入顺序或系统排列影响，并支持逐步提高保留率。
-    keep_n = int(len(easy) * Fraction(str(keep_easy_ratio)))
-    ranked = sorted(easy, key=lambda key: (hashlib.sha256(f"{seed}:{key}".encode()).hexdigest(), key))
-    sampled = set(ranked[:keep_n])
+    # The old evaluation CLI keeps its global floor rule. Production selects
+    # within each world/line, rounding upward so a small easy-only line survives.
+    if any(field not in {"world", "line", "capability"} for field in stratify_by):
+        raise ValueError("Unsupported easy-question sampling stratum")
+    groups = defaultdict(list)
+    easy_keys = set(easy)
+    for q, key in zip(questions, keys):
+        if key in easy_keys:
+            groups[tuple(str(q.get(field, "")) for field in stratify_by)].append(key)
+    sampled = set()
+    for group in groups.values():
+        amount = len(group) * Fraction(str(keep_easy_ratio))
+        keep_n = math.ceil(amount) if stratify_by else int(amount)
+        ranked = sorted(group, key=lambda key: (hashlib.sha256(f"{seed}:{key}".encode()).hexdigest(), key))
+        sampled.update(ranked[:keep_n])
     kept = []
     for q, item in zip(questions, items):
         if item["key"] in sampled:
@@ -158,7 +170,9 @@ def filter_questions(questions: list[dict], results: dict[str, list[dict]], *,
         "schema_version": 3, "rule": "all_selected_systems_correct", "judge_version": JUDGE_VERSION,
         "systems": systems, "keep_easy_ratio": keep_easy_ratio, "seed": seed,
         "preserve_capabilities": sorted(preserved),
-        "sampling": "floor(n_easy * keep_easy_ratio); seeded SHA-256 order",
+        "sampling": ("ceil(n_easy_in_stratum * keep_easy_ratio); seeded SHA-256 order" if stratify_by
+                     else "floor(n_easy * keep_easy_ratio); seeded SHA-256 order"),
+        "stratify_by": list(stratify_by),
         "identity_fields": list(IDENTITY_FIELDS),
         "counts": {**counts(items), "all_correct": len(easy)},
         "by_line": {key: counts(rows) for key, rows in sorted(by_line.items())},

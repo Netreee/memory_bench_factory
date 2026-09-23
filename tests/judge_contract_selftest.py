@@ -111,6 +111,62 @@ class JudgeContractTest(unittest.TestCase):
             self.assertFalse(judge.judge_answer(transition, answer))
         config.chat_json.assert_not_called()
 
+    def test_time_parentheses_compare_every_complete_component(self):
+        from agent_harnesses.scoring import _standard_scoring_fields
+        q = question(capability="TR", question="第一次变化出现在第几期？")
+        q.update(_standard_scoring_fields(q, {"answer": {"week": 7, "date": "2025-02-17"}}))
+        for answer in ("第7周（第7期）。", "第7期（第7周）。", "第7周（2025-02-17）。",
+                       "2025年2月17日（第7期）", "第7期(2025/02/17)", "第7周（7）"):
+            grade = judge.judge_record(q, answer)
+            self.assertTrue(grade["correct"], answer)
+            self.assertEqual(grade["path"], "time_composite")
+        for answer in ("第7周（第6期）。", "第7期（第8周）。", "第7周（2025-02-18）。",
+                       "第7周（2025-02）。", "第7周（7天）。", "第17期", "2025-02-18",
+                       "不是第7期", "第7期或第8期"):
+            self.assertFalse(judge.judge_answer(q, answer), answer)
+        config.chat_json.assert_not_called()
+
+    def test_explanatory_time_uses_semantics_with_numbering_context(self):
+        from agent_harnesses.scoring import _standard_scoring_fields
+        q = question(capability="TR", question="第一次变化出现在第几期？")
+        q.update(_standard_scoring_fields(q, {"answer": {"week": 10, "date": "2025-03-10"}}))
+        config.chat_json.side_effect = None
+        for answer, expected in (
+            ("第10周（2025-03-10，证据充分性由待补证更新为部分充分）。", True),
+            ("第10周（session=9）。", True),
+            ("第10周（期数9）。", False),
+            ("不是第10周，是第11周。", False),
+            ("可能第10周，也可能第11周。", False),
+        ):
+            config.chat_json.return_value = {"correct": expected, "reason": "offline semantic fixture"}
+            grade = judge.judge_record(q, answer)
+            self.assertIs(grade["correct"], expected)
+            self.assertEqual(grade["path"], "llm_primary")
+            messages = config.chat_json.call_args.args[0]
+            data = json.loads(messages[1]["content"])
+            self.assertEqual(data["target"]["canonical_period"], 10)
+            self.assertEqual(data["target"]["canonical_date"], "2025-03-10")
+            self.assertEqual(data["target"]["numbering"]["canonical_session"], 9)
+            self.assertIn("期数本身不能减1", messages[0]["content"])
+        # Internal questions have their own declared time unit, no implicit
+        # standard-light session conversion is added to their grading context.
+        q.pop("_benchmark_schema")
+        judge.judge_record(q, "发生在第10周，并完成归档。")
+        data = json.loads(config.chat_json.call_args.args[0][1]["content"])
+        self.assertNotIn("numbering", data["target"])
+
+    def test_time_semantic_failure_is_unscored(self):
+        q = question(capability="TR", gt={"week": 10, "date": "2025-03-10"},
+                     question_contract=contract("time"))
+        config.chat_json.side_effect = TimeoutError("offline timeout")
+        grade = judge.judge_record(q, "发生在第10周，随后完成归档。")
+        self.assertEqual(grade["verdict"], "error")
+        self.assertIsNone(grade["correct"])
+        config.chat_json.reset_mock()
+        grade = judge.judge_record(q, "发生在第10周，随后完成归档。", use_llm=False)
+        self.assertFalse(grade["correct"])
+        config.chat_json.assert_not_called()
+
     def test_tr_uses_declared_period_unit_only(self):
         for unit in ("周", "日", "天", "章"):
             q = question(capability="TR", gt={"to": "倾听陪伴", "week": 3, "date": "2025-01-20"},

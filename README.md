@@ -13,6 +13,8 @@
 7. `corpus`：按期渲染信号文档与干扰文档，并检查正文能否支撑声明。
 8. `grounding`：逐题阅读相关语料，给出 `released`、`rejected` 或 `pending_review`；单题失败不终止其他题。
 9. `quality`：只核对逐题状态分区和产物散列，生成 `07_release.json`。它不重新判断题目语义，也不会因为题量不足或其他题被淘汰而否决已经通过的题。
+10. `calibration`：四个原生选手对质量审查通过的题作答，复用 `agent_harnesses` 的执行器和判分器。明确值采用确定性判分，需要理解自然语言的回答调用配置的 LLM 裁判。评分处理在评测器内部完成。
+11. `selection`：删除四个选手全部答对的题，保留至少一个选手答错的题，导出标准发布包。四票必须都有效；超时、缺测或判分失败记为未完成，保存候选并在续跑时补齐。
 
 当前 seed 流程主要覆盖 L1–L8；L9、L10 需要补充相应的材料构造后再批量启用。
 
@@ -36,14 +38,68 @@ Linux/macOS 将解释器路径改为 `./venv/bin/python`，复制命令改为 `c
 ./venv/Scripts/python tools/validate_seed_packs.py
 ```
 
-运行单个世界：
+完整发布流程：原有生成 → 四选手评测 → 删除全员答对题 → 标准导出。
 
 ```bash
 ./venv/Scripts/python -m pipeline.factory \
   --seed-pack seeds/insurance.json \
   --min-questions 200 \
-  --target-mtokens 0.1
+  --target-mtokens 0.1 --release
 ```
+
+`--release` 使用 [examples/release_four.json](examples/release_four.json)：
+
+| 选手 | 原生运行器 | 接口协议 |
+| --- | --- | --- |
+| gpt-5.6-sol | Codex | responses |
+| deepseek-v4.1-flash | DSH | openai-completions |
+| gpt-5.3-codex | Codex | responses |
+| deepseek-v4-flash-0731 | DSH | openai-responses |
+
+新作答需要安装原生 Codex / DSH，并按 `configs/env/secrets.env.example` 配置 GPT / DEEPSEEK
+接口；DSH 安装见 `configs/dsh/README.md`。生成与裁判接口使用 `.env`。
+默认裁判 `glm-5.3-flash`；4题并行、2选手并行、每题600秒、裁判最多2000次物理调用。
+裁判额度跨恢复累计，原生选手内部调用由各 CLI 管理。环境预检失败时不开始四选手调用。
+这些配置可以通过 `--calibration-config <json>` 显式替换；四选手发布模式固定删除全部共同答对题。
+当前原生评分支持既有值／关系／时间等题，`L3_process_trace` 的过程语义评分尚未接入，
+该模式在新作答前会明确报错；本发布配置沿用默认关闭的过程题开关。
+省略 `--release` 和 `--calibration-config` 可单独运行原有生成部分。
+
+已有完整 run 可以直接补做生成末尾两个阶段：
+
+```bash
+./venv/Scripts/python -m pipeline.factory --run <run_id> \
+  --release --from quality
+```
+
+这里的 `quality` 只从已有逐题结果刷新轻量汇总，兼容旧版汇总文件；不会重跑世界、语料或逐题审阅。
+当前汇总已经有效时可以直接 `--from calibration`。
+校准复用逐题作答与判分缓存；修改裁判后可以重新判分并保留原作答。
+补做未完成校准时使用 `--run <run_id> --from calibration`，已完成的作答和有效判分继续复用。
+`--to quality` 可以主动停在校准之前。
+题量目标衡量筛选前的合格题供给；筛选会减少交付题数，不触发新一轮生成来补足容易题。
+
+### 复用已有四选手成绩
+
+复制 `examples/release_four.json`，添加下面两个字段。路径相对配置文件解析；
+选手的模型、协议需与原 `run_plan.json` 一致。
+
+```json
+{
+  "source_benchmark": "path/to/original-standard-benchmark",
+  "result_dirs": {
+    "codex-gpt56-sol": "path/to/first/run",
+    "dsh-deepseek-v41-flash": "path/to/second/run",
+    "codex-gpt53-codex": "path/to/third/run",
+    "dsh-deepseek-v4-flash-0731": "path/to/fourth/run"
+  }
+}
+```
+
+每个目录包含 `run_plan.json`、`results.jsonl`、`judged.jsonl`。执行
+`--run <run_id> --calibration-config <import.json> --from quality` 即可直接筛选和导出，
+无新增模型调用。导入会核对实际语料、协议、题面、答案和最新作答，保留原判分版本；
+源标准包可包含额外题，只有当前质量合格子集进入筛选。
 
 查看参数和已有运行：
 
@@ -76,8 +132,13 @@ Linux/macOS 将解释器路径改为 `./venv/bin/python`，复制命令改为 `c
 | `06_grounding_report.json` | 通过、淘汰、待审和范围排除的分区 |
 | `06_grounded_questions.json` | 当前可直接用于评测的题目子集 |
 | `07_release.json` | 上述分区与文件身份的轻量汇总 |
+| `08_calibration.json` | 生成期试答与判分状态，指向 `calibration/` 下的逐题结果 |
+| `09_selection.json` | 全员答对剔除数、保留数、未决数、release_ready 与最终标准包路径 |
+| `09_selected_questions.json` | 筛选后的题目子集 |
+| `delivery/<attempt>/benchmark/` | 世界、完整语料、协议及筛选后的题目/答案，兼容现有标准包读取器 |
 
-题量目标属于生产计划。审查会正常减少最终题量；只要逐题分区完整且至少有一道 `released` 题，通过的子集就可使用。
+原生成的全部候选、质量状态、世界与语料原样保存。发布包只包含质量合格且经过四选手筛选的题。
+`release_ready=true` 表示筛选完成且导出了非空包；评测未完成时只保留候选与进度。
 
 ## 目录
 
@@ -97,4 +158,7 @@ Linux/macOS 将解释器路径改为 `./venv/bin/python`，复制命令改为 `c
 ./venv/Scripts/python -B -X utf8 tests/world_agent_json_recovery_selftest.py
 ./venv/Scripts/python -B -X utf8 tests/grounding_candidate_isolation_selftest.py
 ./venv/Scripts/python -B -X utf8 tests/release_summary_selftest.py
+./venv/Scripts/python -B -X utf8 tests/release_pipeline_selftest.py
+./venv/Scripts/python -B -X utf8 tests/native_evaluation_selftest.py
+./venv/Scripts/python -B -X utf8 tests/native_results_selftest.py
 ```

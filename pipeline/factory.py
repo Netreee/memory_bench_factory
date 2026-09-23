@@ -152,7 +152,8 @@ SCENARIOS = {
 ART = {"input": "00_input.json", "whitepaper": "01_whitepaper.json", "world": "02_world.json",
        "orders": "03_orders.json", "questions": "04_questions.json", "disclosure": "02_disclosure_ready.json",
        "corpus": "05_corpus.json",
-       "grounding": "06_grounded_questions.json", "quality": "07_release.json"}
+       "grounding": "06_grounded_questions.json", "quality": "07_release.json",
+       "calibration": "08_calibration.json", "selection": "09_selection.json"}
 CORPUS_CKPT = "05_corpus.ckpt.json"
 CORPUS_WARNING = "05_corpus_warning.json"
 QUESTION_WARNING = "04_questions_warning.json"
@@ -1328,6 +1329,30 @@ STAGES = [
 ]
 
 
+def generation_stages(run: Run, *, finalize_only=False):
+    """Calibration is a generation tail, executed once after the supply loop."""
+    if not run.manifest.get("config", {}).get("calibration"):
+        return STAGES
+    from pipeline.calibration import (stage_calibration, stage_selection,
+                                      calibration_can_skip, selection_is_current)
+    # Finalization consumes the saved question partition and material. The
+    # existing quality function validates those files directly; old generator
+    # receipts must not cause world generation or semantic review to run again.
+    prefix = ([Stage("quality", [], stage_quality, ART["quality"], is_current=_quality_is_current)]
+              if finalize_only else STAGES)
+    return [*prefix,
+            Stage("calibration", ["quality"], stage_calibration, ART["calibration"],
+                  is_current=calibration_can_skip),
+            Stage("selection", ["calibration"], stage_selection, ART["selection"],
+                  is_current=selection_is_current, refreshes=("calibration",))]
+
+
+def finish_generation(run: Run, to_stage=None, force=False):
+    """Finish a quantity-driven world without rerunning its production rounds."""
+    if run.manifest.get("config", {}).get("calibration") and to_stage in (None, "calibration", "selection"):
+        drive(run, generation_stages(run, finalize_only=True), "quality", to_stage, None, force)
+
+
 
 def _print_runs():
     rows = list_runs()
@@ -1354,6 +1379,10 @@ def main():
                     help="普通流程总订单上限；新 run 缺省 30，续 run 沿用；不承诺最终存活题数")
     ap.add_argument("--semantic-workers", type=int, default=None,
                     help="逐题语义审阅并行数；只并行相互独立的题，最终仍按原顺序统一验收")
+    ap.add_argument("--calibration-config", type=Path,
+                    help="生成末尾执行运动员试答、判分和简单题筛选；JSON配置在run中冻结")
+    ap.add_argument("--release", action="store_true",
+                    help="完整发布流程：原有生成→四运动员评测→删除全员答对题；缺省使用examples/release_four.json")
     ap.add_argument("--tag", default=None, help="人类标签(进 manifest,不影响 run_id)")
     ap.add_argument("--from", dest="from_stage", default=None, help=f"从哪个 stage 起跑 {list(ART)}")
     ap.add_argument("--to", dest="to_stage", default=None, help="跑到哪个 stage 止")
@@ -1372,6 +1401,8 @@ def main():
     ap.add_argument("--total-only", action="store_true", help="总题量为硬下限；白皮书逐线权重用于生产配额，显式 --per-line 仍为硬下限")
     ap.add_argument("--max-world-entities", type=int, default=80, help="闭环每个独立世界的实体上限(8–80)，种子结构最低要求仍须满足")
     a = ap.parse_args()
+    if a.release and a.calibration_config is None:
+        a.calibration_config = Path(__file__).resolve().parents[1] / "examples/release_four.json"
 
     if a.list_runs:
         _print_runs(); return
@@ -1407,6 +1438,12 @@ def main():
         run_id, scenario = new_run_id(requested_scenario), requested_scenario
 
     cfg = {"from": a.from_stage, "to": a.to_stage, "only": a.only}
+    if a.calibration_config:
+        from pipeline.calibration import load_config
+        try:
+            cfg["calibration"] = load_config(a.calibration_config)
+        except (OSError, ValueError) as exc:
+            ap.error(str(exc))
     if a.semantic_workers is not None:
         cfg["semantic_workers"] = a.semantic_workers
     if a.world_semantic_review:
@@ -1442,12 +1479,18 @@ def main():
     elif not (RUNS_DIR / run_id / "manifest.json").exists():
         cfg["target_tokens"] = 1_000_000
     run = Run(scenario, run_id, tag=a.tag, config_meta=cfg)
+    finalize_only = (bool(run.manifest.get("config", {}).get("calibration")) and
+                     (a.from_stage in ("quality", "calibration", "selection") or
+                      a.only in ("quality", "calibration", "selection")))
+    stages = generation_stages(run, finalize_only=finalize_only)
+    if any(name in ("calibration", "selection") for name in (a.from_stage, a.to_stage, a.only)) and len(stages) == len(STAGES):
+        ap.error("calibration/selection requires --calibration-config or a frozen run configuration")
 
     t0 = time.time()
     tgt = run.manifest["config"].get("target_tokens", 1_000_000)
     run.log(f"=== run {run_id}(scenario={scenario},目标 {tgt/1e6:.1f}M token)===")
 
-    if a.min_questions is not None:                         # ★闭环旋钮路径:先把 input+whitepaper 跑出来,再交给 driver 自管 world→grounding
+    if a.min_questions is not None and not finalize_only:   # 显式末尾续跑优先，避免复用命令时再次进入供给闭环。
         drive(run, STAGES, None, "whitepaper", None, a.force)
         plm: dict = {}
         for kv in (a.per_line or []):
@@ -1458,10 +1501,11 @@ def main():
                           haystack_ratio=a.haystack_ratio, time_span_weeks=a.time_span_weeks,
                           total_only=a.total_only, max_world_entities=a.max_world_entities)
         _, status = build_to_target(run, spec, max_rounds=a.max_rounds)
+        finish_generation(run, a.to_stage, a.force)
         run.log(f"=== DONE {run_id}:闭环 {status} / {run.tracer.n} 次 LLM / {round((time.time() - t0) / 60, 1)} min / 留痕 {run.dir} ===")
         return
 
-    drive(run, STAGES, a.from_stage, a.to_stage, a.only, a.force)
+    drive(run, stages, a.from_stage, a.to_stage, a.only, a.force)
     run.log(f"=== DONE {run_id}:{run.tracer.n} 次 LLM / {round((time.time() - t0) / 60, 1)} min / 留痕 {run.dir} ===")
 
 

@@ -20,7 +20,15 @@ class NativeTrackAdapter(TrackAdapter):
         if system.runner == "builtin_diagnostic":
             return {"system_id": system.system_id, "ok": True, "errors": []}
         if system.runner == "native_cli":
-            return preflight_system(system, plan.model)
+            report = preflight_system(system, plan.model)
+            if "timeout_s" in plan.execution:
+                timeout = plan.execution["timeout_s"]
+                if type(timeout) is not int or timeout <= 0:
+                    report.setdefault("errors", []).append("execution.timeout_s 必须是正整数")
+                    report["ok"] = False
+                else:
+                    report.setdefault("runtime_options", {})["timeout_s"] = timeout
+            return report
         return {
             "system_id": system.system_id,
             "ok": False,

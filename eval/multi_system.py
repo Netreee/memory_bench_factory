@@ -67,12 +67,12 @@ WORKERS = 6
 class _EvalProbe:
     FEED_CAP = 40
 
-    def __init__(self):
+    def __init__(self, output_dir=None):
         self._lk = threading.RLock()
         self._d = {}
         self._feed = []
         self.eval_id = f"eval_{time.strftime('%Y%m%d-%H%M%S')}_{uuid.uuid4().hex[:8]}"
-        self.run_dir = ROOT / "output" / "eval" / self.eval_id
+        self.run_dir = Path(output_dir).resolve() if output_dir is not None else ROOT / "output" / "eval" / self.eval_id
         self._progress = self.run_dir / "_progress.json"
         self.write_error = None
 
@@ -877,6 +877,7 @@ def main():
     ap.add_argument("--systems", default="A,B,C",
                     help="逗号分隔,如 A,B,C 或 simpleMem,mem0,zep,memos")
     ap.add_argument("--workers", type=int, default=WORKERS)
+    ap.add_argument("--output-dir", type=Path, help="Owned calibration directory when invoked by pipeline.factory")
     ap.add_argument("--smoke", action="store_true", help="烟测:每 line 取 1 题快速验通管线")
     ap.add_argument("--filter-easy", action="store_true", help="评测后导出 filtered/，默认剔除全员答对题")
     ap.add_argument("--keep-easy-ratio", type=float, default=None, help="全员答对题保留比例(0..1)，同时启用筛选")
@@ -946,7 +947,7 @@ def main():
 
     bid = qa_cache.bench_id(questions)   # QA 断点续传键(题面集合 hash;题变即换键)
 
-    probe = _EvalProbe()
+    probe = _EvalProbe(output_dir=args.output_dir) if args.output_dir else _EvalProbe()
     probe.start(bench=args.bench, corpus=str(args.corpus), model=config.MODEL,
                 systems=sys_names, n_total=len(all_q), n_judgeable=n_eligible,
                 n_eligible=n_eligible, n_selected=len(questions), n_excluded=n_unjudge,

@@ -825,7 +825,11 @@ def _run_questions(
     if not resume:
         results_path.write_text("", encoding="utf-8")
         events_path.write_text("", encoding="utf-8")
-    timeout_s = int(env.get("NATIVE_TIMEOUT_S", "240"))
+    timeout_s = (plan.get("execution") or {}).get("timeout_s")
+    if timeout_s is None:
+        timeout_s = int(env.get("NATIVE_TIMEOUT_S", "240"))
+    if type(timeout_s) is not int or timeout_s <= 0:
+        raise ConfigurationError("execution.timeout_s 必须是正整数")
     secrets = _secret_values(local, endpoint_profile)
     done = _load_done(results_path) if resume else {}
     # resume 判定必须在派发前完成：把已完成的题排除掉后，remaining 才是这次要跑的题；

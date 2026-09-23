@@ -481,6 +481,32 @@ def _time_norm(value: str, time_unit: str = "周") -> str:
     return value
 
 
+def _time_composite(value: str, golds: list, time_unit: str, period=None) -> bool | None:
+    """Resolve only a bare time scalar or two parenthesized time scalars.
+
+    Explanatory prose returns None and uses the existing semantic judge.  Each
+    scalar in a compound answer must agree; merely mentioning gold is unsafe.
+    """
+    text = _scalar_text(value)
+    scalar = (r"(?:第\s*)?[0-9]+(?:\.[0-9]+)?\s*(?:周|期|日|天|章|月|年|"
+              + re.escape(time_unit) + r")?|[0-9]{4}[-年/.][0-9]{1,2}(?:[-月/.][0-9]{1,2}日?)?")
+    if re.fullmatch(scalar, text):
+        return False  # Exact accepted scalars were already checked by caller.
+    if (re.fullmatch(r"(?:不是|并非|非)\s*(?:" + scalar + r")", text)
+            or re.fullmatch(r"(?:" + scalar + r")\s*(?:或|或者|还是)\s*(?:" + scalar + r")", text)):
+        return False  # A bare negation or unresolved choice asserts no answer.
+    pair = re.fullmatch(r"([^()]+)\(([^()]+)\)", text)
+    if pair and all(re.fullmatch(scalar, part.strip()) for part in pair.groups()):
+        accepted = {_time_norm(g, time_unit) for g in golds}
+        if type(period) is int and period > 0:
+            accepted.add(str(period))
+        return all(_time_norm(part, time_unit) in accepted for part in pair.groups())
+    # Target states, partial numbers and vague bare counts are not time answers.
+    temporal = (r"[0-9]+\s*(?:周|期|日|天|章|月|年|" + re.escape(time_unit)
+                + r")|[0-9]{4}[-年/.][0-9]{1,2}[-月/.][0-9]{1,2}|session\s*[=:：]?\s*[0-9]+")
+    return None if re.search(temporal, text, re.I) else False
+
+
 _ABSTENTION_ALIASES = {
     "never_known": ["无此项", "查无", "查无此记录", "无此记录", "没有记录", "未提及", "未提到", "没有相关记录"],
     "forgotten": ["已停止统计", "停止统计", "不再统计", "不再跟踪", "不再追踪", "已停更"],
@@ -568,9 +594,25 @@ def judge_record(q: dict, pred: str, use_llm: bool = True) -> dict:
                     return result(True, "period_number", "complete positive period index in the typed time question's declared unit")
             if any(_time_norm(value, time_unit) == _time_norm(g, time_unit) for g in golds):
                 return result(True, "time_exact", "complete date or declared-unit period equals the answer")
-            return result(False, "time_mismatch", "no complete matching date/period index; wrong units, target values and partial numbers are excluded")
-        value_kind = contract.get("value_kind")
-        if value_kind in {"numeric", "date"}:
+            period = ((q.get("gt") or {}).get("week")
+                      if contract.get("answer_kind") == "time" and isinstance(q.get("gt"), dict) else None)
+            composite = _time_composite(value, golds, time_unit, period)
+            if composite is not None:
+                return result(composite, "time_composite" if composite else "time_mismatch",
+                              "all explicit time scalars must match the accepted date/period; conflicting or partial scalars are excluded")
+            canonical = q.get("gt") if isinstance(q.get("gt"), dict) else {}
+            target = {"accepted_answers": golds, "canonical_period": canonical.get("week"),
+                      "canonical_date": canonical.get("date"), "period_unit": time_unit}
+            rule = ("判断答案是否明确给出标准时间。允许括号和解释中的等价时间表达；"
+                    "必须判断最终肯定的时间，否定、引用、猜测或候选列举中提及标准答案不算正确。"
+                    "答案中同时断言互相冲突的期数或日期应判错，不能只取匹配的一部分。")
+            if q.get("_benchmark_schema") == "memory-bench-standard-light/v1":
+                target["numbering"] = {"period_and_week_base": 1, "session_base": 0,
+                                       "canonical_session": canonical["week"] - 1
+                                       if type(canonical.get("week")) is int else None}
+                rule += "此协议第N周和第N期都从1起算，session编号从0起算；session=K对应第K+1期，期数本身不能减1。"
+        elif contract.get("value_kind") in {"numeric", "date"}:
+            value_kind = contract.get("value_kind")
             schema = contract.get("value_schema") or {}
             parse = ((lambda scalar: parse_number(_scalar_text(scalar), schema.get("unit")))
                      if value_kind == "numeric" else _complete_date)
@@ -587,15 +629,16 @@ def judge_record(q: dict, pred: str, use_llm: bool = True) -> dict:
             except ValueComparisonError:
                 ok = False
             return result(ok, "typed_" + value_kind, "complete typed scalar comparison including numeric dimension or full calendar date")
-        if any(_norm(primary) == _norm(g) or _norm(value) == _norm(g) for g in golds):
+        elif any(_norm(primary) == _norm(g) or _norm(value) == _norm(g) for g in golds):
             return result(True, "exact_alias", "complete final answer equals gold or a declared alias")
-        closed = (kind == "enum" or mode == "mc" or q.get("capability") in {"L4_preference", "L8_next"}
-                  or contract.get("value_kind") in {"status", "date", "numeric", "reference"}
-                  or "状态" in str(q.get("field") or ""))
-        if closed:
-            return result(False, "closed_value_mismatch", "closed values require exact answers or declared aliases")
-        target = golds
-        rule = "判断最终结论是否命中标准答案。否定、引用、列出候选或分析中提及答案不算正确；不得自行扩展状态或枚举的合法别名。只评分主任务，附带事实另记。"
+        else:
+            closed = (kind == "enum" or mode == "mc" or q.get("capability") in {"L4_preference", "L8_next"}
+                      or contract.get("value_kind") in {"status", "date", "numeric", "reference"}
+                      or "状态" in str(q.get("field") or ""))
+            if closed:
+                return result(False, "closed_value_mismatch", "closed values require exact answers or declared aliases")
+            target = golds
+            rule = "判断最终结论是否命中标准答案。否定、引用、列出候选或分析中提及答案不算正确；不得自行扩展状态或枚举的合法别名。只评分主任务，附带事实另记。"
     if not use_llm:
         return result(False, "deterministic_mismatch", "no exact accepted primary answer")
     try:

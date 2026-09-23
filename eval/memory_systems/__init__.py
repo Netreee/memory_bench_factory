@@ -29,8 +29,16 @@ _LAZY = {
 }
 
 
-def _resolve_class(name: str) -> type[MemorySystem]:
+def canonical_system_name(name: str) -> str:
+    """Validate a system name without loading adapters or contacting providers."""
     key = _ALIASES.get(name.upper(), name.lower())
+    if key not in _REGISTRY and key not in _LAZY:
+        raise ValueError(f"未知记忆系统: {name!r}")
+    return key
+
+
+def _resolve_class(name: str) -> type[MemorySystem]:
+    key = canonical_system_name(name)
     cls = _REGISTRY.get(key)
     if cls is None and key in _LAZY:
         mod_path, cls_name = _LAZY[key]

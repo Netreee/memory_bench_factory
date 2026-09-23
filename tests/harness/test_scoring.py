@@ -14,7 +14,7 @@ from agent_harnesses.judging import (
     load_judge,
     resolve_factory_root,
 )
-from agent_harnesses.scoring import aggregate, read_results, score_run
+from agent_harnesses.scoring import _standard_scoring_fields, aggregate, read_results, score_run
 from standard_light_fixture import build_standard_light
 
 
@@ -113,6 +113,23 @@ def _build_out_dir(root: Path) -> Path:
 
 
 class ScoringTests(unittest.TestCase):
+    def test_standard_light_period_answers_match_public_protocol(self):
+        public = {"capability": "TR", "question": "首次变化在第几期？请回答期数。"}
+        reference = {
+            "answer": {"week": 10, "date": "2025-03-10", "to": "已完成"},
+            "answer_raw": {"week": 99},
+        }
+        question = {**public, **_standard_scoring_fields(public, reference)}
+        with mock.patch.dict(os.environ, {"OPENAI_API_KEY": "test-key", "MODEL": "test-model"}):
+            judge = load_judge(REPOSITORY_ROOT)
+            with mock.patch.object(judge._module.config, "chat_json", side_effect=AssertionError("no API calls")):
+                for answer in ("第10期", "第10期。", "10期", "第10周", "10周", "第 10 周", "10", "2025-03-10"):
+                    with self.subTest(answer=answer):
+                        self.assertTrue(judge.judge_answer(question, answer, use_llm=True))
+                for answer in ("第9期", "第11期", "第99期", "第10天", "10个月", "2025-03-11", "第10期或第11期", "不是第10期", "已完成"):
+                    with self.subTest(answer=answer):
+                        self.assertFalse(judge.judge_answer(question, answer, use_llm=True))
+
     def test_standard_light_scores_all_quality_statuses_from_answer_truth(self):
         questions = [
             {"qid": "q-release", "question": "状态？", "line": "L1", "capability": "IE", "quality_status": "released"},
